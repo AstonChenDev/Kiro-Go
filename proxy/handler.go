@@ -3169,6 +3169,24 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if req.AuthMethod == "external_idp" {
+		if (req.IssuerURL == "" || req.Scopes == "") && req.AccessToken != "" {
+			iss, scp := auth.ExtractOidcParamsFromJWT(req.AccessToken)
+			if req.IssuerURL == "" && iss != "" {
+				req.IssuerURL = iss
+			}
+			if req.Scopes == "" && scp != "" {
+				req.Scopes = scp
+			}
+		}
+		if req.TokenEndpoint == "" && req.IssuerURL != "" {
+			tokenEndpoint, err := auth.DiscoverTokenEndpoint(req.IssuerURL, config.GetProxyURL())
+			if err == nil {
+				req.TokenEndpoint = tokenEndpoint
+			}
+		}
+	}
+
 	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
@@ -3851,15 +3869,18 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	// 构建兼容 Kiro Account Manager 的导出格式
 	type ExportCredentials struct {
-		AccessToken  string `json:"accessToken"`
-		CsrfToken    string `json:"csrfToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId,omitempty"`
-		ClientSecret string `json:"clientSecret,omitempty"`
-		Region       string `json:"region,omitempty"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		AuthMethod   string `json:"authMethod,omitempty"`
-		Provider     string `json:"provider,omitempty"`
+		AccessToken   string `json:"accessToken"`
+		CsrfToken     string `json:"csrfToken"`
+		RefreshToken  string `json:"refreshToken"`
+		ClientID      string `json:"clientId,omitempty"`
+		ClientSecret  string `json:"clientSecret,omitempty"`
+		Region        string `json:"region,omitempty"`
+		ExpiresAt     int64  `json:"expiresAt"`
+		AuthMethod    string `json:"authMethod,omitempty"`
+		Provider      string `json:"provider,omitempty"`
+		TokenEndpoint string `json:"tokenEndpoint,omitempty"`
+		IssuerURL     string `json:"issuerUrl,omitempty"`
+		Scopes        string `json:"scopes,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -3935,15 +3956,18 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 			UserId:    a.UserId,
 			MachineId: a.MachineId,
 			Credentials: ExportCredentials{
-				AccessToken:  a.AccessToken,
-				CsrfToken:    "",
-				RefreshToken: a.RefreshToken,
-				ClientID:     a.ClientID,
-				ClientSecret: a.ClientSecret,
-				Region:       a.Region,
-				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
-				AuthMethod:   authMethod,
-				Provider:     a.Provider,
+				AccessToken:   a.AccessToken,
+				CsrfToken:     "",
+				RefreshToken:  a.RefreshToken,
+				ClientID:      a.ClientID,
+				ClientSecret:  a.ClientSecret,
+				Region:        a.Region,
+				ExpiresAt:     a.ExpiresAt * 1000, // 转为毫秒时间戳
+				AuthMethod:    authMethod,
+				Provider:      a.Provider,
+				TokenEndpoint: a.TokenEndpoint,
+				IssuerURL:     a.IssuerURL,
+				Scopes:        a.Scopes,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

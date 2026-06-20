@@ -844,3 +844,47 @@ func (s *KiroSsoSession) ProcessCallbackURL(callbackURL string) (string, *KiroSs
 	return "", res, nil
 }
 
+// ExtractOidcParamsFromJWT decodes the JWT payload of an access token (best-effort)
+// and returns the issuer claim ("iss") and scopes claim ("scp").
+func ExtractOidcParamsFromJWT(accessToken string) (string, string) {
+	parts := strings.Split(strings.TrimSpace(accessToken), ".")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if payload, err = base64.StdEncoding.DecodeString(parts[1]); err != nil {
+			return "", ""
+		}
+	}
+	var claims struct {
+		Issuer string      `json:"iss"`
+		Scp    interface{} `json:"scp"`
+	}
+	if err = json.Unmarshal(payload, &claims); err != nil {
+		return "", ""
+	}
+	var scopes string
+	if claims.Scp != nil {
+		switch v := claims.Scp.(type) {
+		case string:
+			scopes = v
+		case []interface{}:
+			var sList []string
+			for _, item := range v {
+				if str, ok := item.(string); ok {
+					sList = append(sList, str)
+				}
+			}
+			scopes = strings.Join(sList, " ")
+		}
+	}
+	return claims.Issuer, scopes
+}
+
+// DiscoverTokenEndpoint discovers the OIDC token endpoint given an issuer URL.
+func DiscoverTokenEndpoint(issuerURL string, proxyURL string) (string, error) {
+	_, tokenEndpoint, err := oidcDiscover(GetAuthClientForProxy(proxyURL), issuerURL, proxyURL)
+	return tokenEndpoint, err
+}
+
