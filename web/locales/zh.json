@@ -458,6 +458,7 @@
   "apiKeys.saveBtn": "保存",
   "apiKeys.cancelBtn": "取消",
   "apiKeys.loadFailed": "加载 API Key 列表失败",
+<<<<<<< HEAD
   "tabs.logs": "日志",
   "logs.title": "请求日志",
   "logs.empty": "暂无日志记录",
@@ -488,5 +489,13 @@
   "errors.typeSuspended": "封禁",
   "errors.typeOverage": "超额",
   "errors.typeProfile": "配置",
-  "errors.typeUnknown": "未知"
+  "errors.typeUnknown": "未知",
+  "detail.concurrencyLimits": "并发与限频",
+  "detail.maxSSE": "自定义最大 SSE 流并发",
+  "detail.maxRPM": "自定义最大请求 RPM (每分钟)",
+  "detail.limitPlaceholder": "0 表示使用默认限额",
+  "accounts.concurrencySSE": "并发流",
+  "accounts.concurrencyRPM": "请求/分",
+  "accounts.concurrencyRules": "并发限制",
+  "accounts.unlimited": "无限制"
 }

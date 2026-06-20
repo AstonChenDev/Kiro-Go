@@ -891,7 +891,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		if !h.pool.Acquire(account.ID, true) {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
+			h.pool.Release(account.ID, true)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1217,6 +1223,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
+			h.pool.Release(account.ID, true)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1275,6 +1282,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
+		h.pool.Release(account.ID, true)
 		return
 	}
 
@@ -1450,6 +1458,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
+		}
+		if !h.pool.Acquire(account.ID, false) {
+			excluded[account.ID] = true
+			attempt--
+			continue
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
@@ -1638,7 +1651,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if account == nil {
 			break
 		}
+		if !h.pool.Acquire(account.ID, true) {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
+			h.pool.Release(account.ID, true)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1928,6 +1947,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
+			h.pool.Release(account.ID, true)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1992,6 +2012,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		h.pool.Release(account.ID, true)
 		return
 	}
 
@@ -2014,6 +2035,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
 			break
+		}
+		if !h.pool.Acquire(account.ID, false) {
+			excluded[account.ID] = true
+			attempt--
+			continue
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
@@ -2333,6 +2359,10 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			"maxSSE":            a.MaxSSE,
+			"maxRPM":            a.MaxRPM,
+			"activeSSE":         h.pool.GetActiveSSE(a.ID),
+			"currentRPM":        h.pool.GetCurrentRPM(a.ID),
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -2420,6 +2450,12 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
+	}
+	if v, ok := updates["maxSSE"].(float64); ok {
+		existing.MaxSSE = int(v)
+	}
+	if v, ok := updates["maxRPM"].(float64); ok {
+		existing.MaxRPM = int(v)
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {

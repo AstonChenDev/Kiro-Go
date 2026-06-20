@@ -21,6 +21,8 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	activeSSE     map[string]int             // accountID → active SSE stream count
+	reqTimestamps map[string][]time.Time     // accountID → sliding window of request timestamps
 }
 
 var (
@@ -32,9 +34,11 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:     make(map[string]time.Time),
+			errorCounts:   make(map[string]int),
+			modelLists:    make(map[string]map[string]bool),
+			activeSSE:     make(map[string]int),
+			reqTimestamps: make(map[string][]time.Time),
 		}
 		pool.Reload()
 	})
@@ -499,3 +503,119 @@ func effectiveWeight(weight int) int {
 	}
 	return weight
 }
+
+// Acquire tries to acquire limit slots for the given account.
+// It returns true if successful, and false if limits are exceeded.
+func (p *AccountPool) Acquire(accountID string, isStream bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+
+	// 1. Clean up old timestamps (older than 60 seconds)
+	timestamps := p.reqTimestamps[accountID]
+	cutoff := now.Add(-time.Minute)
+	validIdx := 0
+	for i, t := range timestamps {
+		if t.After(cutoff) {
+			validIdx = i
+			break
+		}
+		if i == len(timestamps)-1 {
+			validIdx = len(timestamps)
+		}
+	}
+	if validIdx > 0 {
+		if validIdx >= len(timestamps) {
+			timestamps = nil
+		} else {
+			timestamps = timestamps[validIdx:]
+		}
+	}
+
+	// Find the account in current active pool to check credentials and overrides
+	var acc *config.Account
+	for i := range p.accounts {
+		if p.accounts[i].ID == accountID {
+			acc = &p.accounts[i]
+			break
+		}
+	}
+
+	// Determine defaults based on credentials
+	limitSSE := 3
+	limitRPM := 10
+	isEnterprise := false
+
+	if acc != nil {
+		isEnterprise = strings.EqualFold(acc.Provider, "Enterprise") || acc.AuthMethod == "idc"
+		if isEnterprise {
+			limitSSE = 30
+			limitRPM = 0 // unlimited
+		}
+		if acc.MaxSSE > 0 {
+			limitSSE = acc.MaxSSE
+		}
+		if acc.MaxRPM > 0 {
+			limitRPM = acc.MaxRPM
+		}
+	}
+
+	// 2. Check RPM Limit (0 means unlimited)
+	if limitRPM > 0 && len(timestamps) >= limitRPM {
+		p.reqTimestamps[accountID] = timestamps // update even if rejected
+		return false
+	}
+
+	// 3. Check SSE Concurrency Limit
+	if isStream {
+		if limitSSE > 0 && p.activeSSE[accountID] >= limitSSE {
+			p.reqTimestamps[accountID] = timestamps
+			return false
+		}
+		p.activeSSE[accountID]++
+	}
+
+	// 4. Record new request timestamp
+	timestamps = append(timestamps, now)
+	p.reqTimestamps[accountID] = timestamps
+
+	return true
+}
+
+// Release releases slots for the given account.
+func (p *AccountPool) Release(accountID string, isStream bool) {
+	if !isStream {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.activeSSE[accountID] > 0 {
+		p.activeSSE[accountID]--
+	}
+}
+
+// GetActiveSSE returns the active concurrent SSE stream count for a given account.
+func (p *AccountPool) GetActiveSSE(accountID string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.activeSSE[accountID]
+}
+
+// GetCurrentRPM returns the requests count in the last sliding 60 seconds window for a given account.
+func (p *AccountPool) GetCurrentRPM(accountID string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+	count := 0
+	for _, t := range p.reqTimestamps[accountID] {
+		if t.After(cutoff) {
+			count++
+		}
+	}
+	return count
+}
+

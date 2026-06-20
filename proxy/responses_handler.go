@@ -137,6 +137,11 @@ func (h *Handler) handleResponsesNonStream(
 		if account == nil {
 			break
 		}
+		if !h.pool.Acquire(account.ID, false) {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -322,7 +327,13 @@ func (h *Handler) handleResponsesStream(
 		if account == nil {
 			break
 		}
+		if !h.pool.Acquire(account.ID, true) {
+			excluded[account.ID] = true
+			attempt--
+			continue
+		}
 		if err := h.ensureValidToken(account); err != nil {
+			h.pool.Release(account.ID, true)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -472,6 +483,7 @@ func (h *Handler) handleResponsesStream(
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
+			h.pool.Release(account.ID, true)
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
@@ -555,6 +567,7 @@ func (h *Handler) handleResponsesStream(
 		})
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		h.pool.Release(account.ID, true)
 		return
 	}
 

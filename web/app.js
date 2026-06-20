@@ -950,6 +950,20 @@
       const displayEmail = getDisplayEmail(a.email, a.id);
       const selectLabel = t('accounts.selectAccount', displayEmail);
 
+      const isEnt = (a.provider && a.provider.toLowerCase() === 'enterprise') || (a.authMethod && a.authMethod.toLowerCase() === 'idc');
+      const sseLimit = a.maxSSE > 0 ? a.maxSSE : (isEnt ? 30 : 3);
+      const rpmLimit = a.maxRPM > 0 ? a.maxRPM : (isEnt ? 0 : 10);
+      const activeSseVal = a.activeSSE || 0;
+      const currentRpmVal = a.currentRPM || 0;
+
+      const sseUsagePct = sseLimit > 0 ? (activeSseVal / sseLimit) * 100 : 0;
+      const sseStatusClass = sseUsagePct >= 100 ? 'concurrency-critical' : (sseUsagePct >= 70 ? 'concurrency-warning' : 'concurrency-normal');
+
+      const rpmUsagePct = rpmLimit > 0 ? (currentRpmVal / rpmLimit) * 100 : 0;
+      const rpmStatusClass = rpmLimit > 0 && rpmUsagePct >= 100 ? 'concurrency-critical' : (rpmLimit > 0 && rpmUsagePct >= 70 ? 'concurrency-warning' : 'concurrency-normal');
+
+      const rpmLimitDisplay = rpmLimit > 0 ? rpmLimit : t('accounts.unlimited');
+
       const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
       const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
       const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -995,6 +1009,16 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        '<div class="account-concurrency">' +
+        '  <div class="concurrency-metric">' +
+        '    <span class="concurrency-label"><i class="fa-solid fa-bolt" style="margin-right:4px;color:#eab308"></i>' + escapeHtml(t('accounts.concurrencySSE')) + ':</span>' +
+        '    <span class="concurrency-value ' + sseStatusClass + '">' + activeSseVal + ' / ' + sseLimit + '</span>' +
+        '  </div>' +
+        '  <div class="concurrency-metric">' +
+        '    <span class="concurrency-label"><i class="fa-solid fa-gauge-high" style="margin-right:4px;color:#3b82f6"></i>' + escapeHtml(t('accounts.concurrencyRPM')) + ':</span>' +
+        '    <span class="concurrency-value ' + rpmStatusClass + '">' + currentRpmVal + ' / ' + rpmLimitDisplay + '</span>' +
+        '  </div>' +
+        '</div>' +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
@@ -1207,6 +1231,20 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
 
+      '<div class="detail-section"><h4>' + escapeHtml(t('detail.concurrencyLimits')) + '</h4>' +
+      '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:10px;">' +
+      '  <div class="form-group" style="margin-bottom:0;">' +
+      '    <label>' + escapeHtml(t('detail.maxSSE')) + '</label>' +
+      '    <input type="number" id="maxSSEInput" value="' + (a.maxSSE || 0) + '" min="0" placeholder="' + escapeAttr(t('detail.limitPlaceholder')) + '" />' +
+      '  </div>' +
+      '  <div class="form-group" style="margin-bottom:0;">' +
+      '    <label>' + escapeHtml(t('detail.maxRPM')) + '</label>' +
+      '    <input type="number" id="maxRPMInput" value="' + (a.maxRPM || 0) + '" min="0" placeholder="' + escapeAttr(t('detail.limitPlaceholder')) + '" />' +
+      '  </div>' +
+      '</div>' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="saveConcurrency" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div>' +
+
       '<div class="detail-section">' +
       '<h4>' + escapeHtml(t('detail.overage')) +
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button>' +
@@ -1311,6 +1349,11 @@
   async function saveWeight(id) {
     const weight = parseInt($('weightInput').value, 10) || 0;
     await putAccount(id, { weight }, t('detail.saved'));
+  }
+  async function saveConcurrency(id) {
+    const maxSSE = parseInt($('maxSSEInput').value, 10) || 0;
+    const maxRPM = parseInt($('maxRPMInput').value, 10) || 0;
+    await putAccount(id, { maxSSE, maxRPM }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -2965,6 +3008,7 @@
       const a = b.dataset.detailAction;
       if (a === 'saveMachineId') saveMachineId(id);
       else if (a === 'saveWeight') saveWeight(id);
+      else if (a === 'saveConcurrency') saveConcurrency(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
