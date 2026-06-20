@@ -435,5 +435,13 @@
   "apiKeys.closeBtn": "Close",
   "apiKeys.saveBtn": "Save",
   "apiKeys.cancelBtn": "Cancel",
-  "apiKeys.loadFailed": "Failed to load API keys"
+  "apiKeys.loadFailed": "Failed to load API keys",
+  "detail.concurrencyLimits": "Concurrency & Rate Limits",
+  "detail.maxSSE": "Custom Max SSE Concurrency",
+  "detail.maxRPM": "Custom Max Requests RPM (Per Minute)",
+  "detail.limitPlaceholder": "0 to use default limits",
+  "accounts.concurrencySSE": "Active SSE",
+  "accounts.concurrencyRPM": "RPM",
+  "accounts.concurrencyRules": "Concurrency Rules",
+  "accounts.unlimited": "Unlimited"
 }

@@ -325,3 +325,142 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+func TestAcquireAndReleaseLimits(t *testing.T) {
+	p := &AccountPool{
+		activeSSE:     make(map[string]int),
+		reqTimestamps: make(map[string][]time.Time),
+	}
+	// Setup standard account in the pool
+	p.accounts = []config.Account{
+		{ID: "standard-acc", Enabled: true, Provider: "Social"},
+	}
+
+	accountID := "standard-acc"
+
+	// 1. Concurrency limit test (stream = true)
+	// We can acquire up to 3 SSE streams (default standard limit)
+	for i := 0; i < 3; i++ {
+		if !p.Acquire(accountID, true) {
+			t.Fatalf("expected to acquire stream slot %d", i+1)
+		}
+	}
+	// The 4th stream should fail
+	if p.Acquire(accountID, true) {
+		t.Fatal("expected 4th stream acquire to fail")
+	}
+
+	// Release one stream slot
+	p.Release(accountID, true)
+	// Should be able to acquire again
+	if !p.Acquire(accountID, true) {
+		t.Fatal("expected to acquire stream slot after release")
+	}
+	// And fail again on subsequent try
+	if p.Acquire(accountID, true) {
+		t.Fatal("expected stream slot to be full again")
+	}
+
+	// Reset concurrency for RPM testing
+	p.Release(accountID, true)
+	p.Release(accountID, true)
+	p.Release(accountID, true)
+
+	// 2. RPM limit test (stream = false)
+	p.reqTimestamps[accountID] = nil
+
+	// We can acquire up to 10 requests (non-stream, default standard limit)
+	for i := 0; i < 10; i++ {
+		if !p.Acquire(accountID, false) {
+			t.Fatalf("expected to acquire request %d", i+1)
+		}
+	}
+	// The 11th request should fail
+	if p.Acquire(accountID, false) {
+		t.Fatal("expected 11th request acquire to fail")
+	}
+
+	// Test RPM sliding window expiration:
+	p.mu.Lock()
+	oldTime := time.Now().Add(-2 * time.Minute)
+	for i := range p.reqTimestamps[accountID] {
+		p.reqTimestamps[accountID][i] = oldTime
+	}
+	p.mu.Unlock()
+
+	// Now we should be able to acquire again because old timestamps will be cleaned up
+	if !p.Acquire(accountID, false) {
+		t.Fatal("expected to acquire request after timestamp expiration")
+	}
+}
+
+func TestEnterpriseAccountLimits(t *testing.T) {
+	p := &AccountPool{
+		activeSSE:     make(map[string]int),
+		reqTimestamps: make(map[string][]time.Time),
+	}
+	// Setup Enterprise credentials in the pool
+	p.accounts = []config.Account{
+		{ID: "ent-acc", Enabled: true, Provider: "Enterprise"},
+	}
+
+	accountID := "ent-acc"
+
+	// 1. Concurrency limit test (stream = true)
+	// We can acquire up to 30 SSE streams (default Enterprise limit)
+	for i := 0; i < 30; i++ {
+		if !p.Acquire(accountID, true) {
+			t.Fatalf("expected to acquire stream slot %d", i+1)
+		}
+	}
+	// The 31st stream should fail
+	if p.Acquire(accountID, true) {
+		t.Fatal("expected 31st stream acquire to fail")
+	}
+
+	// 2. RPM limit test (stream = false)
+	// Enterprise accounts should have unlimited RPM (limitRPM = 0)
+	p.reqTimestamps[accountID] = nil
+	for i := 0; i < 100; i++ {
+		if !p.Acquire(accountID, false) {
+			t.Fatalf("expected to acquire request %d on enterprise (unlimited RPM)", i+1)
+		}
+	}
+}
+
+func TestCustomOverriddenLimits(t *testing.T) {
+	p := &AccountPool{
+		activeSSE:     make(map[string]int),
+		reqTimestamps: make(map[string][]time.Time),
+	}
+	// Setup custom overridden limits
+	p.accounts = []config.Account{
+		{ID: "custom-acc", Enabled: true, MaxSSE: 1, MaxRPM: 2},
+	}
+
+	accountID := "custom-acc"
+
+	// MaxSSE override = 1
+	if !p.Acquire(accountID, true) {
+		t.Fatal("expected to acquire first stream slot")
+	}
+	// Second stream should fail
+	if p.Acquire(accountID, true) {
+		t.Fatal("expected second stream to fail")
+	}
+
+	p.Release(accountID, true)
+
+	// MaxRPM override = 2
+	p.reqTimestamps[accountID] = nil
+	if !p.Acquire(accountID, false) {
+		t.Fatal("expected to acquire first request")
+	}
+	if !p.Acquire(accountID, false) {
+		t.Fatal("expected to acquire second request")
+	}
+	// Third request should fail
+	if p.Acquire(accountID, false) {
+		t.Fatal("expected third request to fail")
+	}
+}

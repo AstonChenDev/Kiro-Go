@@ -101,6 +101,10 @@ type Account struct {
 	TrialStatus       string  `json:"trialStatus,omitempty"`       // Trial status: ACTIVE, EXPIRED, NONE
 	TrialExpiresAt    int64   `json:"trialExpiresAt,omitempty"`    // Trial expiration timestamp (Unix seconds)
 
+	// Concurrency and rate limit overrides (0 = use defaults)
+	MaxSSE int `json:"maxSSE,omitempty"` // Custom maximum concurrent SSE streams
+	MaxRPM int `json:"maxRPM,omitempty"` // Custom maximum requests per minute
+
 	// Runtime statistics (updated during operation)
 	RequestCount int     `json:"requestCount,omitempty"` // Total requests processed
 	ErrorCount   int     `json:"errorCount,omitempty"`   // Total errors encountered

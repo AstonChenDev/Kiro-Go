@@ -199,8 +199,8 @@ func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	if streamClient.Timeout != 30*time.Minute {
+		t.Fatalf("expected streaming timeout to be 30m, got %s", streamClient.Timeout)
 	}
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
