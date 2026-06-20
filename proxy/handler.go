@@ -2243,6 +2243,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPollKiroSso(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
+	case path == "/auth/kiro-sso/complete" && r.Method == "POST":
+		h.apiCompleteKiroSso(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
@@ -2924,6 +2926,80 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 授权完成，创建账号
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    result.AuthMethod,
+		Provider:      result.Provider,
+		Region:        result.Region,
+		ProfileArn:    result.ProfileArn,
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+		ExpiresAt:     time.Now().Unix() + int64(result.ExpiresIn),
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		},
+	})
+}
+
+// apiCompleteKiroSso completes the Kiro hosted-portal sign-in (Enterprise SSO) manually
+// by receiving a manually copied callback URL.
+func (h *Handler) apiCompleteKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		CallbackUrl string `json:"callbackUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	session := auth.GetKiroSsoSession(req.SessionID)
+	if session == nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+
+	nextURL, result, err := session.ProcessCallbackURL(req.CallbackUrl)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// If a nextURL is returned, it means we need the user to navigate to that URL (Leg 2)
+	if nextURL != "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"nextUrl":   nextURL,
+		})
+		return
+	}
+
+	// Otherwise, exchange is complete. Create the account.
 	account := config.Account{
 		ID:            auth.GenerateAccountID(),
 		Email:         result.Email,

@@ -950,7 +950,7 @@
       const displayEmail = getDisplayEmail(a.email, a.id);
       const selectLabel = t('accounts.selectAccount', displayEmail);
 
-      const isEnt = (a.provider && a.provider.toLowerCase() === 'enterprise') || (a.authMethod && a.authMethod.toLowerCase() === 'idc');
+      const isEnt = (a.provider && (a.provider.toLowerCase() === 'enterprise' || a.provider.toLowerCase() === 'azuread')) || (a.authMethod && (a.authMethod.toLowerCase() === 'idc' || a.authMethod.toLowerCase() === 'external_idp'));
       const sseLimit = a.maxSSE > 0 ? a.maxSSE : (isEnt ? 30 : 3);
       const rpmLimit = a.maxRPM > 0 ? a.maxRPM : (isEnt ? 0 : 10);
       const activeSseVal = a.activeSSE || 0;
@@ -2524,10 +2524,18 @@
       '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
       '</div>' +
       '</div>' +
+      '<div class="form-group mt-3">' +
+      '<label>' + escapeHtml(t('iam.callbackUrl')) + ' <small class="text-xs muted-text">(' + escapeHtml(t('kirosso.manualHint')) + ')</small></label>' +
+      '<input type="text" id="kiroSsoCallback" placeholder="http://localhost:3128/?code=..." />' +
+      '</div>' +
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
-      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="kiroSsoCompleteBtn" type="button">' + escapeHtml(t('iam.complete')) + '</button>' +
+      '</div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+    $('kiroSsoCompleteBtn').addEventListener('click', completeKiroSsoLogin);
   }
   async function startKiroSsoLogin() {
     const region = $('kiroSsoRegion').value || 'us-east-1';
@@ -2578,6 +2586,43 @@
     }
     kiroSsoSession = '';
     showModal('add');
+  }
+  async function completeKiroSsoLogin() {
+    const cbUrl = $('kiroSsoCallback').value.trim();
+    if (!cbUrl) {
+      toastWarning(t('iam.callbackUrl') + ' is required');
+      return;
+    }
+    const btn = $('kiroSsoCompleteBtn');
+    btn.disabled = true;
+    btn.textContent = t('builderid.waiting') || 'Processing...';
+    try {
+      const res = await api('/auth/kiro-sso/complete', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId: kiroSsoSession, callbackUrl: cbUrl })
+      });
+      const d = await res.json();
+      if (d.success) {
+        if (d.completed) {
+          kiroSsoSession = '';
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else if (d.nextUrl) {
+          $('kiroSsoSignInUrl').textContent = d.nextUrl;
+          $('kiroSsoCallback').value = '';
+          window.open(d.nextUrl, '_blank');
+          toastPrimary('Leg 1 processed. Please sign in to Microsoft, then paste the new callback URL.');
+        }
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('iam.complete');
+    }
   }
   async function startIamSso() {
     if (iamSession) {

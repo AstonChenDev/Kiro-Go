@@ -180,7 +180,7 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 	}
 
 	if err := session.startListener(); err != nil {
-		return nil, "", err
+		logger.Warnf("[KiroSSO] Failed to bind callback listener (port may be in use), proceeding with manual callback option only: %v", err)
 	}
 
 	params := url.Values{}
@@ -715,5 +715,132 @@ func removeKiroSsoSession(sessionID string) {
 	kiroSsoSessionsMu.Lock()
 	delete(kiroSsoSessions, sessionID)
 	kiroSsoSessionsMu.Unlock()
+}
+
+// GetKiroSsoSession retrieves a session from the registry.
+func GetKiroSsoSession(sessionID string) *KiroSsoSession {
+	kiroSsoSessionsMu.RLock()
+	defer kiroSsoSessionsMu.RUnlock()
+	return kiroSsoSessions[sessionID]
+}
+
+// ProcessCallbackURL processes a manually entered callback URL from the operator.
+// It parses the URL, routes it to the corresponding step of the OAuth flow (Leg 1, Leg 2, or Social),
+// and returns either a nextURL (if another redirect is needed) or the final KiroSsoResult.
+func (s *KiroSsoSession) ProcessCallbackURL(callbackURL string) (string, *KiroSsoResult, error) {
+	u, err := url.Parse(strings.TrimSpace(callbackURL))
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid callback URL format: %w", err)
+	}
+
+	q := u.Query()
+	state := strings.TrimSpace(q.Get("state"))
+	code := strings.TrimSpace(q.Get("code"))
+	errParam := strings.TrimSpace(q.Get("error"))
+
+	// --- Case A: Enterprise Leg-1 Redirect ---
+	if u.Path != kiroOAuthCallbackPath &&
+		(strings.EqualFold(strings.TrimSpace(q.Get("login_option")), "external_idp") || strings.TrimSpace(q.Get("issuer_url")) != "") {
+		
+		s.mu.Lock()
+		alreadyStarted := s.leg2 != nil
+		s.mu.Unlock()
+		if alreadyStarted {
+			return "", nil, fmt.Errorf("enterprise SSO login already in progress")
+		}
+
+		issuerURL := strings.TrimSpace(q.Get("issuer_url"))
+		clientID := strings.TrimSpace(q.Get("client_id"))
+		scopes := strings.TrimSpace(q.Get("scopes"))
+		loginHint := strings.TrimSpace(q.Get("login_hint"))
+		if clientID == "" {
+			return "", nil, fmt.Errorf("invalid external IdP descriptor (missing client_id)")
+		}
+
+		authEndpoint, tokenEndpoint, errDisc := oidcDiscover(GetAuthClientForProxy(s.ProxyURL), issuerURL, s.ProxyURL)
+		if errDisc != nil {
+			return "", nil, errDisc
+		}
+
+		verifier := generateCodeVerifier()
+		state2 := uuid.New().String()
+		redirectURI := kiroRedirectURI + kiroOAuthCallbackPath
+
+		s.mu.Lock()
+		s.leg2 = &kiroLeg2{
+			state:         state2,
+			verifier:      verifier,
+			tokenEndpoint: tokenEndpoint,
+			issuerURL:     issuerURL,
+			clientID:      clientID,
+			scopes:        scopes,
+			redirectURI:   redirectURI,
+		}
+		s.mu.Unlock()
+
+		authURL := externalIdpAuthorizeURL(authEndpoint, clientID, redirectURI, scopes, generateCodeChallenge(verifier), state2, loginHint)
+		return authURL, nil, nil
+	}
+
+	// --- Case B: Enterprise Leg-2 Redirect (/oauth/callback) ---
+	if u.Path == kiroOAuthCallbackPath || strings.HasSuffix(u.Path, kiroOAuthCallbackPath) {
+		s.mu.Lock()
+		ctx2 := s.leg2
+		s.mu.Unlock()
+
+		if ctx2 == nil {
+			return "", nil, fmt.Errorf("no active Enterprise SSO session context (are you pasting the Leg 2 URL too early?)")
+		}
+		if state == "" || state != ctx2.state {
+			return "", nil, fmt.Errorf("anti-CSRF state mismatch on Enterprise SSO callback")
+		}
+		if errParam != "" {
+			desc := strings.TrimSpace(q.Get("error_description"))
+			return "", nil, fmt.Errorf("external IdP authorization error: %s %s", errParam, desc)
+		}
+		if code == "" {
+			return "", nil, fmt.Errorf("authorization code is missing in callback URL")
+		}
+
+		capture := kiroSsoCapture{
+			kind:          "external_idp",
+			code:          code,
+			tokenEndpoint: ctx2.tokenEndpoint,
+			issuerURL:     ctx2.issuerURL,
+			clientID:      ctx2.clientID,
+			scopes:        ctx2.scopes,
+			redirectURI:   ctx2.redirectURI,
+			codeVerifier:  ctx2.verifier,
+		}
+
+		res, _, errEx := s.exchange(capture)
+		if errEx != nil {
+			return "", nil, errEx
+		}
+		return "", res, nil
+	}
+
+	// --- Case C: Social Redirect ---
+	if state == "" || state != s.State {
+		return "", nil, fmt.Errorf("anti-CSRF state mismatch on SSO callback")
+	}
+	if errParam != "" {
+		desc := strings.TrimSpace(q.Get("error_description"))
+		return "", nil, fmt.Errorf("SSO authorization error: %s %s", errParam, desc)
+	}
+	if code == "" {
+		return "", nil, fmt.Errorf("authorization code is missing in callback URL")
+	}
+
+	capture := kiroSsoCapture{
+		kind: "social",
+		code: code,
+	}
+
+	res, _, errEx := s.exchange(capture)
+	if errEx != nil {
+		return "", nil, errEx
+	}
+	return "", res, nil
 }
 
