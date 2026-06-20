@@ -3043,13 +3043,16 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-		AuthMethod   string `json:"authMethod"`
-		Provider     string `json:"provider"`
-		Region       string `json:"region"`
+		AccessToken   string `json:"accessToken"`
+		RefreshToken  string `json:"refreshToken"`
+		ClientID      string `json:"clientId"`
+		ClientSecret  string `json:"clientSecret"`
+		AuthMethod    string `json:"authMethod"`
+		Provider      string `json:"provider"`
+		Region        string `json:"region"`
+		TokenEndpoint string `json:"tokenEndpoint"`
+		IssuerURL     string `json:"issuerUrl"`
+		Scopes        string `json:"scopes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3080,6 +3083,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		req.AuthMethod = "idc"
 	case "social", "google", "github":
 		req.AuthMethod = "social"
+	case "external_idp", "azuread", "enterprisesso":
+		req.AuthMethod = "external_idp"
 	default:
 		if req.ClientID != "" && req.ClientSecret != "" {
 			req.AuthMethod = "idc"
@@ -3092,11 +3097,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
 	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		Scopes:        req.Scopes,
 	}
 	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
@@ -3113,19 +3121,22 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 	// 创建账号
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
+		ID:            auth.GenerateAccountID(),
+		Email:         email,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Provider:      req.Provider,
+		Region:        req.Region,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		ProfileArn:    newProfileArn,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		Scopes:        req.Scopes,
 	}
 
 	if err := config.AddAccount(account); err != nil {

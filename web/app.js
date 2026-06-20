@@ -2333,11 +2333,15 @@
           const c = a.credentials || {};
           return {
             refreshToken: c.refreshToken || a.refreshToken,
+            accessToken: c.accessToken || a.accessToken,
             clientId: c.clientId || a.clientId,
             clientSecret: c.clientSecret || a.clientSecret,
             region: c.region || a.region,
             authMethod: c.authMethod || a.authMethod,
-            provider: c.provider || a.provider || a.idp
+            provider: c.provider || a.provider || a.idp,
+            tokenEndpoint: c.tokenEndpoint || a.tokenEndpoint,
+            issuerUrl: c.issuerUrl || c.issuerURL || a.issuerUrl || a.issuerURL,
+            scopes: c.scopes || a.scopes
           };
         });
       } else {
@@ -2360,19 +2364,30 @@
     for (const item of items) {
       if (!item.refreshToken) { fail++; continue; }
       let authMethod = item.authMethod || '';
-      if (item.clientId && item.clientSecret) authMethod = 'idc';
-      else if (!authMethod || authMethod === 'social') authMethod = 'social';
-      else authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
+      const lowerAuth = authMethod.toLowerCase();
+      if (item.clientId && item.clientSecret) {
+        authMethod = 'idc';
+      } else if (lowerAuth === 'external_idp' || lowerAuth === 'azuread' || lowerAuth === 'enterprisesso') {
+        authMethod = 'external_idp';
+      } else if (lowerAuth === 'idc' || lowerAuth === 'builderid' || lowerAuth === 'enterprise') {
+        authMethod = 'idc';
+      } else {
+        authMethod = 'social';
+      }
       let provider = item.provider || '';
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
+      if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
       const payload = {
         refreshToken: item.refreshToken,
         accessToken: item.accessToken || '',
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
         authMethod, provider,
-        region: item.region || 'us-east-1'
+        region: item.region || 'us-east-1',
+        tokenEndpoint: item.tokenEndpoint || '',
+        issuerUrl: item.issuerUrl || '',
+        scopes: item.scopes || ''
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
