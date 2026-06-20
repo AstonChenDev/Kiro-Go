@@ -458,7 +458,6 @@
   "apiKeys.saveBtn": "保存",
   "apiKeys.cancelBtn": "取消",
   "apiKeys.loadFailed": "加载 API Key 列表失败",
-<<<<<<< HEAD
   "tabs.logs": "日志",
   "logs.title": "请求日志",
   "logs.empty": "暂无日志记录",

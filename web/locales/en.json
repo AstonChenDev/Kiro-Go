@@ -458,7 +458,6 @@
   "apiKeys.saveBtn": "Save",
   "apiKeys.cancelBtn": "Cancel",
   "apiKeys.loadFailed": "Failed to load API keys",
-<<<<<<< HEAD
   "tabs.logs": "Logs",
   "logs.title": "Request Logs",
   "logs.empty": "No logs recorded",
