@@ -433,6 +433,21 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			}
 
 			return nil, fmt.Errorf("Account suspended: %w", err)
+		} else if strings.Contains(errMsg, "MONTHLY_REQUEST_COUNT") || strings.Contains(errMsg, "monthly_request_count") ||
+			(strings.Contains(errMsg, "402") && strings.Contains(strings.ToLower(errMsg), "reached the limit")) {
+			// 账户达到月度限额，自动禁用并标记封禁状态
+			logger.Warnf("[RefreshAccountInfo] Account %s monthly request limit reached: %v", account.Email, err)
+
+			updatedAccount := *account
+			updatedAccount.Enabled = false
+			updatedAccount.BanStatus = "BANNED"
+			updatedAccount.BanReason = "Monthly request limit reached"
+			updatedAccount.BanTime = time.Now().Unix()
+
+			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
+				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
+			}
+			return nil, fmt.Errorf("Monthly limit reached: %w", err)
 		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
 			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
 			// Token 相关错误，可能需要重新认证

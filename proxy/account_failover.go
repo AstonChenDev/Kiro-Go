@@ -19,6 +19,13 @@ func isOverageErrorMessage(msg string) bool {
 	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
 }
 
+func isMonthlyLimitErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return (strings.Contains(msg, "402") && strings.Contains(msg, "monthly_request_count")) ||
+		(strings.Contains(msg, "reached the limit") && strings.Contains(msg, "monthly_request_count"))
+}
+
+
 func isSuspensionErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "temporarily_suspended") ||
@@ -95,6 +102,8 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 
 	errMsg := err.Error()
 	switch {
+	case isMonthlyLimitErrorMessage(errMsg):
+		h.disableAccount(account, "BANNED", "Monthly request limit reached")
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)

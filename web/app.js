@@ -975,6 +975,7 @@
         '<input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" />' +
         '<div class="account-info-text">' +
         '<div class="account-email">' + escapeHtml(displayEmail) + '</div>' +
+        (banned && a.banReason ? '<div class="account-ban-reason" style="font-size: 0.75rem; color: var(--destructive); margin-top: 0.25rem; display: flex; align-items: center; gap: 0.25rem;"><i class="fa-solid fa-circle-exclamation"></i>' + escapeHtml(a.banReason) + '</div>' : '') +
         '<div class="account-meta">' +
         getSubBadge(a.subscriptionType) +
         getTrialBadge(a) +

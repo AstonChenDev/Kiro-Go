@@ -2045,12 +2045,14 @@
                 const weightVal = a.weight || 0;
                 const weightBadge = weightVal >= 2 ? '<span class="badge" style="background:#f59e0b;color:#fff">W:' + weightVal + '</span>' : '';
                 const overageBadge = a.allowOverage ? '<span class="badge badge-warning">' + t('accounts.overage') + ':' + (a.overageWeight || 1) + '</span>' : '';
+                const banned = a.banStatus && a.banStatus !== 'ACTIVE';
                 return '<div class="account-card" style="' + (isSelected ? 'border-color:#7c3aed;background:#faf5ff' : '') + '">' +
                     '<div class="account-header">' +
                     '<div class="account-info" style="display:flex;align-items:center;gap:8px">' +
                     '<input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="toggleSelectAccount(\'' + a.id + '\')" style="cursor:pointer;width:16px;height:16px;flex-shrink:0">' +
                     '<div>' +
                     '<div class="account-email">' + getDisplayEmail(a.email, a.id) + '</div>' +
+                    (banned && a.banReason ? '<div class="account-ban-reason" style="font-size: 12px; color: #dc2626; margin-top: 4px; display: flex; align-items: center; gap: 4px;"><i class="fa-solid fa-circle-exclamation"></i>' + escapeHtml(a.banReason) + '</div>' : '') +
                     '<div class="account-meta">' +
                     getSubBadge(a.subscriptionType) +
                     getTrialBadge(a) +
