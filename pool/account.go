@@ -551,7 +551,7 @@ func (p *AccountPool) Acquire(accountID string, isStream bool) bool {
 		isEnterprise = strings.EqualFold(acc.Provider, "Enterprise") || acc.AuthMethod == "idc" || acc.AuthMethod == "external_idp" || strings.EqualFold(acc.Provider, "AzureAD")
 		if isEnterprise {
 			limitSSE = 30
-			limitRPM = 0 // unlimited
+			limitRPM = 15
 		}
 		if acc.MaxSSE > 0 {
 			limitSSE = acc.MaxSSE

@@ -952,7 +952,7 @@
 
       const isEnt = (a.provider && (a.provider.toLowerCase() === 'enterprise' || a.provider.toLowerCase() === 'azuread')) || (a.authMethod && (a.authMethod.toLowerCase() === 'idc' || a.authMethod.toLowerCase() === 'external_idp'));
       const sseLimit = a.maxSSE > 0 ? a.maxSSE : (isEnt ? 30 : 3);
-      const rpmLimit = a.maxRPM > 0 ? a.maxRPM : (isEnt ? 0 : 10);
+      const rpmLimit = a.maxRPM > 0 ? a.maxRPM : (isEnt ? 15 : 10);
       const activeSseVal = a.activeSSE || 0;
       const currentRpmVal = a.currentRPM || 0;
 

@@ -419,12 +419,16 @@ func TestEnterpriseAccountLimits(t *testing.T) {
 	}
 
 	// 2. RPM limit test (stream = false)
-	// Enterprise accounts should have unlimited RPM (limitRPM = 0)
+	// Enterprise accounts should have default RPM = 15
 	p.reqTimestamps[accountID] = nil
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 15; i++ {
 		if !p.Acquire(accountID, false) {
-			t.Fatalf("expected to acquire request %d on enterprise (unlimited RPM)", i+1)
+			t.Fatalf("expected to acquire request %d on enterprise (default 15 RPM)", i+1)
 		}
+	}
+	// The 16th request should fail
+	if p.Acquire(accountID, false) {
+		t.Fatal("expected 16th request acquire to fail on enterprise")
 	}
 }
 
