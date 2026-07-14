@@ -2420,7 +2420,6 @@
       } else {
         authMethod = 'social';
       }
-      }
       let provider = item.provider || '';
       if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
       if (!provider && authMethod === 'social') provider = 'Google';
