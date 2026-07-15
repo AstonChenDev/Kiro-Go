@@ -161,10 +161,6 @@ var (
 // StartKiroSsoLogin generates PKCE codes, binds the loopback listener, and
 // returns the session plus the hosted sign-in URL the operator must open.
 func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
-	// Free the callback port from any previous abandoned session — only one
-	// sign-in can bind 127.0.0.1:3128 at a time.
-	cancelAllKiroSsoSessions()
-
 	if region == "" {
 		region = "us-east-1"
 	}
@@ -928,7 +924,7 @@ func (s *KiroSsoSession) ProcessCallbackURL(callbackURL string) (string, *KiroSs
 	// --- Case A: Enterprise Leg-1 Redirect ---
 	if u.Path != kiroOAuthCallbackPath &&
 		(strings.EqualFold(strings.TrimSpace(q.Get("login_option")), "external_idp") || strings.TrimSpace(q.Get("issuer_url")) != "") {
-		
+
 		s.mu.Lock()
 		alreadyStarted := s.leg2 != nil
 		s.mu.Unlock()
@@ -1074,4 +1070,3 @@ func DiscoverTokenEndpoint(issuerURL string, proxyURL string) (string, error) {
 	_, tokenEndpoint, err := oidcDiscover(GetAuthClientForProxy(proxyURL), issuerURL, proxyURL)
 	return tokenEndpoint, err
 }
-

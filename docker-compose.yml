@@ -13,6 +13,7 @@ services:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      - KIRO_SELECTION_STRATEGY=round_robin
       # Bind host for the Enterprise SSO callback listener INSIDE the container.
       # Default (unset) is loopback-only (127.0.0.1/::1), which the published port
       # above cannot reach; 0.0.0.0 lets the forwarded connection land. The callback

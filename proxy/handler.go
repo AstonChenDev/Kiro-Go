@@ -2498,7 +2498,7 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPollKiroSso(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
-	case path == "/auth/kiro-sso/callback" && r.Method == "POST":
+	case path == "/auth/kiro-sso/complete" && r.Method == "POST":
 		h.apiCompleteKiroSso(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
@@ -3153,54 +3153,76 @@ func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// apiCompleteKiroSso lets an operator paste the OAuth callback URL for remote
-// deployments where localhost isn't the proxy host. The callback URL is fed
-// through the session's state machine; if a redirect is returned (enterprise
-// SSO leg-1) the front end should open it in a browser.
+// apiCompleteKiroSso completes the Kiro hosted-portal sign-in (Enterprise SSO) manually
+// by receiving a manually copied callback URL.
 func (h *Handler) apiCompleteKiroSso(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SessionID        string `json:"session_id"`
-		SessionIDCamel   string `json:"sessionId"`
-		CallbackURL      string `json:"callback_url"`
-		CallbackURLCamel string `json:"callbackUrl"`
+		SessionID   string `json:"sessionId"`
+		CallbackUrl string `json:"callbackUrl"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-	sessionID := req.SessionID
-	if sessionID == "" {
-		sessionID = req.SessionIDCamel
-	}
-	callbackURL := req.CallbackURL
-	if callbackURL == "" {
-		callbackURL = req.CallbackURLCamel
-	}
-
-	if sessionID == "" || callbackURL == "" {
+	session := auth.GetKiroSsoSession(req.SessionID)
+	if session == nil {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and callbackUrl are required"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
 		return
 	}
 
-	redirectURL, err := auth.FeedCallbackURL(sessionID, callbackURL)
+	nextURL, result, err := session.ProcessCallbackURL(req.CallbackUrl)
 	if err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	if redirectURL != "" {
+	// If a nextURL is returned, it means we need the user to navigate to that URL (Leg 2)
+	if nextURL != "" {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":        "redirect",
-			"authorize_url": redirectURL,
+			"success":   true,
+			"completed": false,
+			"nextUrl":   nextURL,
 		})
 		return
 	}
 
+	// Otherwise, exchange is complete. Create the account.
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    result.AuthMethod,
+		Provider:      result.Provider,
+		Region:        result.Region,
+		ProfileArn:    result.ProfileArn,
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+		ExpiresAt:     time.Now().Unix() + int64(result.ExpiresIn),
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "accepted",
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		},
 	})
 }
 
