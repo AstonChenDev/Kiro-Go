@@ -2,6 +2,7 @@
 .github
 Kiro-Go
 data
+kiro-accounts-*.json
 backup*
 PR-*.md
 docker-compose.yml
