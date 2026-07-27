@@ -147,6 +147,9 @@ func (h *Handler) handleResponsesNonStream(
 			break
 		}
 		if !h.pool.Acquire(account.ID, false) {
+			// Account selection already reserved a scheduler in-flight slot.
+			// Acquire rejected before dispatch, so finish it neutrally.
+			h.pool.RecordPermanentRejection(account.ID)
 			excluded[account.ID] = true
 			attempt--
 			continue
@@ -345,6 +348,9 @@ func (h *Handler) handleResponsesStream(
 			break
 		}
 		if !h.pool.Acquire(account.ID, true) {
+			// Acquire did not take an SSE slot, but selection did reserve the
+			// scheduler slot. Return that reservation without penalising health.
+			h.pool.RecordPermanentRejection(account.ID)
 			excluded[account.ID] = true
 			attempt--
 			continue

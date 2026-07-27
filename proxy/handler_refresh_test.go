@@ -72,9 +72,9 @@ func TestRefreshAccountTokenDedupConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			<-start // release all goroutines together to maximize concurrency
+			<-start          // release all goroutines together to maximize concurrency
 			local := account // each goroutine simulates an independent per-request copy
-			_ = h.refreshAccountToken(&local, false)
+			_, _ = h.refreshAccountToken(&local, false)
 		}()
 	}
 	close(start)

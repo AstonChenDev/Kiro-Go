@@ -401,7 +401,9 @@ func TestEnterpriseAccountLimits(t *testing.T) {
 	}
 	// Setup Enterprise credentials in the pool
 	p.accounts = []config.Account{
-		{ID: "ent-acc", Enabled: true, Provider: "Enterprise"},
+		// Raise RPM only while exercising the independent SSE concurrency limit;
+		// otherwise the default 15 RPM guard masks the expected 30-stream cap.
+		{ID: "ent-acc", Enabled: true, Provider: "Enterprise", MaxRPM: 31},
 	}
 
 	accountID := "ent-acc"
@@ -420,6 +422,7 @@ func TestEnterpriseAccountLimits(t *testing.T) {
 
 	// 2. RPM limit test (stream = false)
 	// Enterprise accounts should have default RPM = 15
+	p.accounts[0].MaxRPM = 0
 	p.reqTimestamps[accountID] = nil
 	for i := 0; i < 15; i++ {
 		if !p.Acquire(accountID, false) {

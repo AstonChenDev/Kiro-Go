@@ -70,7 +70,6 @@ func isMonthlyLimitErrorMessage(msg string) bool {
 		(strings.Contains(msg, "reached the limit") && strings.Contains(msg, "monthly_request_count"))
 }
 
-
 func isSuspensionErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "temporarily_suspended") ||
@@ -102,17 +101,11 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 		return
 	}
 
-	updatedAccount := *account
-	if !updatedAccount.Enabled && updatedAccount.BanStatus == banStatus && updatedAccount.BanReason == banReason {
+	if !account.Enabled && account.BanStatus == banStatus && account.BanReason == banReason {
 		return
 	}
 
-	updatedAccount.Enabled = false
-	updatedAccount.BanStatus = banStatus
-	updatedAccount.BanReason = banReason
-	updatedAccount.BanTime = time.Now().Unix()
-
-	if err := config.UpdateAccount(account.ID, updatedAccount); err != nil {
+	if err := config.SetAccountBanStatus(account.ID, banStatus, banReason); err != nil {
 		logger.Warnf("[AccountFailover] Failed to disable %s: %v", account.Email, err)
 		return
 	}

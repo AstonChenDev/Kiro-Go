@@ -79,16 +79,9 @@ func TestApiImportCredentialsRejectsWhenRefreshFails(t *testing.T) {
 	}
 }
 
-// TestApiImportCredentialsUsesUpstreamExpiresAt verifies the happy path: when
-// refresh succeeds, the persisted ExpiresAt reflects the upstream expiresIn,
-// not a hard-coded 300s.
-// TestApiImportCredentialsDedupsByRefreshToken verifies the invariant stated at
-// config.go:437 / handler.go:3234 ("re-importing a backup never creates a
-// duplicate entry"): re-importing the same credential JSON must update the
-// existing account in place rather than mint a fresh id and leave two live
-// accounts sharing the same refresh token (which causes interleaved rotation
-// conflicts). The bulk import path already dedups on refresh token; the single
-// import path did not.
+// TestApiImportCredentialsDedupsByRefreshToken verifies that a duplicate
+// refresh token is rejected before a second outbound refresh. Silently updating
+// an existing account would let an import overwrite identity and profile state.
 func TestApiImportCredentialsDedupsByRefreshToken(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -96,9 +89,9 @@ func TestApiImportCredentialsDedupsByRefreshToken(t *testing.T) {
 	}
 	defer installCleanAuthClient(t)()
 
-	// Fake OIDC issues a valid access token and echoes a fixed refresh token, so
-	// both imports resolve the same persisted RefreshToken and reach the dedup.
+	refreshCalls := 0
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"accessToken":"at-new","refreshToken":"rt-shared","expiresIn":3600,"profileArn":"arn:aws:codewhisperer:profile/test"}`)
 	}))
@@ -111,20 +104,33 @@ func TestApiImportCredentialsDedupsByRefreshToken(t *testing.T) {
 	h := &Handler{pool: accountpool.GetPool()}
 	body := `{"refreshToken":"rt-good","clientId":"c","clientSecret":"s","authMethod":"idc","region":"us-east-1"}`
 
-	for i := 0; i < 2; i++ {
-		rec := httptest.NewRecorder()
-		h.apiImportCredentials(rec, httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body)))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("import #%d failed: status=%d body=%s", i+1, rec.Code, rec.Body.String())
-		}
+	first := httptest.NewRecorder()
+	h.apiImportCredentials(first, httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first import failed: status=%d body=%s", first.Code, first.Body.String())
+	}
+
+	second := httptest.NewRecorder()
+	h.apiImportCredentials(second, httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body)))
+	if second.Code != http.StatusConflict {
+		t.Fatalf("duplicate import status=%d, want 409; body=%s", second.Code, second.Body.String())
+	}
+	if !strings.Contains(second.Body.String(), "refresh token already exists") {
+		t.Fatalf("duplicate import body=%s, want duplicate refresh-token error", second.Body.String())
 	}
 
 	accs := config.GetAccounts()
 	if len(accs) != 1 {
-		t.Fatalf("re-importing the same credential must update in place, not create a duplicate sharing the refresh token; got %d accounts", len(accs))
+		t.Fatalf("duplicate import persisted %d accounts, want 1", len(accs))
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("duplicate import made %d refresh calls, want 1", refreshCalls)
 	}
 }
 
+// TestApiImportCredentialsUsesUpstreamExpiresAt verifies the happy path: when
+// refresh succeeds, the persisted ExpiresAt reflects the upstream expiresIn,
+// not a hard-coded 300s.
 func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -188,12 +194,12 @@ func authOidcURL() func(string) string { return auth.GetOIDCTokenURLForTest() }
 // clientSecret, so the old default branch misclassified them as "social".
 func TestNormalizeImportAuthMethod(t *testing.T) {
 	cases := []struct {
-		name           string
-		authMethod     string
-		clientID       string
-		clientSecret   string
-		tokenEndpoint  string
-		want           string
+		name          string
+		authMethod    string
+		clientID      string
+		clientSecret  string
+		tokenEndpoint string
+		want          string
 	}{
 		{"explicit external_idp", "external_idp", "c", "", "https://login.microsoftonline.com/t/oauth2/v2.0/token", "external_idp"},
 		{"azure alias", "AzureAD", "c", "", "https://login.microsoftonline.com/t/oauth2/v2.0/token", "external_idp"},
@@ -229,8 +235,16 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 	}
 	defer installCleanAuthClient(t)()
 
-	const upstreamExpiresIn = 3600
+	const (
+		upstreamExpiresIn = 3600
+		tenant            = "5fbc183e-3d09-4043-b36f-0c49d3665977"
+		clientID          = "fa6d79bf-cdaa-495e-8359-78aab7c7cd9b"
+		tokenPath         = "/" + tenant + "/oauth2/v2.0/token"
+	)
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != tokenPath {
+			t.Errorf("token path: want %q, got %q", tokenPath, r.URL.Path)
+		}
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
 			return
@@ -250,7 +264,11 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 
 	h := &Handler{pool: accountpool.GetPool()}
 
-	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-ext","clientId":"ext-client","tokenEndpoint":%q,"issuerUrl":"https://login.microsoftonline.com/t/v2.0","scopes":"api://x/codewhisperer:conversations offline_access","region":"eu-central-1"}`, fake.URL)
+	tokenEndpoint := fake.URL + tokenPath
+	issuerURL := fake.URL + "/" + tenant + "/v2.0"
+	scopes := "api://" + clientID + "/codewhisperer:conversations offline_access"
+	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-ext","clientId":%q,"tokenEndpoint":%q,"issuerUrl":%q,"scopes":%q,"region":"eu-central-1"}`,
+		clientID, tokenEndpoint, issuerURL, scopes)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	before := time.Now().Unix()
@@ -275,14 +293,17 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 	if got.RefreshToken != "rt-rotated" {
 		t.Fatalf("RefreshToken: want rt-rotated (rotated), got %q", got.RefreshToken)
 	}
-	if got.TokenEndpoint != fake.URL {
-		t.Fatalf("TokenEndpoint not persisted: got %q", got.TokenEndpoint)
+	if got.TokenEndpoint != tokenEndpoint {
+		t.Fatalf("TokenEndpoint: want %q, got %q", tokenEndpoint, got.TokenEndpoint)
 	}
-	if got.ClientID != "ext-client" {
-		t.Fatalf("ClientID not persisted: got %q", got.ClientID)
+	if got.IssuerURL != issuerURL {
+		t.Fatalf("IssuerURL: want %q, got %q", issuerURL, got.IssuerURL)
 	}
-	if got.Scopes == "" {
-		t.Fatalf("Scopes not persisted: got %q", got.Scopes)
+	if got.ClientID != clientID {
+		t.Fatalf("ClientID: want %q, got %q", clientID, got.ClientID)
+	}
+	if got.Scopes != scopes {
+		t.Fatalf("Scopes: want %q, got %q", scopes, got.Scopes)
 	}
 	if got.Provider != "AzureAD" {
 		t.Fatalf("Provider default: want AzureAD, got %q", got.Provider)
@@ -307,7 +328,15 @@ func TestApiImportCredentialsExternalIdpRejectsNonAllowListedEndpoint(t *testing
 
 	h := &Handler{pool: accountpool.GetPool()}
 
-	body := `{"authMethod":"external_idp","refreshToken":"rt","clientId":"c","tokenEndpoint":"https://evil.example.com/oauth/token","region":"us-east-1"}`
+	const (
+		tenant   = "5fbc183e-3d09-4043-b36f-0c49d3665977"
+		clientID = "fa6d79bf-cdaa-495e-8359-78aab7c7cd9b"
+	)
+	issuerURL := "https://login.microsoftonline.com/" + tenant + "/v2.0"
+	tokenEndpoint := "https://evil.example.com/" + tenant + "/oauth2/v2.0/token"
+	scopes := "api://" + clientID + "/codewhisperer:conversations offline_access"
+	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt","clientId":%q,"tokenEndpoint":%q,"issuerUrl":%q,"scopes":%q,"region":"us-east-1"}`,
+		clientID, tokenEndpoint, issuerURL, scopes)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.apiImportCredentials(rec, req)
@@ -337,7 +366,15 @@ func TestApiImportCredentialsExternalIdpRejectsWhenRefreshFails(t *testing.T) {
 	}
 	defer installCleanAuthClient(t)()
 
+	const (
+		tenant    = "5fbc183e-3d09-4043-b36f-0c49d3665977"
+		clientID  = "fa6d79bf-cdaa-495e-8359-78aab7c7cd9b"
+		tokenPath = "/" + tenant + "/oauth2/v2.0/token"
+	)
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != tokenPath {
+			t.Errorf("token path: want %q, got %q", tokenPath, r.URL.Path)
+		}
 		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
 	}))
 	defer fake.Close()
@@ -347,7 +384,11 @@ func TestApiImportCredentialsExternalIdpRejectsWhenRefreshFails(t *testing.T) {
 
 	h := &Handler{pool: accountpool.GetPool()}
 
-	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-broken","clientId":"c","tokenEndpoint":%q,"region":"us-east-1"}`, fake.URL)
+	tokenEndpoint := fake.URL + tokenPath
+	issuerURL := fake.URL + "/" + tenant + "/v2.0"
+	scopes := "api://" + clientID + "/codewhisperer:conversations offline_access"
+	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-broken","clientId":%q,"tokenEndpoint":%q,"issuerUrl":%q,"scopes":%q,"region":"us-east-1"}`,
+		clientID, tokenEndpoint, issuerURL, scopes)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.apiImportCredentials(rec, req)
@@ -377,7 +418,17 @@ func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T
 	}
 	defer installCleanAuthClient(t)()
 
+	const (
+		tenant     = "5fbc183e-3d09-4043-b36f-0c49d3665977"
+		clientID   = "fa6d79bf-cdaa-495e-8359-78aab7c7cd9b"
+		tokenPath  = "/" + tenant + "/oauth2/v2.0/token"
+		profileARN = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/PRESERVED"
+		providedID = "11111111-2222-3333-4444-555555555555"
+	)
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != tokenPath {
+			t.Errorf("token path: want %q, got %q", tokenPath, r.URL.Path)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"access_token":"at-ext","refresh_token":"rt-rotated","expires_in":3600}`)
 	}))
@@ -386,10 +437,30 @@ func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
+	previousRestClient := kiroRestHttpStore.Load()
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPost || req.URL.Path != "/ListAvailableProfiles" {
+				return nil, fmt.Errorf("unexpected Kiro profile request: %s %s", req.Method, req.URL)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"profiles":[{"arn":"` + profileARN + `","profileName":"Preserved"}]}`,
+				)),
+				Header: make(http.Header),
+			}, nil
+		}),
+	})
+	t.Cleanup(func() { kiroRestHttpStore.Store(previousRestClient) })
+
 	h := &Handler{pool: accountpool.GetPool()}
 
-	const providedID = "11111111-2222-3333-4444-555555555555"
-	body := fmt.Sprintf(`{"id":%q,"email":"ada@example.com","profileArn":"arn:aws:codewhisperer:eu-central-1:1:profile/PRESERVED","authMethod":"external_idp","refreshToken":"rt","clientId":"c","tokenEndpoint":%q,"region":"eu-central-1"}`, providedID, fake.URL)
+	tokenEndpoint := fake.URL + tokenPath
+	issuerURL := fake.URL + "/" + tenant + "/v2.0"
+	scopes := "api://" + clientID + "/codewhisperer:conversations offline_access"
+	body := fmt.Sprintf(`{"id":%q,"email":"ada@example.com","profileArn":%q,"authMethod":"external_idp","refreshToken":"rt","clientId":%q,"tokenEndpoint":%q,"issuerUrl":%q,"scopes":%q,"region":"eu-central-1"}`,
+		providedID, profileARN, clientID, tokenEndpoint, issuerURL, scopes)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.apiImportCredentials(rec, req)
@@ -404,7 +475,7 @@ func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T
 	if got.Email != "ada@example.com" {
 		t.Fatalf("Email: want ada@example.com (GetUserInfo empty in test → fallback), got %q", got.Email)
 	}
-	if got.ProfileArn != "arn:aws:codewhisperer:eu-central-1:1:profile/PRESERVED" {
+	if got.ProfileArn != profileARN {
 		t.Fatalf("ProfileArn: want preserved, got %q", got.ProfileArn)
 	}
 }
@@ -457,13 +528,10 @@ func TestApiImportCredentialsExternalIdpDerivesEndpointsFromUserId(t *testing.T)
 	}
 }
 
-// TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT verifies a bare
-// credential blob (clientId + accessToken + refreshToken, NO authMethod/userId/
-// tokenEndpoint) imports via TRUST-ON-IMPORT: the accessToken's JWT issuer
-// classifies it as external_idp + yields the tenant to derive the endpoint from,
-// and — because the token is an Azure AD JWT with a real exp — the credential is
-// persisted verbatim WITHOUT a live refresh round-trip (so the same JSON can be
-// re-imported without the refresh token getting consumed/rotated).
+// TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT verifies that a
+// bare credential blob can use its JWT issuer to derive the tenant-bound
+// Microsoft configuration. The pasted access token is not trusted for import:
+// the refresh token must still succeed before credentials are persisted.
 func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -471,34 +539,43 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	}
 	defer installCleanAuthClient(t)()
 
-	// Sentinel: if trust-on-import were broken, a refresh would hit this server and
-	// the persisted AccessToken would be "at-jwt" instead of the pasted JWT.
+	const (
+		tenant            = "5fbc183e-3d09-4043-b36f-0c49d3665977"
+		clientID          = "fa6d79bf-cdaa-495e-8359-78aab7c7cd9b"
+		upstreamExpiresIn = 3600
+		tokenPath         = "/" + tenant + "/oauth2/v2.0/token"
+	)
+	refreshCalls := 0
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		if r.URL.Path != tokenPath {
+			t.Errorf("token path: want %q, got %q", tokenPath, r.URL.Path)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"access_token":"at-jwt","refresh_token":"rt-j2","expires_in":3600}`)
+		fmt.Fprintf(w, `{"access_token":"at-jwt","refresh_token":"rt-j2","expires_in":%d}`, upstreamExpiresIn)
 	}))
 	defer fake.Close()
 
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
-	// Bare blob: only clientId + accessToken + refreshToken. The access token is an
-	// Azure AD JWT (iss + future exp) → external_idp + derived tenant + trust-on-import
-	// (NO live refresh; pasted tokens persist verbatim, ExpiresAt from JWT exp).
-	tenant := "5fbc183e-3d09-4043-b36f-0c49d3665977"
-	const exp int64 = 2000000000
+	// Bare blob: only clientId + accessToken + refreshToken. The issuer identifies
+	// Microsoft and the tenant; the access-token expiry itself is not trusted.
+	jwtExp := time.Now().Add(2 * time.Hour).Unix()
 	jwt := "eyJhbGciOiJub25lIn0." +
-		base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iss":%q,"exp":%d}`, fake.URL+"/"+tenant+"/v2.0", exp))) + "."
+		base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iss":%q,"exp":%d}`, fake.URL+"/"+tenant+"/v2.0", jwtExp))) + "."
 
 	h := &Handler{pool: accountpool.GetPool()}
 
-	body := fmt.Sprintf(`{"clientId":"fa6d79bf-cdaa-495e-8359-78aab7c7cd9b","accessToken":%q,"refreshToken":"rt","region":"eu-central-1"}`, jwt)
+	body := fmt.Sprintf(`{"clientId":%q,"accessToken":%q,"refreshToken":"rt","region":"eu-central-1"}`, clientID, jwt)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
+	before := time.Now().Unix()
 	h.apiImportCredentials(rec, req)
+	after := time.Now().Unix()
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 (trust-on-import), got %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 after validated refresh, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	got := config.GetAccounts()[0]
 	if got.AuthMethod != "external_idp" {
@@ -508,14 +585,20 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	if got.TokenEndpoint != wantTE {
 		t.Fatalf("derived TokenEndpoint: want %q, got %q", wantTE, got.TokenEndpoint)
 	}
-	if got.AccessToken != jwt {
-		t.Fatalf("AccessToken: want the pasted JWT persisted verbatim (trust-on-import), got %q", got.AccessToken)
+	if got.AccessToken != "at-jwt" {
+		t.Fatalf("AccessToken: want refreshed token at-jwt, got %q", got.AccessToken)
 	}
-	if got.ExpiresAt != exp {
-		t.Fatalf("ExpiresAt: want %d (from JWT exp, trust-on-import), got %d", exp, got.ExpiresAt)
+	if got.ExpiresAt < before+upstreamExpiresIn-5 || got.ExpiresAt > after+upstreamExpiresIn+5 {
+		t.Fatalf("ExpiresAt not derived from refresh response: got %d (want ~now+%d)", got.ExpiresAt, upstreamExpiresIn)
 	}
-	if got.RefreshToken != "rt" {
-		t.Fatalf("RefreshToken: want the pasted token (not rotated), got %q", got.RefreshToken)
+	if got.RefreshToken != "rt-j2" {
+		t.Fatalf("RefreshToken: want rotated token rt-j2, got %q", got.RefreshToken)
+	}
+	if got.RefreshTokenFingerprint != config.RefreshTokenFingerprint("rt") {
+		t.Fatalf("RefreshTokenFingerprint does not identify the imported refresh token")
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls: want 1, got %d", refreshCalls)
 	}
 }
 
@@ -550,7 +633,7 @@ func TestApiImportCredentialsApiKeyBranch(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.apiImportCredentials(rec, req)
 
-	if rec.Code != 200 {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	accs := config.GetAccounts()
@@ -595,5 +678,84 @@ func TestApiImportCredentialsApiKeyRequiresKey(t *testing.T) {
 	}
 	if accs := config.GetAccounts(); len(accs) != 0 {
 		t.Fatalf("expected no account persisted, got %d", len(accs))
+	}
+}
+
+func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// The import handler starts an un-awaited model-list refresh for enabled
+	// accounts. Keep it on an inert transport so this test never reaches the
+	// network or initializes ProxyFromEnvironment ahead of transport tests.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_test_import|eu-central-1","authMethod":"api_key","nickname":"cli-key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "api_key" || got.KiroApiKey != "ksk_test_import" {
+		t.Fatalf("unexpected account: %+v", got)
+	}
+	if got.AccessToken != "ksk_test_import" {
+		t.Fatalf("accessToken should mirror api key, got %q", got.AccessToken)
+	}
+	if got.Region != "eu-central-1" {
+		t.Fatalf("region = %q", got.Region)
+	}
+	if got.RefreshToken != "" || got.ExpiresAt != 0 || got.ProfileArn != "" {
+		t.Fatalf("oauth fields should be empty: %+v", got)
+	}
+	if got.MachineId != config.MachineIdFromAPIKey("ksk_test_import") {
+		t.Fatalf("machineId = %q", got.MachineId)
+	}
+}
+
+func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_dup_import","authMethod":"api_key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first import expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req2 := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec2 := httptest.NewRecorder()
+	h.apiImportCredentials(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("duplicate expected 409, got %d body=%s", rec2.Code, rec2.Body.String())
 	}
 }

@@ -59,21 +59,42 @@ func TestRegionalizeURLForRegionNoCodewhispererRegionalHost(t *testing.T) {
 	}
 }
 
-// TestKiroProfileRegionCandidatesExternalIdp checks that an external_idp account —
-// whose home region is unknown and defaults to us-east-1 — probes the account region
-// first and then the built-in fallbacks, de-duplicated.
+// TestKiroProfileRegionCandidatesExternalIdp checks that Account.Region remains
+// the OAuth/OIDC authentication region. Profile discovery uses the cached profile
+// ARN when present, then an explicit ApiRegion, followed by the known Kiro
+// data-plane defaults.
 func TestKiroProfileRegionCandidatesExternalIdp(t *testing.T) {
-	// Default us-east-1 external_idp login: fallbacks follow.
+	// The authentication region is not a profile-region candidate.
 	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "external_idp", Region: "us-east-1"})
 	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 
-	// Already-detected eu-central-1 leads; us-east-1 fallback follows.
+	// A different authentication region does not reorder the data-plane defaults.
 	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "external_idp", Region: "eu-central-1"})
-	assertOrder(t, got, []string{"eu-central-1", "us-east-1"})
+	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 
-	// A non-default region leads, both defaults follow.
-	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "external_idp", Region: "ap-southeast-2"})
+	// A cached profile ARN is authoritative and leads the fallback list.
+	got = kiroProfileRegionCandidates(&config.Account{
+		AuthMethod: "external_idp",
+		Region:     "eu-central-1",
+		ProfileArn: "arn:aws:codewhisperer:ap-southeast-2:123456789012:profile/test",
+	})
 	assertOrder(t, got, []string{"ap-southeast-2", "us-east-1", "eu-central-1"})
+
+	// An explicit data-plane region follows the cached profile region and is
+	// de-duplicated against the built-in fallback list.
+	got = kiroProfileRegionCandidates(&config.Account{
+		AuthMethod: "external_idp",
+		Region:     "eu-west-1",
+		ApiRegion:  "ap-south-1",
+		ProfileArn: "arn:aws:codewhisperer:ap-southeast-2:123456789012:profile/test",
+	})
+	assertOrder(t, got, []string{"ap-southeast-2", "ap-south-1", "us-east-1", "eu-central-1"})
+
+	got = kiroProfileRegionCandidates(&config.Account{
+		AuthMethod: "external_idp",
+		ApiRegion:  "eu-central-1",
+	})
+	assertOrder(t, got, []string{"eu-central-1", "us-east-1"})
 }
 
 // TestKiroProfileRegionCandidatesNoRegion checks an account with no region set falls
@@ -83,46 +104,65 @@ func TestKiroProfileRegionCandidatesNoRegion(t *testing.T) {
 	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 }
 
-// TestKiroProfileRegionCandidatesSingleRegionAuthMethods checks that social/
-// Builder ID accounts — which already carry their authoritative region — are probed
-// against that single region only, with no fallback probing.
-func TestKiroProfileRegionCandidatesSingleRegionAuthMethods(t *testing.T) {
+// TestKiroProfileRegionCandidatesIgnoresOAuthAuthRegion checks that OAuth account
+// authentication regions never become profile-discovery regions. API-key accounts
+// use EffectiveApiRegion for data-plane calls instead.
+func TestKiroProfileRegionCandidatesIgnoresOAuthAuthRegion(t *testing.T) {
 	for _, method := range []string{"social", "builderId", ""} {
 		got := kiroProfileRegionCandidates(&config.Account{AuthMethod: method, Region: "eu-central-1"})
-		if len(got) != 1 || got[0] != "eu-central-1" {
-			t.Fatalf("authMethod %q: candidate regions = %v, want [eu-central-1] only", method, got)
-		}
+		assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 	}
+
+	got := kiroProfileRegionCandidates(&config.Account{
+		AuthMethod: "external_idp",
+		Region:     "ap-south-1",
+		ApiRegion:  "evil.amazonaws.com",
+	})
+	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
+
+	apiKey := &config.Account{
+		AuthMethod: "api_key",
+		KiroApiKey: "ksk_test",
+		Region:     "us-east-1",
+		ApiRegion:  "eu-central-1",
+	}
+	if got := kiroRegionForProfile(apiKey, ""); got != "eu-central-1" {
+		t.Fatalf("API-key data-plane region = %q, want EffectiveApiRegion eu-central-1", got)
+	}
+	assertOrder(t, kiroProfileRegionCandidates(apiKey), []string{"us-east-1", "eu-central-1"})
 }
 
 // TestKiroProfileRegionCandidatesIdcFallback checks that idc (IAM Identity Center /
-// enterprise SSO) accounts — whose SSO portal region (e.g. us-east-1) does not
-// guarantee the profile region — probe fallback regions just like external_idp.
+// enterprise SSO) Account.Region is authentication-only, so profile discovery
+// probes the same known defaults as other OAuth methods.
 func TestKiroProfileRegionCandidatesIdcFallback(t *testing.T) {
-	// Default us-east-1 idc login: fallbacks follow.
 	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Region: "us-east-1"})
 	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 
-	// Already eu-central-1 leads; us-east-1 fallback follows.
+	// Authentication region does not reorder profile data planes.
 	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Region: "eu-central-1"})
-	assertOrder(t, got, []string{"eu-central-1", "us-east-1"})
+	assertOrder(t, got, []string{"us-east-1", "eu-central-1"})
 }
 
 // TestKiroProfileRegionCandidatesEnvOverride checks KIRO_PROFILE_REGIONS replaces
-// the built-in fallbacks (external_idp only) while the account region is tried first.
+// the built-in fallback list for OAuth methods without promoting Account.Region.
+// An explicit ApiRegion still precedes the environment-provided fallback list.
 func TestKiroProfileRegionCandidatesEnvOverride(t *testing.T) {
 	t.Setenv("KIRO_PROFILE_REGIONS", "eu-west-1, ap-south-1 ,eu-west-1")
-	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "external_idp", Region: "us-east-1"})
-	// us-east-1 (account) first; env values de-duplicated and trimmed; no built-in defaults.
-	assertOrder(t, got, []string{"us-east-1", "eu-west-1", "ap-south-1"})
+	got := kiroProfileRegionCandidates(&config.Account{
+		AuthMethod: "external_idp",
+		Region:     "us-east-1",
+		ApiRegion:  "ap-northeast-1",
+	})
+	// Environment values are de-duplicated and trimmed; built-in defaults are replaced.
+	assertOrder(t, got, []string{"ap-northeast-1", "eu-west-1", "ap-south-1"})
 
-	// An idc account also uses env fallbacks (enterprise SSO can have cross-region profiles).
+	// All OAuth methods use the same profile-region extension list.
 	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "idc", Region: "us-east-1"})
-	assertOrder(t, got, []string{"us-east-1", "eu-west-1", "ap-south-1"})
+	assertOrder(t, got, []string{"eu-west-1", "ap-south-1"})
 
-	// A social account ignores the env fallbacks entirely.
 	got = kiroProfileRegionCandidates(&config.Account{AuthMethod: "social", Region: "us-east-1"})
-	assertOrder(t, got, []string{"us-east-1"})
+	assertOrder(t, got, []string{"eu-west-1", "ap-south-1"})
 }
 
 func assertOrder(t *testing.T, got, want []string) {

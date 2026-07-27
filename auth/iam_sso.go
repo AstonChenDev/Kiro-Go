@@ -42,9 +42,11 @@ var scopes = []string{
 
 // StartIamSsoLogin 发起 IAM SSO 登录
 func StartIamSsoLogin(startUrl, region string) (sessionID, authorizeUrl string, expiresIn int, err error) {
-	if region == "" {
-		region = "us-east-1"
+	normalizedRegion, err := normalizeAWSRegionOrDefault(region)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("IAM SSO region rejected: %w", err)
 	}
+	region = normalizedRegion
 
 	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
 	redirectUri := "http://127.0.0.1/oauth/callback"
@@ -135,7 +137,11 @@ func CompleteIamSsoLogin(sessionID, callbackUrl string) (accessToken, refreshTok
 	}
 
 	// 用 code 换取 token
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", session.Region)
+	normalizedRegion, err := normalizeAWSRegionOrDefault(session.Region)
+	if err != nil {
+		return "", "", "", "", "", 0, fmt.Errorf("IAM SSO session region rejected: %w", err)
+	}
+	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", normalizedRegion)
 	accessToken, refreshToken, expiresIn, err = exchangeToken(
 		oidcBase,
 		session.ClientID,

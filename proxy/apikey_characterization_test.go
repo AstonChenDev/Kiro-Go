@@ -36,8 +36,13 @@ func TestApiKeyAccountDoesNotRefreshOnHandlerPath(t *testing.T) {
 	if !account.IsApiKeyCredential() {
 		t.Fatalf("expected IsApiKeyCredential() == true")
 	}
-	h := &Handler{pool: accountpool.GetPool()}
-	if err := h.refreshAccountToken(account, false); err != nil {
+	if err := config.AddAccount(*account); err != nil {
+		t.Fatalf("config.AddAccount: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+	if _, err := h.refreshAccountToken(account, false); err != nil {
 		t.Fatalf("refreshAccountToken returned error: %v", err)
 	}
 }

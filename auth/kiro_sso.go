@@ -75,20 +75,6 @@ const (
 	kiroSsoLoginTimeout = 10 * time.Minute
 )
 
-// allowedExternalIdpIssuerSuffixes restricts which IdP issuer/endpoint hosts the
-// enterprise leg will discover and redirect to. The issuer arrives in an
-// attacker-influenceable portal callback query, so it is constrained to known
-// enterprise IdP hosts (Microsoft Entra / Azure AD — the supported provider).
-// This is the primary control against SSRF, open-redirect, and forced-auth abuse
-// via a forged /signin/callback. The leading dot anchors each suffix to a real
-// subdomain boundary so "evil-microsoftonline.com" cannot match. Extend this
-// list to onboard additional enterprise IdPs.
-var allowedExternalIdpIssuerSuffixes = []string{
-	".microsoftonline.com",
-	".microsoftonline.us",
-	".microsoftonline.cn",
-}
-
 // KiroSsoSession holds the transient state for one hosted-portal sign-in attempt.
 type KiroSsoSession struct {
 	ID        string
@@ -161,9 +147,14 @@ var (
 // StartKiroSsoLogin generates PKCE codes, binds the loopback listener, and
 // returns the session plus the hosted sign-in URL the operator must open.
 func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
-	if region == "" {
-		region = "us-east-1"
+	normalizedRegion, err := normalizeAWSRegionOrDefault(region)
+	if err != nil {
+		return nil, "", fmt.Errorf("Kiro SSO region rejected: %w", err)
 	}
+	region = normalizedRegion
+	// The callback port is fixed, so only one hosted legacy login can be active.
+	// Retire abandoned sessions before attempting to bind the listener again.
+	cancelAllKiroSsoSessions()
 
 	verifier := generateCodeVerifier()
 	challenge := generateCodeChallenge(verifier)
@@ -191,19 +182,18 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 	params.Set("redirect_from", kiroRedirectFrom)
 	signInURL := kiroSignInBaseURL + "?" + params.Encode()
 
-	kiroSsoSessionsMu.Lock()
-	kiroSsoSessions[session.ID] = session
-	kiroSsoSessionsMu.Unlock()
-
 	// Self-teardown at the deadline: free the loopback listener and drop the
 	// session even if the operator abandons the sign-in and the front end stops
 	// polling. Without this an abandoned login would hold 127.0.0.1:3128 until the
 	// process restarts and block every subsequent SSO login (the redirect port is
 	// fixed, so only one sign-in can use it at a time).
+	kiroSsoSessionsMu.Lock()
 	session.timer = time.AfterFunc(kiroSsoLoginTimeout, func() {
 		session.close()
 		removeKiroSsoSession(session.ID)
 	})
+	kiroSsoSessions[session.ID] = session
+	kiroSsoSessionsMu.Unlock()
 
 	return session, signInURL, nil
 }
@@ -247,7 +237,7 @@ func (s *KiroSsoSession) exchange(capture kiroSsoCapture) (*KiroSsoResult, strin
 
 	if capture.kind == "external_idp" {
 		access, refresh, expiresIn, err := exchangeExternalIdpCode(
-			client, capture.tokenEndpoint, capture.clientID, capture.code,
+			client, capture.tokenEndpoint, capture.issuerURL, capture.clientID, capture.code,
 			capture.codeVerifier, capture.redirectURI, capture.scopes,
 		)
 		if err != nil {
@@ -353,6 +343,11 @@ func (s *KiroSsoSession) close() {
 	})
 }
 
+func (s *KiroSsoSession) finishManualCallback() {
+	s.close()
+	removeKiroSsoSession(s.ID)
+}
+
 // cancelAllKiroSsoSessions tears down every in-flight session, freeing the
 // loopback callback port. Called whenever a new SSO login starts so that a
 // stale/abandoned session never blocks the next attempt.
@@ -434,9 +429,9 @@ func (w *redirectCapturingWriter) WriteHeader(statusCode int) {
 // or HTML pages to a real HTTP response.
 type discardResponseWriter struct{}
 
-func (discardResponseWriter) Header() http.Header           { return http.Header{} }
-func (discardResponseWriter) Write(b []byte) (int, error)   { return len(b), nil }
-func (discardResponseWriter) WriteHeader(statusCode int)    {}
+func (discardResponseWriter) Header() http.Header         { return http.Header{} }
+func (discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (discardResponseWriter) WriteHeader(statusCode int)  {}
 
 // deliver pushes the first (and only) capture onto the result channel.
 func (s *KiroSsoSession) deliver(capture kiroSsoCapture) {
@@ -478,14 +473,15 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 			s.deliver(kiroSsoCapture{err: fmt.Errorf("invalid external IdP descriptor (missing client_id)")})
 			return
 		}
-		// oidcDiscover validates the issuer + both discovered endpoints against
-		// the IdP host allow-list, so the issuer here is not trusted blindly.
-		authEndpoint, tokenEndpoint, errDisc := oidcDiscover(GetAuthClientForProxy(s.ProxyURL), issuerURL, s.ProxyURL)
+		authEndpoint, tokenEndpoint, normalizedScopes, errDisc := resolveLegacyExternalIdpDescriptor(
+			GetAuthClientForProxy(s.ProxyURL), issuerURL, clientID, scopes, s.ProxyURL,
+		)
 		if errDisc != nil {
 			writeKiroCallbackPage(w, false)
 			s.deliver(kiroSsoCapture{err: errDisc})
 			return
 		}
+		scopes = normalizedScopes
 		verifier := generateCodeVerifier()
 		state2 := uuid.New().String()
 		redirectURI := kiroRedirectURI + kiroOAuthCallbackPath
@@ -576,39 +572,11 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 
 // --- OIDC discovery + token exchange (enterprise / external IdP leg) ---------
 
-// validateExternalIdpEndpoint verifies rawURL is an https URL whose host is a
-// non-IP, allow-listed enterprise IdP host. It gates the issuer (before
-// discovery) and BOTH discovered endpoints (the authorize URL the browser is
-// 302'd to, and the token endpoint the code is exchanged at).
-func validateExternalIdpEndpoint(rawURL string) error {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return fmt.Errorf("invalid external IdP URL: %w", err)
-	}
-	if !strings.EqualFold(u.Scheme, "https") {
-		return fmt.Errorf("external IdP URL must be https")
-	}
-	host := strings.ToLower(u.Hostname())
-	if host == "" {
-		return fmt.Errorf("external IdP URL has no host")
-	}
-	// Reject IP-literal hosts outright; only named, allow-listed hosts pass.
-	if net.ParseIP(host) != nil {
-		return fmt.Errorf("external IdP host must not be an IP literal")
-	}
-	for _, suffix := range allowedExternalIdpIssuerSuffixes {
-		if strings.HasSuffix(host, suffix) {
-			return nil
-		}
-	}
-	return fmt.Errorf("external IdP host %q is not allow-listed", host)
-}
-
 // externalIdpEndpointValidator is the function ValidateExternalIdpEndpoint delegates
 // to. Tests override it via SetExternalIdpValidatorForTest so a happy-path import
 // test can POST against an httptest server (http + 127.0.0.1) that the real
 // allow-list would reject.
-var externalIdpEndpointValidator = validateExternalIdpEndpoint
+var externalIdpEndpointValidator = validateMicrosoftExternalIdpEndpoint
 
 // ValidateExternalIdpEndpoint is the exported entry point for validating a user- or
 // discovery-supplied external IdP endpoint URL. The credential-import path
@@ -673,107 +641,31 @@ func ExpFromAccessTokenJWT(accessToken string) int64 {
 	return claims.Exp
 }
 
-// DeriveExternalIdpEndpoints reconstructs the Microsoft / Azure AD token endpoint,
-// OIDC issuer, and default scopes for an external-IdP credential. The Azure tenant
-// is recovered from userId (Kiro Account Manager exports carry it at account
-// level) or, failing that, from the accessToken JWT's issuer (bare blobs with only
-// clientId + accessToken + refreshToken). This lets the credential-import path
-// accept those shapes even though they omit tokenEndpoint/issuerUrl/scopes.
-//
-// userId / iss look like: https://login.microsoftonline.com/<tenant>/v2.0.<oid>
-// Returns empty strings if neither source yields a usable tenant, so the caller
-// can fall back to its "requires clientId and tokenEndpoint" error. The derived
-// tokenEndpoint is re-validated against the IdP allow-list by the caller, so a
-// non-allow-listed host (or the test's http+127.0.0.1 fake) is still gated.
-func DeriveExternalIdpEndpoints(userId, clientID, accessToken string) (tokenEndpoint, issuerURL, scopes string) {
-	src := strings.TrimSpace(userId)
-	if src == "" {
-		// Bare credential blobs carry only clientId + accessToken: recover the
-		// tenant from the access token's JWT issuer.
-		src = strings.TrimSpace(issuerFromAccessTokenJWT(accessToken))
-	}
-	if src == "" {
-		return "", "", ""
-	}
-	u, err := url.Parse(src)
-	if err != nil || u.Host == "" {
-		return "", "", ""
-	}
-	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(segments) == 0 || segments[0] == "" {
-		return "", "", ""
-	}
-	tenant := segments[0]
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "https"
-	}
-	tokenEndpoint = fmt.Sprintf("%s://%s/%s/oauth2/v2.0/token", scheme, u.Host, tenant)
-	issuerURL = fmt.Sprintf("%s://%s/%s/v2.0", scheme, u.Host, tenant)
-	if clientID != "" {
-		scopes = fmt.Sprintf("api://%s/codewhisperer:conversations api://%s/codewhisperer:completions offline_access", clientID, clientID)
-	}
-	return tokenEndpoint, issuerURL, scopes
-}
-
 // oidcDiscover fetches the OpenID Connect discovery document for issuerURL and
 // returns its authorization and token endpoints. The issuer and BOTH discovered
 // endpoints are validated against the IdP host allow-list; redirects are NOT
 // followed (so a discovery host cannot bounce the fetch to an internal target);
 // and no response body is echoed into errors.
-func oidcDiscover(client *http.Client, issuerURL, proxyURL string) (authEndpoint, tokenEndpoint string, err error) {
-	if err = validateExternalIdpEndpoint(issuerURL); err != nil {
-		return "", "", err
-	}
-	docURL := strings.TrimRight(strings.TrimSpace(issuerURL), "/") + "/.well-known/openid-configuration"
-	req, err := http.NewRequest(http.MethodGet, docURL, nil)
+func oidcDiscover(client *http.Client, issuerURL, _ string) (authEndpoint, tokenEndpoint string, err error) {
+	return discoverMicrosoftOIDC(client, issuerURL)
+}
+
+func resolveLegacyExternalIdpDescriptor(
+	client *http.Client,
+	issuerURL, clientID, scopes, proxyURL string,
+) (authEndpoint, tokenEndpoint, normalizedScopes string, err error) {
+	normalizedScopes, err = NormalizeExternalIdpScopes(scopes, clientID)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to build OIDC discovery request: %w", err)
+		return "", "", "", err
 	}
-	req.Header.Set("Accept", "application/json")
-	// Do not follow redirects: the allow-listed issuer host must answer directly,
-	// so a 3xx (which could point at an internal/link-local target) is a failure.
-	noRedirect := &http.Client{
-		Timeout:       30 * time.Second,
-		Transport:     buildAuthTransport(proxyURL),
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-	resp, err := noRedirect.Do(req)
+	authEndpoint, tokenEndpoint, err = oidcDiscover(client, issuerURL, proxyURL)
 	if err != nil {
-		return "", "", fmt.Errorf("OIDC discovery request failed: %w", err)
+		return "", "", "", err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", "", fmt.Errorf("failed to read OIDC discovery response: %w", err)
+	if err := ValidateExternalIdpConfiguration(clientID, tokenEndpoint, issuerURL, normalizedScopes); err != nil {
+		return "", "", "", err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Deliberately omit the body to avoid exfiltrating an internal response.
-		return "", "", fmt.Errorf("OIDC discovery failed (status %d)", resp.StatusCode)
-	}
-	var doc struct {
-		AuthorizationEndpoint string `json:"authorization_endpoint"`
-		TokenEndpoint         string `json:"token_endpoint"`
-	}
-	if err = json.Unmarshal(body, &doc); err != nil {
-		return "", "", fmt.Errorf("failed to parse OIDC discovery document: %w", err)
-	}
-	if doc.AuthorizationEndpoint == "" || doc.TokenEndpoint == "" {
-		return "", "", fmt.Errorf("OIDC discovery document missing authorization_endpoint or token_endpoint")
-	}
-	// Both endpoints must themselves be https + allow-listed. The allow-list (the
-	// trust boundary) is the only check applied here, not equality with the issuer
-	// host: within Microsoft's own *.microsoftonline.com infrastructure the
-	// discovery doc legitimately points authorize/token at sibling hosts. If the
-	// allow-list is ever broadened to multiple distinct IdPs, tighten this to also
-	// pin the endpoints to the issuer's registrable host.
-	if err = validateExternalIdpEndpoint(doc.AuthorizationEndpoint); err != nil {
-		return "", "", fmt.Errorf("discovered authorization_endpoint rejected: %w", err)
-	}
-	if err = validateExternalIdpEndpoint(doc.TokenEndpoint); err != nil {
-		return "", "", fmt.Errorf("discovered token_endpoint rejected: %w", err)
-	}
-	return doc.AuthorizationEndpoint, doc.TokenEndpoint, nil
+	return authEndpoint, tokenEndpoint, normalizedScopes, nil
 }
 
 // externalIdpAuthorizeURL builds the IdP authorization-code+PKCE URL the browser
@@ -799,7 +691,7 @@ func externalIdpAuthorizeURL(authEndpoint, clientID, redirectURI, scopes, challe
 // verifier) for IdP tokens at the discovered token endpoint. Standard OAuth2
 // authorization_code grant for a public client (PKCE, no client secret);
 // request is form-encoded and the response is snake_case.
-func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, clientID, code, codeVerifier, redirectURI, scopes string) (accessToken, refreshToken string, expiresIn int, err error) {
+func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, issuerURL, clientID, code, codeVerifier, redirectURI, scopes string) (accessToken, refreshToken string, expiresIn int, err error) {
 	form := url.Values{}
 	form.Set("client_id", clientID)
 	form.Set("grant_type", "authorization_code")
@@ -809,7 +701,11 @@ func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, clientID, code,
 	if strings.TrimSpace(scopes) != "" {
 		form.Set("scope", scopes)
 	}
-	return postExternalIdpToken(client, tokenEndpoint, form)
+	token, err := postExternalIdpToken(client, tokenEndpoint, issuerURL, form)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return token.AccessToken, token.RefreshToken, token.ExpiresIn, nil
 }
 
 // exchangeSocialCode exchanges a Cognito authorization code (with its PKCE
@@ -940,16 +836,26 @@ func (s *KiroSsoSession) ProcessCallbackURL(callbackURL string) (string, *KiroSs
 			return "", nil, fmt.Errorf("invalid external IdP descriptor (missing client_id)")
 		}
 
-		authEndpoint, tokenEndpoint, errDisc := oidcDiscover(GetAuthClientForProxy(s.ProxyURL), issuerURL, s.ProxyURL)
+		authEndpoint, tokenEndpoint, normalizedScopes, errDisc := resolveLegacyExternalIdpDescriptor(
+			GetAuthClientForProxy(s.ProxyURL), issuerURL, clientID, scopes, s.ProxyURL,
+		)
 		if errDisc != nil {
 			return "", nil, errDisc
 		}
+		scopes = normalizedScopes
 
 		verifier := generateCodeVerifier()
 		state2 := uuid.New().String()
 		redirectURI := kiroRedirectURI + kiroOAuthCallbackPath
 
 		s.mu.Lock()
+		// Discovery is intentionally performed without holding s.mu. Re-check
+		// after that network round-trip so concurrent manual descriptors cannot
+		// overwrite the first leg-2 state/verifier that was installed.
+		if s.leg2 != nil {
+			s.mu.Unlock()
+			return "", nil, fmt.Errorf("enterprise SSO login already in progress")
+		}
 		s.leg2 = &kiroLeg2{
 			state:         state2,
 			verifier:      verifier,
@@ -977,6 +883,7 @@ func (s *KiroSsoSession) ProcessCallbackURL(callbackURL string) (string, *KiroSs
 		if state == "" || state != ctx2.state {
 			return "", nil, fmt.Errorf("anti-CSRF state mismatch on Enterprise SSO callback")
 		}
+		defer s.finishManualCallback()
 		if errParam != "" {
 			desc := strings.TrimSpace(q.Get("error_description"))
 			return "", nil, fmt.Errorf("external IdP authorization error: %s %s", errParam, desc)
@@ -1007,6 +914,7 @@ func (s *KiroSsoSession) ProcessCallbackURL(callbackURL string) (string, *KiroSs
 	if state == "" || state != s.State {
 		return "", nil, fmt.Errorf("anti-CSRF state mismatch on SSO callback")
 	}
+	defer s.finishManualCallback()
 	if errParam != "" {
 		desc := strings.TrimSpace(q.Get("error_description"))
 		return "", nil, fmt.Errorf("SSO authorization error: %s %s", errParam, desc)

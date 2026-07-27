@@ -15,11 +15,29 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+)
+
+const defaultAWSRegion = "us-east-1"
+
+var (
+	ErrAccountNotFound       = errors.New("account not found")
+	ErrDuplicateAccountID    = errors.New("account ID already exists")
+	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
+	ErrDuplicateAPIKey       = errors.New("account API key already exists")
+	ErrEmptyAPIKey           = errors.New("kiroApiKey is empty")
+
+	// AWS region identifiers are single DNS labels ending in a numeric generation
+	// (for example us-east-1, us-gov-west-1, or eusc-de-east-1). Do not keep an
+	// enumerated allow-list here: new AWS regions must remain usable without a
+	// release, while the syntax check still prevents URL authority/path injection.
+	awsRegionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)+-[0-9]+$`)
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -138,18 +156,25 @@ type Account struct {
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
 	// Authentication credentials
-	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
-	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
+	AccessToken  string `json:"accessToken"`  // OAuth access token for API calls
+	RefreshToken string `json:"refreshToken"` // OAuth refresh token for token renewal
+	// RefreshTokenFingerprint is a one-way identifier for the credential that
+	// originally created this account. It prevents a previously imported token
+	// from being imported again after the provider rotates it.
+	RefreshTokenFingerprint string `json:"refreshTokenFingerprint,omitempty"`
+	// KiroApiKey is a headless Kiro API key (typically ksk_...). When set,
+	// AuthMethod is "api_key" and the key is used directly as the Bearer token
+	// without OAuth refresh. AccessToken is kept in sync for the shared request path.
+	KiroApiKey   string `json:"kiroApiKey,omitempty"`
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
 	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), or "api_key" (Kiro API key used directly as bearer)
-	KiroApiKey   string `json:"kiroApiKey,omitempty"`   // API key credential, used directly as the bearer token when AuthMethod == "api_key"
 	AuthRegion   string `json:"authRegion,omitempty"`   // Region for token-refresh endpoints; falls back to Region
 	ApiRegion    string `json:"apiRegion,omitempty"`    // Region for API request hosts; falls back to Region
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
+	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds); unused for API Key
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
 	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
 
@@ -226,55 +251,57 @@ type Account struct {
 // refresh and profile-ARN resolution. True when KiroApiKey is set OR the
 // authMethod is "api_key"/"apikey" (case-insensitive).
 func (a *Account) IsApiKeyCredential() bool {
-	if a == nil {
-		return false
-	}
-	if a.KiroApiKey != "" {
-		return true
-	}
-	m := strings.ToLower(a.AuthMethod)
-	return m == "api_key" || m == "apikey"
+	return IsAPIKeyAccount(a)
 }
 
 // EffectiveAuthRegion returns the region used for token-refresh endpoints, with
 // the fallback chain: account.AuthRegion > account.Region > global AuthRegion
-// (if set and not us-east-1) > global Region (if set and not us-east-1) > us-east-1.
+// (when explicitly set) > global Region > us-east-1.
+//
+// Invalid candidates are ignored defensively. Persisted and newly-added
+// accounts are rejected earlier, but this keeps manually-constructed Account
+// values from ever becoming part of an outbound hostname.
 func (a *Account) EffectiveAuthRegion() string {
+	var authRegion, region string
 	if a != nil {
-		if r := strings.TrimSpace(a.AuthRegion); r != "" {
-			return r
-		}
-		if r := strings.TrimSpace(a.Region); r != "" {
-			return r
-		}
+		authRegion = a.AuthRegion
+		region = a.Region
 	}
-	if r := GetGlobalAuthRegion(); r != "" && r != "us-east-1" {
-		return r
-	}
-	if r := GetGlobalRegion(); r != "" && r != "us-east-1" {
-		return r
-	}
-	return "us-east-1"
+	return effectiveAWSRegion(authRegion, region, true)
 }
 
 // EffectiveApiRegion returns the region used for API request hosts, with the
 // same fallback chain as EffectiveAuthRegion but using ApiRegion.
 func (a *Account) EffectiveApiRegion() string {
+	var apiRegion, region string
 	if a != nil {
-		if r := strings.TrimSpace(a.ApiRegion); r != "" {
-			return r
+		apiRegion = a.ApiRegion
+		region = a.Region
+	}
+	return effectiveAWSRegion(apiRegion, region, false)
+}
+
+func effectiveAWSRegion(accountSpecialized, accountRegion string, auth bool) string {
+	for _, candidate := range []string{accountSpecialized, accountRegion} {
+		if normalized, err := NormalizeAWSRegion(candidate); err == nil {
+			return normalized
 		}
-		if r := strings.TrimSpace(a.Region); r != "" {
-			return r
+	}
+
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg != nil {
+		globalSpecialized := cfg.ApiRegion
+		if auth {
+			globalSpecialized = cfg.AuthRegion
+		}
+		for _, candidate := range []string{globalSpecialized, cfg.Region} {
+			if normalized, err := NormalizeAWSRegion(candidate); err == nil {
+				return normalized
+			}
 		}
 	}
-	if r := GetGlobalApiRegion(); r != "" && r != "us-east-1" {
-		return r
-	}
-	if r := GetGlobalRegion(); r != "" && r != "us-east-1" {
-		return r
-	}
-	return "us-east-1"
+	return defaultAWSRegion
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -344,9 +371,9 @@ type Config struct {
 
 	// Region defaults for accounts that omit per-account region/authRegion/apiRegion.
 	// Defaults to "us-east-1" when empty (see GetGlobalRegion* / Account.Effective*Region).
-	Region        string `json:"region,omitempty"`
-	AuthRegion    string `json:"authRegion,omitempty"`
-	ApiRegion     string `json:"apiRegion,omitempty"`
+	Region     string `json:"region,omitempty"`
+	AuthRegion string `json:"authRegion,omitempty"`
+	ApiRegion  string `json:"apiRegion,omitempty"`
 	// MaxPayloadBytes caps the serialized Kiro request body before upstream rejects
 	// it as oversized. <=0 means use DefaultMaxPayloadBytes.
 	MaxPayloadBytes int `json:"maxPayloadBytes,omitempty"`
@@ -425,7 +452,7 @@ type AccountInfo struct {
 const DefaultMaxPayloadBytes = 2_000_000
 
 // Version current version
-const Version = "1.1.2"
+const Version = "1.1.5"
 
 const (
 	autoQuarantineSuspicious429Reason = "auto-quarantine: suspicious 429 pattern"
@@ -442,14 +469,25 @@ var (
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
 	cfgPath = path
-	return Load()
+	return loadLocked()
 }
 
+// Load reloads the current configuration path. The path and in-memory
+// configuration are replaced under one exclusive lock so a concurrent Save
+// cannot persist one configuration to another Init call's path.
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
+	return loadLocked()
+}
+
+// loadLocked reloads cfg from cfgPath. Caller MUST hold cfgLock exclusively.
+func loadLocked() error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -471,7 +509,16 @@ func Load() error {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return err
 	}
+	regionsNormalized, err := normalizeConfigRegions(&c)
+	if err != nil {
+		return err
+	}
 	cfg = &c
+	if regionsNormalized {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -519,27 +566,8 @@ func Load() error {
 }
 
 // saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
-// This is identical to Save() (which does not take the lock either) but is named
-// distinctly so call sites that already hold cfgLock are explicit about it.
+// Internal mutators use this helper to avoid recursively locking cfgLock.
 func saveLocked() error {
-	return Save()
-}
-
-// newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
-func newUUID() string {
-	return GenerateMachineId()
-}
-
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
-//
-// Atomic write: marshalled JSON is written to a sibling temp file, then renamed
-// over config.json. A crash mid-write can no longer truncate/corrupt the file —
-// which would lose every account token, API key, and the admin password, since
-// this is the single source of truth for all credentials. rename is atomic on
-// the same filesystem (same dir), so readers see either the old or the new file
-// in full, never a partial write.
-func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -553,6 +581,30 @@ func Save() error {
 		return err
 	}
 	return nil
+}
+
+// newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
+func newUUID() string {
+	return GenerateMachineId()
+}
+
+// Save persists the current configuration to the JSON file.
+// Uses indented formatting for human readability.
+//
+// Save takes the same exclusive lock as Init, Load, and all in-memory
+// mutations. Besides protecting cfg and cfgPath, exclusive locking serializes
+// use of the shared sibling ".tmp" file used by the atomic write.
+//
+// Atomic write: marshalled JSON is written to a sibling temp file, then renamed
+// over config.json. A crash mid-write can no longer truncate/corrupt the file —
+// which would lose every account token, API key, and the admin password, since
+// this is the single source of truth for all credentials. rename is atomic on
+// the same filesystem (same dir), so readers see either the old or the new file
+// in full, never a partial write.
+func Save() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	return saveLocked()
 }
 
 // SetPassword updates the admin password.
@@ -650,22 +702,300 @@ func GetEnabledAccounts() []Account {
 	return accounts
 }
 
+// RefreshTokenFingerprint returns a stable, non-reversible identifier for an
+// opaque refresh token. Empty tokens do not receive a fingerprint.
+func RefreshTokenFingerprint(refreshToken string) string {
+	if refreshToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// APIKeyFingerprint returns a stable, non-reversible identifier for a Kiro API key.
+func APIKeyFingerprint(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// IsAPIKeyAccount reports whether the account authenticates with a Kiro API key.
+func IsAPIKeyAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	if strings.TrimSpace(account.KiroApiKey) != "" {
+		return true
+	}
+	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
+	return method == "api_key" || method == "apikey"
+}
+
+// SplitKiroAPIKeyAndRegion parses the convenience form "key|region".
+// The key itself is not restricted to a fixed prefix so future formats remain compatible.
+func SplitKiroAPIKeyAndRegion(raw string) (key, region string, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", ErrEmptyAPIKey
+	}
+	parts := strings.Split(trimmed, "|")
+	if len(parts) > 2 {
+		return "", "", errors.New("multiple pipe separators are not allowed")
+	}
+	key = strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", "", errors.New("key before pipe is empty")
+	}
+	if len(parts) == 2 {
+		region = strings.TrimSpace(parts[1])
+		if region == "" {
+			return "", "", errors.New("region after pipe is empty")
+		}
+		normalized, err := NormalizeAWSRegion(region)
+		if err != nil {
+			return "", "", err
+		}
+		region = normalized
+	}
+	return key, region, nil
+}
+
+// NormalizeAWSRegion validates and canonicalizes an AWS region before it can
+// become part of an outbound hostname. It intentionally validates syntax rather
+// than a fixed region allow-list so newly launched AWS regions remain usable.
+func NormalizeAWSRegion(region string) (string, error) {
+	region = strings.ToLower(strings.TrimSpace(region))
+	if region == "" {
+		return "", errors.New("region is empty")
+	}
+	if len(region) > 63 || !awsRegionPattern.MatchString(region) {
+		return "", fmt.Errorf("invalid AWS region %q", region)
+	}
+	return region, nil
+}
+
+func normalizeOptionalAWSRegion(region string) (normalized string, changed bool, err error) {
+	if strings.TrimSpace(region) == "" {
+		return "", region != "", nil
+	}
+	normalized, err = NormalizeAWSRegion(region)
+	if err != nil {
+		return "", false, err
+	}
+	return normalized, normalized != region, nil
+}
+
+func normalizeAccountRegions(account *Account) (bool, error) {
+	if account == nil {
+		return false, errors.New("account is nil")
+	}
+	changed := false
+	fields := []struct {
+		name  string
+		value *string
+	}{
+		{name: "region", value: &account.Region},
+		{name: "authRegion", value: &account.AuthRegion},
+		{name: "apiRegion", value: &account.ApiRegion},
+	}
+	for _, field := range fields {
+		normalized, fieldChanged, err := normalizeOptionalAWSRegion(*field.value)
+		if err != nil {
+			return false, fmt.Errorf("%s: %w", field.name, err)
+		}
+		*field.value = normalized
+		changed = changed || fieldChanged
+	}
+	return changed, nil
+}
+
+func normalizeConfigRegions(c *Config) (bool, error) {
+	if c == nil {
+		return false, errors.New("config is nil")
+	}
+	changed := false
+	globalFields := []struct {
+		name  string
+		value *string
+	}{
+		{name: "region", value: &c.Region},
+		{name: "authRegion", value: &c.AuthRegion},
+		{name: "apiRegion", value: &c.ApiRegion},
+	}
+	for _, field := range globalFields {
+		normalized, fieldChanged, err := normalizeOptionalAWSRegion(*field.value)
+		if err != nil {
+			return false, fmt.Errorf("config %s: %w", field.name, err)
+		}
+		*field.value = normalized
+		changed = changed || fieldChanged
+	}
+	for i := range c.Accounts {
+		before := c.Accounts[i]
+		if IsAPIKeyAccount(&c.Accounts[i]) {
+			if err := NormalizeAPIKeyAccount(&c.Accounts[i]); err != nil {
+				return false, fmt.Errorf("account %q: %w", c.Accounts[i].ID, err)
+			}
+			changed = changed || before != c.Accounts[i]
+			continue
+		}
+		accountChanged, err := normalizeAccountRegions(&c.Accounts[i])
+		if err != nil {
+			return false, fmt.Errorf("account %q: %w", c.Accounts[i].ID, err)
+		}
+		changed = changed || accountChanged
+	}
+	return changed, nil
+}
+
+// MachineIdFromAPIKey derives the machine id used by Kiro CLI/API-key clients:
+// sha256 hex of "KiroAPIKey/<api_key>".
+func MachineIdFromAPIKey(apiKey string) string {
+	sum := sha256.Sum256([]byte("KiroAPIKey/" + apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// NormalizeAPIKeyAccount fills API-key credential defaults in place.
+// It accepts "ksk_xxx|region", sets AuthMethod=api_key, copies the key into
+// AccessToken for the shared Bearer path, clears OAuth-only fields, and
+// derives MachineId when missing.
+func NormalizeAPIKeyAccount(account *Account) error {
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	raw := strings.TrimSpace(account.KiroApiKey)
+	if raw == "" {
+		raw = strings.TrimSpace(account.AccessToken)
+	}
+	key, region, err := SplitKiroAPIKeyAndRegion(raw)
+	if err != nil {
+		return err
+	}
+	account.KiroApiKey = key
+	account.AccessToken = key
+	account.AuthMethod = "api_key"
+	account.RefreshToken = ""
+	account.RefreshTokenFingerprint = ""
+	account.ClientID = ""
+	account.ClientSecret = ""
+	account.TokenEndpoint = ""
+	account.IssuerURL = ""
+	account.Scopes = ""
+	account.ProfileArn = ""
+	account.ExpiresAt = 0
+	if region != "" {
+		if strings.TrimSpace(account.Region) == "" {
+			account.Region = region
+		}
+	}
+	if strings.TrimSpace(account.Region) == "" {
+		account.Region = defaultAWSRegion
+	}
+	if _, err := normalizeAccountRegions(account); err != nil {
+		return err
+	}
+	if strings.TrimSpace(account.MachineId) == "" {
+		account.MachineId = MachineIdFromAPIKey(key)
+	}
+	if strings.TrimSpace(account.Provider) == "" {
+		account.Provider = "APIKey"
+	}
+	if strings.TrimSpace(account.Email) == "" {
+		// Stable display label without leaking the full secret.
+		fp := APIKeyFingerprint(key)
+		if len(fp) > 12 {
+			fp = fp[:12]
+		}
+		account.Email = "api-key-" + fp
+	}
+	return nil
+}
+
+// AccountCredentialExists checks both the current refresh token and the
+// original credential fingerprint while holding the configuration read lock.
+func AccountCredentialExists(refreshToken string) bool {
+	if refreshToken == "" {
+		return false
+	}
+	fingerprint := RefreshTokenFingerprint(refreshToken)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.RefreshToken == refreshToken ||
+			(fingerprint != "" && account.RefreshTokenFingerprint == fingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountAPIKeyExists reports whether a Kiro API key is already persisted.
+func AccountAPIKeyExists(apiKey string) bool {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return false
+	}
+	fingerprint := APIKeyFingerprint(apiKey)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		existing := strings.TrimSpace(account.KiroApiKey)
+		if existing == "" {
+			continue
+		}
+		if existing == apiKey || APIKeyFingerprint(existing) == fingerprint {
+			return true
+		}
+	}
+	return false
+}
+
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	// Reject a duplicate id under the write lock. The import path pre-checks with
-	// AccountIDExists (RLock) and mints a fresh id on collision, but that check and this
-	// append are not atomic; two concurrent imports of the same pasted id could both
-	// pass the pre-check. This makes "add if id absent" the atomic invariant.
-	if account.ID != "" {
-		for _, a := range cfg.Accounts {
-			if a.ID == account.ID {
-				return fmt.Errorf("account with id %s already exists", account.ID)
+	if IsAPIKeyAccount(&account) {
+		if err := NormalizeAPIKeyAccount(&account); err != nil {
+			return err
+		}
+	} else {
+		if _, err := normalizeAccountRegions(&account); err != nil {
+			return err
+		}
+		if account.RefreshTokenFingerprint == "" {
+			account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
+		}
+	}
+	for _, existing := range cfg.Accounts {
+		if account.ID != "" && existing.ID == account.ID {
+			return ErrDuplicateAccountID
+		}
+		if account.RefreshToken != "" && existing.RefreshToken == account.RefreshToken {
+			return ErrDuplicateRefreshToken
+		}
+		existingFingerprint := existing.RefreshTokenFingerprint
+		if existingFingerprint == "" {
+			existingFingerprint = RefreshTokenFingerprint(existing.RefreshToken)
+		}
+		if account.RefreshTokenFingerprint != "" &&
+			existingFingerprint == account.RefreshTokenFingerprint {
+			return ErrDuplicateRefreshToken
+		}
+		if account.KiroApiKey != "" {
+			existingKey := strings.TrimSpace(existing.KiroApiKey)
+			if existingKey != "" && (existingKey == account.KiroApiKey ||
+				APIKeyFingerprint(existingKey) == APIKeyFingerprint(account.KiroApiKey)) {
+				return ErrDuplicateAPIKey
 			}
 		}
 	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := saveLocked(); err != nil {
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -673,8 +1003,37 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			// Current callers use UpdateAccount for administrative/status fields.
+			// Preserve the authoritative credential state so a stale account
+			// snapshot cannot overwrite a refresh-token rotation that completed
+			// while an upstream status request was in flight.
+			account.AccessToken = a.AccessToken
+			account.RefreshToken = a.RefreshToken
+			account.RefreshTokenFingerprint = a.RefreshTokenFingerprint
+			account.KiroApiKey = a.KiroApiKey
+			account.ClientID = a.ClientID
+			account.ClientSecret = a.ClientSecret
+			account.AuthMethod = a.AuthMethod
+			account.Provider = a.Provider
+			account.Region = a.Region
+			account.AuthRegion = a.AuthRegion
+			account.ApiRegion = a.ApiRegion
+			account.StartUrl = a.StartUrl
+			account.ExpiresAt = a.ExpiresAt
+			account.ProfileArn = a.ProfileArn
+			account.TokenEndpoint = a.TokenEndpoint
+			account.IssuerURL = a.IssuerURL
+			account.Scopes = a.Scopes
+			if account.RefreshTokenFingerprint == "" {
+				account.RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i] = account
-			return Save()
+			if err := saveLocked(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -699,7 +1058,7 @@ func UpdateAccountOverageStatus(id, status, capability string, cap, rate, curren
 			if checkedAt > 0 {
 				cfg.Accounts[i].OverageCheckedAt = checkedAt
 			}
-			return Save()
+			return saveLocked()
 		}
 	}
 	return nil
@@ -713,6 +1072,7 @@ func SetAccountEnabled(id string, enabled bool) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].Enabled = enabled
 			if enabled {
 				cfg.Accounts[i].BanStatus = "ACTIVE"
@@ -722,7 +1082,11 @@ func SetAccountEnabled(id string, enabled bool) error {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			if err := saveLocked(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -735,13 +1099,39 @@ func SetAccountBanStatus(id, status, reason string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			if err := saveLocked(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// ClearAccountBanStatus marks an account active without replacing any
+// credential fields from a potentially stale caller snapshot.
+func ClearAccountBanStatus(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, account := range cfg.Accounts {
+		if account.ID == id {
+			previous := cfg.Accounts[i]
+			cfg.Accounts[i].BanStatus = "ACTIVE"
+			cfg.Accounts[i].BanReason = ""
+			cfg.Accounts[i].BanTime = 0
+			if err := saveLocked(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -778,45 +1168,88 @@ func applyAutoRestoreLocked() bool {
 		}
 	}
 	if changed {
-		_ = Save()
+		_ = saveLocked()
 	}
 	return changed
 }
 
-// AddAccounts appends multiple accounts in a single locked pass and persists
-// with exactly one Save(), avoiding the O(n²) write amplification that calling
-// AddAccount in a loop would cause (each AddAccount re-serializes the entire
-// config.json). Accounts whose RefreshToken already exists (against the current
-// config or earlier entries in the same batch) are skipped to keep bulk imports
-// idempotent across retries/re-pastes. Entries with an empty RefreshToken are
-// also skipped — there is no stable identity to dedup on and they cannot be
-// activated later. Returns how many were added and how many were skipped.
+// AddAccounts appends multiple OAuth or API-key accounts in a single locked pass
+// and persists with exactly one saveLocked(), avoiding the O(n²) write amplification
+// that calling AddAccount in a loop would cause. Existing credentials are
+// skipped to keep bulk imports idempotent across retries/re-pastes. Entries with
+// neither a refresh token nor an API key are skipped.
 //
-// Save() is only invoked when at least one account is actually added, so a
+// saveLocked() is only invoked when at least one account is actually added, so a
 // fully-duplicate batch does not churn the config file.
 func AddAccounts(accounts []Account) (added int, skipped int, err error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
-	// Seed the seen-set with refresh tokens already persisted so the batch
-	// dedups against existing accounts, not just within itself.
-	seen := make(map[string]struct{}, len(cfg.Accounts)+len(accounts))
-	for i := range cfg.Accounts {
-		if rt := cfg.Accounts[i].RefreshToken; rt != "" {
-			seen[rt] = struct{}{}
+	normalizedAccounts := make([]Account, len(accounts))
+	copy(normalizedAccounts, accounts)
+	for i := range normalizedAccounts {
+		if IsAPIKeyAccount(&normalizedAccounts[i]) {
+			if err := NormalizeAPIKeyAccount(&normalizedAccounts[i]); err != nil {
+				return 0, 0, fmt.Errorf("account %q: %w", normalizedAccounts[i].ID, err)
+			}
+		} else {
+			if _, err := normalizeAccountRegions(&normalizedAccounts[i]); err != nil {
+				return 0, 0, fmt.Errorf("account %q: %w", normalizedAccounts[i].ID, err)
+			}
+			if normalizedAccounts[i].RefreshTokenFingerprint == "" {
+				normalizedAccounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(normalizedAccounts[i].RefreshToken)
+			}
 		}
 	}
 
-	for _, a := range accounts {
+	// Seed the seen-sets with credentials already persisted so the batch dedups
+	// against existing accounts, not just within itself.
+	seenRefresh := make(map[string]struct{}, len(cfg.Accounts)+len(accounts))
+	seenAPIKeys := make(map[string]struct{}, len(cfg.Accounts)+len(accounts))
+	for i := range cfg.Accounts {
+		if fingerprint := cfg.Accounts[i].RefreshTokenFingerprint; fingerprint != "" {
+			seenRefresh[fingerprint] = struct{}{}
+		}
+		if rt := cfg.Accounts[i].RefreshToken; rt != "" {
+			seenRefresh[RefreshTokenFingerprint(rt)] = struct{}{}
+		}
+		if key := strings.TrimSpace(cfg.Accounts[i].KiroApiKey); key != "" {
+			seenAPIKeys[APIKeyFingerprint(key)] = struct{}{}
+		}
+	}
+
+	for _, a := range normalizedAccounts {
+		if IsAPIKeyAccount(&a) {
+			fingerprint := APIKeyFingerprint(a.KiroApiKey)
+			if _, dup := seenAPIKeys[fingerprint]; dup {
+				skipped++
+				continue
+			}
+			seenAPIKeys[fingerprint] = struct{}{}
+			cfg.Accounts = append(cfg.Accounts, a)
+			added++
+			continue
+		}
 		if a.RefreshToken == "" {
 			skipped++
 			continue
 		}
-		if _, dup := seen[a.RefreshToken]; dup {
+		currentFingerprint := RefreshTokenFingerprint(a.RefreshToken)
+		originalFingerprint := a.RefreshTokenFingerprint
+		if _, dup := seenRefresh[currentFingerprint]; dup {
 			skipped++
 			continue
 		}
-		seen[a.RefreshToken] = struct{}{}
+		if originalFingerprint != "" {
+			if _, dup := seenRefresh[originalFingerprint]; dup {
+				skipped++
+				continue
+			}
+		}
+		seenRefresh[currentFingerprint] = struct{}{}
+		if originalFingerprint != "" {
+			seenRefresh[originalFingerprint] = struct{}{}
+		}
 		cfg.Accounts = append(cfg.Accounts, a)
 		added++
 	}
@@ -824,7 +1257,7 @@ func AddAccounts(accounts []Account) (added int, skipped int, err error) {
 	if added == 0 {
 		return 0, skipped, nil
 	}
-	if err := Save(); err != nil {
+	if err := saveLocked(); err != nil {
 		// Roll back the in-memory appends so a failed persist does not leave
 		// the running pool out of sync with what is on disk.
 		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-added]
@@ -879,7 +1312,7 @@ func SuspendAccountTemporarily(id, reason string) error {
 			cfg.Accounts[i].BanStatus = "SUSPENDED"
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = now
-			return Save()
+			return saveLocked()
 		}
 	}
 	return nil
@@ -904,7 +1337,7 @@ func ClearAccountCurrentOverages(id string, checkedAt int64) error {
 			if checkedAt > 0 {
 				cfg.Accounts[i].OverageCheckedAt = checkedAt
 			}
-			return Save()
+			return saveLocked()
 		}
 	}
 	return nil
@@ -915,8 +1348,13 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i].ProfileArn
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			if err := saveLocked(); err != nil {
+				cfg.Accounts[i].ProfileArn = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -928,26 +1366,51 @@ func DeleteAccount(id string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+			return saveLocked()
 		}
 	}
 	return nil
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	return UpdateAccountCredentialState(id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateAccountCredentialState atomically updates all fields produced by one
+// refresh-token exchange. If persistence fails, the in-memory configuration is
+// restored so a rotated token is never published from a state that cannot
+// survive restart.
+func UpdateAccountCredentialState(
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
+			if cfg.Accounts[i].RefreshTokenFingerprint == "" {
+				cfg.Accounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
 			cfg.Accounts[i].AccessToken = accessToken
 			if refreshToken != "" {
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			if profileArn != "" {
+				cfg.Accounts[i].ProfileArn = profileArn
+			}
+			if err := saveLocked(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
-	return nil
+	return ErrAccountNotFound
 }
 
 func GetApiKey() string {
@@ -970,7 +1433,7 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	if password != "" {
 		cfg.Password = password
 	}
-	return Save()
+	return saveLocked()
 }
 
 func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) error {
@@ -985,7 +1448,7 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 	if password != "" {
 		cfg.Password = password
 	}
-	return Save()
+	return saveLocked()
 }
 
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
@@ -996,7 +1459,7 @@ func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits 
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	return saveLocked()
 }
 
 func GetStats() (int, int, int, int, float64) {
@@ -1015,7 +1478,7 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].TotalTokens = totalTokens
 			cfg.Accounts[i].TotalCredits = totalCredits
 			cfg.Accounts[i].LastUsed = lastUsed
-			return Save()
+			return saveLocked()
 		}
 	}
 	return nil
@@ -1047,7 +1510,7 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			return Save()
+			return saveLocked()
 		}
 	}
 	return nil
@@ -1121,7 +1584,7 @@ func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBound
 	if rules != nil {
 		cfg.PromptFilterRules = rules
 	}
-	return Save()
+	return saveLocked()
 }
 
 // GetPromptFilterRules returns the current prompt filter rules.
@@ -1176,7 +1639,7 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
-	return Save()
+	return saveLocked()
 }
 
 // GetPreferredEndpoint 获取首选端点配置
@@ -1194,7 +1657,7 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
-	return Save()
+	return saveLocked()
 }
 
 // GetEndpointFallback returns whether endpoint fallback is enabled. Defaults to true.
@@ -1212,7 +1675,7 @@ func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
-	return Save()
+	return saveLocked()
 }
 
 // GetProxyURL 获取出站代理地址
@@ -1227,7 +1690,7 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
-	return Save()
+	return saveLocked()
 }
 
 // GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
@@ -1245,7 +1708,7 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
-	return Save()
+	return saveLocked()
 }
 
 // GetMaxPayloadBytes returns the configured payload cap, falling back to
@@ -1264,37 +1727,66 @@ func UpdateMaxPayloadBytes(n int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.MaxPayloadBytes = n
-	return Save()
+	return saveLocked()
+}
+
+// UpdateRegionSettings validates and atomically persists the global fallback
+// regions. Empty values remain unset and resolve to us-east-1 at read time.
+func UpdateRegionSettings(region, authRegion, apiRegion string) error {
+	candidate := Config{
+		Region:     region,
+		AuthRegion: authRegion,
+		ApiRegion:  apiRegion,
+	}
+	if _, err := normalizeConfigRegions(&candidate); err != nil {
+		return err
+	}
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	previousRegion, previousAuthRegion, previousApiRegion := cfg.Region, cfg.AuthRegion, cfg.ApiRegion
+	cfg.Region, cfg.AuthRegion, cfg.ApiRegion = candidate.Region, candidate.AuthRegion, candidate.ApiRegion
+	if err := saveLocked(); err != nil {
+		cfg.Region, cfg.AuthRegion, cfg.ApiRegion = previousRegion, previousAuthRegion, previousApiRegion
+		return err
+	}
+	return nil
 }
 
 // GetGlobalRegion returns the configured default region (empty → "us-east-1").
 func GetGlobalRegion() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.Region == "" {
-		return "us-east-1"
+	if cfg != nil {
+		if region, err := NormalizeAWSRegion(cfg.Region); err == nil {
+			return region
+		}
 	}
-	return cfg.Region
+	return defaultAWSRegion
 }
 
 // GetGlobalAuthRegion returns the configured default token-refresh region.
 func GetGlobalAuthRegion() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.AuthRegion == "" {
-		return "us-east-1"
+	if cfg != nil {
+		if region, err := NormalizeAWSRegion(cfg.AuthRegion); err == nil {
+			return region
+		}
 	}
-	return cfg.AuthRegion
+	return defaultAWSRegion
 }
 
 // GetGlobalApiRegion returns the configured default API-request host region.
 func GetGlobalApiRegion() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.ApiRegion == "" {
-		return "us-east-1"
+	if cfg != nil {
+		if region, err := NormalizeAWSRegion(cfg.ApiRegion); err == nil {
+			return region
+		}
 	}
-	return cfg.ApiRegion
+	return defaultAWSRegion
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".
@@ -1322,7 +1814,7 @@ func UpdatePromptCacheMaxRatio(ratio float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PromptCacheMaxRatio = ratio
-	return Save()
+	return saveLocked()
 }
 
 const defaultPromptCacheMaxEntries = 131072
@@ -1352,7 +1844,7 @@ func UpdatePromptCacheMaxEntries(n int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PromptCacheMaxEntries = n
-	return Save()
+	return saveLocked()
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.
@@ -1360,7 +1852,7 @@ func UpdateLogLevel(level string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.LogLevel = level
-	return Save()
+	return saveLocked()
 }
 
 // KiroClientConfig is the {KiroVersion, SystemVersion, NodeVersion} triple

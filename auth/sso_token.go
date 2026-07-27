@@ -13,9 +13,11 @@ import (
 
 // ImportFromSsoToken 从 SSO Token (x-amz-sso_authn) 导入账号
 func ImportFromSsoToken(bearerToken, region string) (accessToken, refreshToken, clientID, clientSecret string, expiresIn int, err error) {
-	if region == "" {
-		region = "us-east-1"
+	normalizedRegion, err := normalizeAWSRegionOrDefault(region)
+	if err != nil {
+		return "", "", "", "", 0, fmt.Errorf("SSO token region rejected: %w", err)
 	}
+	region = normalizedRegion
 
 	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
 	portalBase := "https://portal.sso.us-east-1.amazonaws.com"

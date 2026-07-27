@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestKiroCallbackBindAddrs locks in the secure default (loopback-only) and the
@@ -69,27 +70,28 @@ func TestExtractEmailFromJWT(t *testing.T) {
 	}
 }
 
-func TestValidateExternalIdpEndpoint(t *testing.T) {
+func TestValidateLegacyExternalIdpEndpoint(t *testing.T) {
 	valid := []string{
 		"https://login.microsoftonline.com/5fbc183e/v2.0",
 		"https://login.microsoftonline.us/tenant/v2.0",
-		"https://login.microsoftonline.cn/tenant/oauth2/v2.0/token",
+		"https://login.partner.microsoftonline.cn/tenant/oauth2/v2.0/token",
 	}
 	for _, u := range valid {
-		if err := validateExternalIdpEndpoint(u); err != nil {
+		if err := ValidateExternalIdpEndpoint(u); err != nil {
 			t.Fatalf("expected %q to be allowed, got %v", u, err)
 		}
 	}
 	invalid := []string{
-		"http://login.microsoftonline.com/x",      // not https
-		"https://evil-microsoftonline.com/x",       // suffix not anchored to a subdomain boundary
+		"http://login.microsoftonline.com/x",        // not https
+		"https://evil-microsoftonline.com/x",        // suffix not anchored to a subdomain boundary
 		"https://login.microsoftonline.com.evil.co", // not an allowed suffix
+		"https://login.microsoftonline.cn/x",        // unsupported China-cloud host
 		"https://10.0.0.5/x",                        // IP literal
 		"https://accounts.google.com/x",             // not allow-listed
 		"https:///x",                                // no host
 	}
 	for _, u := range invalid {
-		if err := validateExternalIdpEndpoint(u); err == nil {
+		if err := ValidateExternalIdpEndpoint(u); err == nil {
 			t.Fatalf("expected %q to be rejected", u)
 		}
 	}
@@ -140,6 +142,112 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 	}
 }
 
+func TestProcessCallbackURLConcurrentEnterpriseLeg1KeepsInstalledState(t *testing.T) {
+	discoveryArrived := make(chan struct{}, 2)
+	releaseDiscovery := make(chan struct{})
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		discoveryArrived <- struct{}{}
+		<-releaseDiscovery
+		issuer := server.URL + "/" + testMicrosoftTenantID + "/v2.0"
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 issuer,
+			"authorization_endpoint": server.URL + "/" + testMicrosoftTenantID + "/oauth2/v2.0/authorize",
+			"token_endpoint":         server.URL + "/" + testMicrosoftTenantID + "/oauth2/v2.0/token",
+		})
+	}))
+	defer server.Close()
+	discoveryReleased := false
+	defer func() {
+		if !discoveryReleased {
+			close(releaseDiscovery)
+		}
+	}()
+
+	previousClient := SetGlobalAuthClientForTest(server.Client())
+	defer SetGlobalAuthClientForTest(previousClient)
+	previousValidator := SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer SetExternalIdpValidatorForTest(previousValidator)
+
+	issuer := server.URL + "/" + testMicrosoftTenantID + "/v2.0"
+	query := url.Values{}
+	query.Set("login_option", "external_idp")
+	query.Set("issuer_url", issuer)
+	query.Set("client_id", testMicrosoftClientID)
+	query.Set("scopes", testMicrosoftScopes())
+	callbackURL := "http://localhost:3128/signin/callback?" + query.Encode()
+	session := &KiroSsoSession{}
+
+	type outcome struct {
+		nextURL string
+		err     error
+	}
+	outcomes := make(chan outcome, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			nextURL, _, err := session.ProcessCallbackURL(callbackURL)
+			outcomes <- outcome{nextURL: nextURL, err: err}
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-discoveryArrived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent manual callbacks did not both enter discovery")
+		}
+	}
+	close(releaseDiscovery)
+	discoveryReleased = true
+
+	var successURL string
+	failures := 0
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-outcomes:
+			if got.err == nil {
+				if successURL != "" {
+					t.Fatalf("both concurrent callbacks succeeded: %q and %q", successURL, got.nextURL)
+				}
+				successURL = got.nextURL
+				continue
+			}
+			if !strings.Contains(got.err.Error(), "already in progress") {
+				t.Fatalf("losing callback error = %v", got.err)
+			}
+			failures++
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent callback result")
+		}
+	}
+	if successURL == "" || failures != 1 {
+		t.Fatalf("successURL=%q failures=%d, want one success and one failure", successURL, failures)
+	}
+
+	successState := mustParseMicrosoftURL(t, successURL).Query().Get("state")
+	session.mu.Lock()
+	installed := session.leg2
+	session.mu.Unlock()
+	if installed == nil || installed.state == "" {
+		t.Fatalf("session leg2 was not installed: %#v", installed)
+	}
+	if installed.state != successState {
+		t.Fatalf("installed state %q does not match successful redirect state %q", installed.state, successState)
+	}
+
+	if _, _, err := session.ProcessCallbackURL(callbackURL); err == nil ||
+		!strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("later callback error = %v, want already in progress", err)
+	}
+	session.mu.Lock()
+	stableState := session.leg2.state
+	session.mu.Unlock()
+	if stableState != installed.state {
+		t.Fatalf("installed state changed from %q to %q", installed.state, stableState)
+	}
+}
+
 // TestRefreshExternalIdpToken drives the refresh_token grant against a stub IdP
 // token endpoint and asserts the form encoding and response mapping.
 func TestRefreshExternalIdpToken(t *testing.T) {
@@ -167,7 +275,7 @@ func TestRefreshExternalIdpToken(t *testing.T) {
 	defer SetExternalIdpValidatorForTest(restore)
 
 	access, refresh, expiresAt, profileArn, err := refreshExternalIdpToken(
-		"old-refresh", "azure-client", srv.URL, "api://x/codewhisperer:conversations offline_access", srv.Client(),
+		"old-refresh", "azure-client", srv.URL, "", "api://x/codewhisperer:conversations offline_access", srv.Client(),
 	)
 	if err != nil {
 		t.Fatalf("refreshExternalIdpToken: %v", err)
@@ -199,7 +307,7 @@ func TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted(t *testing.T) {
 	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer SetExternalIdpValidatorForTest(restore)
 
-	_, refresh, _, _, err := refreshExternalIdpToken("keep-me", "c", srv.URL, "", srv.Client())
+	_, refresh, _, _, err := refreshExternalIdpToken("keep-me", "c", srv.URL, "", "", srv.Client())
 	if err != nil {
 		t.Fatalf("refreshExternalIdpToken: %v", err)
 	}
@@ -211,10 +319,10 @@ func TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted(t *testing.T) {
 // TestRefreshExternalIdpTokenRequiresClientAndEndpoint guards the precondition
 // that distinguishes the external-IdP branch from the AWS OIDC branch.
 func TestRefreshExternalIdpTokenRequiresClientAndEndpoint(t *testing.T) {
-	if _, _, _, _, err := refreshExternalIdpToken("r", "", "https://login.microsoftonline.com/t/token", "", http.DefaultClient); err == nil {
+	if _, _, _, _, err := refreshExternalIdpToken("r", "", "https://login.microsoftonline.com/t/token", "", "", http.DefaultClient); err == nil {
 		t.Fatalf("expected error when clientID is empty")
 	}
-	if _, _, _, _, err := refreshExternalIdpToken("r", "c", "", "", http.DefaultClient); err == nil {
+	if _, _, _, _, err := refreshExternalIdpToken("r", "c", "", "", "", http.DefaultClient); err == nil {
 		t.Fatalf("expected error when tokenEndpoint is empty")
 	}
 }
@@ -238,8 +346,8 @@ func TestValidateExternalIdpEndpointAcceptsAllowListed(t *testing.T) {
 // and non-allow-listed hosts.
 func TestValidateExternalIdpEndpointRejectsUnsafe(t *testing.T) {
 	for _, raw := range []string{
-		"http://login.microsoftonline.com/x",  // not https
-		"https://127.0.0.1/oauth/token",       // IP literal
+		"http://login.microsoftonline.com/x",   // not https
+		"https://127.0.0.1/oauth/token",        // IP literal
 		"https://evil.example.com/oauth/token", // not allow-listed
 	} {
 		if err := ValidateExternalIdpEndpoint(raw); err == nil {

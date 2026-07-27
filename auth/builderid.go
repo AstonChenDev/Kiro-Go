@@ -30,9 +30,11 @@ var (
 
 // StartBuilderIdLogin 开始 Builder ID 登录
 func StartBuilderIdLogin(region string) (*BuilderIdSession, error) {
-	if region == "" {
-		region = "us-east-1"
+	normalizedRegion, err := normalizeAWSRegionOrDefault(region)
+	if err != nil {
+		return nil, fmt.Errorf("Builder ID region rejected: %w", err)
 	}
+	region = normalizedRegion
 
 	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
 	startUrl := "https://view.awsapps.com/start"
@@ -162,7 +164,11 @@ func PollBuilderIdAuth(sessionID string) (accessToken, refreshToken, clientID, c
 		return "", "", "", "", "", 0, "", fmt.Errorf("authorization expired")
 	}
 
-	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", session.Region)
+	normalizedRegion, err := normalizeAWSRegionOrDefault(session.Region)
+	if err != nil {
+		return "", "", "", "", "", 0, "", fmt.Errorf("Builder ID session region rejected: %w", err)
+	}
+	oidcBase := fmt.Sprintf("https://oidc.%s.amazonaws.com", normalizedRegion)
 
 	tokenPayload := map[string]string{
 		"clientId":     session.ClientID,
