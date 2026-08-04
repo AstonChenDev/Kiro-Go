@@ -455,6 +455,7 @@
   "common.saved": "保存",
   "common.copy": "复制",
   "common.copied": "已复制",
+  "common.copyFailed": "复制失败，请允许剪贴板权限，或使用 HTTPS 后重试",
   "common.cancel": "取消",
   "common.confirm": "确认",
   "common.back": "返回",

@@ -455,6 +455,7 @@
   "common.saved": "Saved",
   "common.copy": "Copy",
   "common.copied": "Copied",
+  "common.copyFailed": "Copy failed. Allow clipboard access or retry over HTTPS.",
   "common.cancel": "Cancel",
   "common.confirm": "Confirm",
   "common.back": "Back",

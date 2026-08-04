@@ -70,31 +70,73 @@
     const isPromise = input && typeof input.then === 'function';
     if (isPromise && typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
       const blobPromise = Promise.resolve(input).then(t => new Blob([String(t == null ? '' : t)], { type: 'text/plain' }));
-      await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blobPromise })]);
-      return;
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blobPromise })]);
+        return true;
+      } catch (e) {
+        // ClipboardItem can be rejected by browser permissions. Resolve the
+        // original value below and try the focused textarea fallback.
+      }
     }
     const text = isPromise ? await input : input;
     const str = String(text == null ? '' : text);
     if (navigator.clipboard && navigator.clipboard.writeText) {
       try {
         await navigator.clipboard.writeText(str);
-        return;
+        return true;
       } catch (e) { }
+    }
+    if (!document.body || typeof document.execCommand !== 'function') {
+      const error = new Error('clipboard copy failed');
+      error.name = 'ClipboardError';
+      throw error;
     }
     const ta = document.createElement('textarea');
     ta.value = str;
     ta.readOnly = true;
     ta.className = 'clipboard-proxy';
+    ta.tabIndex = -1;
+    ta.setAttribute('aria-hidden', 'true');
+    ta.style.top = '0';
+    ta.style.left = '0';
+    const active = document.activeElement;
     document.body.appendChild(ta);
-    const range = document.createRange();
-    range.selectNodeContents(ta);
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-    ta.setSelectionRange(0, str.length);
-    document.execCommand('copy');
-    sel.removeAllRanges();
-    document.body.removeChild(ta);
+    let copied = false;
+    try {
+      // execCommand only copies the active selection. The previous fallback
+      // selected a range without focusing the textarea, which can return false
+      // on an insecure HTTP origin while the UI still reported success.
+      ta.focus({ preventScroll: true });
+      ta.select();
+      ta.setSelectionRange(0, str.length);
+      copied = document.execCommand('copy') === true;
+    } catch (e) {
+      copied = false;
+    } finally {
+      document.body.removeChild(ta);
+      if (active && typeof active.focus === 'function') {
+        try { active.focus({ preventScroll: true }); } catch (e) { }
+      }
+    }
+    if (!copied) {
+      const error = new Error('clipboard copy failed');
+      error.name = 'ClipboardError';
+      throw error;
+    }
+    return true;
+  }
+  function isClipboardError(error) {
+    return !!(error && error.name === 'ClipboardError');
+  }
+  async function copyTextWithFeedback(input, successMessage) {
+    try {
+      await copyText(input);
+      toastPrimary(successMessage || t('common.copied'));
+      return true;
+    } catch (error) {
+      toastError(t('common.copyFailed'));
+      return false;
+    }
   }
   function renderEndpointCode(id, value) {
     const el = $(id);
@@ -2315,8 +2357,7 @@
         if (opened) opened.opener = null;
       });
       $('microsoftCopyBtn').addEventListener('click', async () => {
-        await copyText(microsoftAuthorizeUrl);
-        toast(t('common.copied'), 'primary');
+        await copyTextWithFeedback(microsoftAuthorizeUrl);
       });
     }
     $('microsoftBtn').addEventListener('click', hasAuthorizeUrl ? completeMicrosoftLogin : startMicrosoftLogin);
@@ -2756,8 +2797,7 @@
       $('builderIdStep2').classList.remove('hidden');
       $('builderIdOpenBtn').addEventListener('click', () => window.open($('builderIdVerifyUrl').textContent, '_blank'));
       $('builderIdCopyBtn').addEventListener('click', async () => {
-        await copyText($('builderIdVerifyUrl').textContent);
-        toast(t('common.copied'), 'primary');
+        await copyTextWithFeedback($('builderIdVerifyUrl').textContent);
       });
       $('builderIdCancelBtn').addEventListener('click', cancelBuilderIdLogin);
       pollBuilderIdAuth(d.interval || 5);
@@ -2833,8 +2873,7 @@
       $('kiroSsoStep2').classList.remove('hidden');
       $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
       $('kiroSsoCopyBtn').addEventListener('click', async () => {
-        await copyText($('kiroSsoSignInUrl').textContent);
-        toast(t('common.copied'), 'primary');
+        await copyTextWithFeedback($('kiroSsoSignInUrl').textContent);
       });
       $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
       // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
@@ -2937,8 +2976,7 @@
         $('iamBtn').textContent = t('iam.complete');
         $('iamOpenBtn').addEventListener('click', () => window.open($('iamAuthUrl').textContent, '_blank'));
         $('iamCopyBtn').addEventListener('click', async () => {
-          await copyText($('iamAuthUrl').textContent);
-          toast(t('common.copied'), 'primary');
+          await copyTextWithFeedback($('iamAuthUrl').textContent);
         });
       } else toastError(t('common.failed') + ': ' + (d.error || ''));
     }
@@ -3778,7 +3816,7 @@
       await copyText(keys.join('\n'));
       toastPrimary(t('suppliers.allKeysCopied', keys.length));
     } catch (e) {
-      toastError(e.message);
+      toastError(isClipboardError(e) ? t('common.copyFailed') : (e.message || t('common.failed')));
     } finally {
       btn.disabled = false;
       btn.removeAttribute('aria-busy');
@@ -4004,8 +4042,7 @@
         case 'copy-webhook': {
           const provider = supplierProviderById(id);
           if (!provider) return;
-          await copyText(location.origin + provider.webhookPath);
-          toastPrimary(t('common.copied'));
+          await copyTextWithFeedback(location.origin + provider.webhookPath);
           break;
         }
         case 'test':
@@ -4029,8 +4066,7 @@
     $('supplierKeysList').addEventListener('click', async e => {
       const button = e.target.closest('[data-supplier-key]');
       if (!button) return;
-      await copyText(button.dataset.supplierKey || '');
-      toastPrimary(t('suppliers.keyCopied'));
+      await copyTextWithFeedback(button.dataset.supplierKey || '', t('suppliers.keyCopied'));
     });
     $('supplierKeysPagination').addEventListener('click', e => {
       const button = e.target.closest('[data-supplier-page]');
@@ -4063,14 +4099,12 @@
         return;
       }
       if (e.target.closest('#supplierCopyPurchased')) {
-        await copyText(supplierLastPurchaseKeys.join('\n'));
-        toastPrimary(t('suppliers.allKeysCopied', supplierLastPurchaseKeys.length));
+        await copyTextWithFeedback(supplierLastPurchaseKeys.join('\n'), t('suppliers.allKeysCopied', supplierLastPurchaseKeys.length));
         return;
       }
       const keyButton = e.target.closest('[data-purchased-key]');
       if (keyButton) {
-        await copyText(keyButton.dataset.purchasedKey || '');
-        toastPrimary(t('suppliers.keyCopied'));
+        await copyTextWithFeedback(keyButton.dataset.purchasedKey || '', t('suppliers.keyCopied'));
       }
     });
   }

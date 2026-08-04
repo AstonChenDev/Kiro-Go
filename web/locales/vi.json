@@ -315,6 +315,7 @@
   "common.saved": "Đã lưu",
   "common.copy": "Sao chép",
   "common.copied": "Đã sao chép",
+  "common.copyFailed": "Sao chép thất bại. Hãy cho phép truy cập bảng nhớ tạm hoặc thử lại qua HTTPS.",
   "common.cancel": "Hủy",
   "common.confirm": "Xác nhận",
   "common.back": "Quay lại",
