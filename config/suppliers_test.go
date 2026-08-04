@@ -74,18 +74,18 @@ func TestSupplierPollIntervalDefaultsValidatesAndPersists(t *testing.T) {
 			t.Fatalf("poll interval %d unexpectedly accepted", invalid)
 		}
 	}
-	if err := UpdateSupplierSettings(true, true, 37); err != nil {
+	if err := UpdateSupplierSettings(true, true, MinSupplierPollIntervalSeconds); err != nil {
 		t.Fatalf("UpdateSupplierSettings: %v", err)
 	}
-	if got := GetSupplierIntegration().PollIntervalSeconds; got != 37 {
-		t.Fatalf("poll interval = %d, want 37", got)
+	if got := GetSupplierIntegration().PollIntervalSeconds; got != MinSupplierPollIntervalSeconds {
+		t.Fatalf("poll interval = %d, want %d", got, MinSupplierPollIntervalSeconds)
 	}
 
 	if err := Init(path); err != nil {
 		t.Fatalf("reload Init: %v", err)
 	}
 	got := GetSupplierIntegration()
-	if !got.Enabled || !got.AutoPurchaseEnabled || got.PollIntervalSeconds != 37 {
+	if !got.Enabled || !got.AutoPurchaseEnabled || got.PollIntervalSeconds != MinSupplierPollIntervalSeconds {
 		t.Fatalf("poll settings did not persist: %+v", got)
 	}
 }

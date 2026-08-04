@@ -3545,7 +3545,7 @@
     const interval = $('supplierPollInterval');
     if (!master || !auto || !interval) return;
     const pollIntervalSeconds = Number(interval.value);
-    if (!Number.isInteger(pollIntervalSeconds) || pollIntervalSeconds < 5 || pollIntervalSeconds > 300) {
+    if (!Number.isInteger(pollIntervalSeconds) || pollIntervalSeconds < 1 || pollIntervalSeconds > 300) {
       interval.value = supplierOverview && supplierOverview.pollIntervalSeconds || 5;
       toastError(t('suppliers.pollIntervalInvalid'));
       return;

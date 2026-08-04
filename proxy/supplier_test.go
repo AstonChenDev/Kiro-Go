@@ -145,30 +145,30 @@ func TestSupplierSettingsUpdatePollIntervalAndPreserveItForOlderClients(t *testi
 	fake := &fakeSupplierAPI{}
 	h, manager, _ := newSupplierTestManager(t, fake)
 
-	request := httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/settings", strings.NewReader(`{"enabled":true,"autoPurchaseEnabled":true,"pollIntervalSeconds":41}`))
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/settings", strings.NewReader(`{"enabled":true,"autoPurchaseEnabled":true,"pollIntervalSeconds":1}`))
 	response := httptest.NewRecorder()
 	h.apiUpdateSupplierFeature(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("settings status=%d body=%s", response.Code, response.Body.String())
 	}
-	if got := config.GetSupplierIntegration().PollIntervalSeconds; got != 41 {
-		t.Fatalf("poll interval = %d, want 41", got)
+	if got := config.GetSupplierIntegration().PollIntervalSeconds; got != 1 {
+		t.Fatalf("poll interval = %d, want 1", got)
 	}
 	if len(manager.wake) != 1 {
 		t.Fatalf("settings update queued %d wakes, want 1", len(manager.wake))
 	}
 
-	invalid := httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/settings", strings.NewReader(`{"enabled":true,"autoPurchaseEnabled":true,"pollIntervalSeconds":4}`))
+	invalid := httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/settings", strings.NewReader(`{"enabled":true,"autoPurchaseEnabled":true,"pollIntervalSeconds":0}`))
 	invalidResponse := httptest.NewRecorder()
 	h.apiUpdateSupplierFeature(invalidResponse, invalid)
-	if invalidResponse.Code != http.StatusBadRequest || config.GetSupplierIntegration().PollIntervalSeconds != 41 {
+	if invalidResponse.Code != http.StatusBadRequest || config.GetSupplierIntegration().PollIntervalSeconds != 1 {
 		t.Fatalf("invalid settings status=%d config=%+v", invalidResponse.Code, config.GetSupplierIntegration())
 	}
 
 	legacy := httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/settings", strings.NewReader(`{"enabled":false,"autoPurchaseEnabled":false}`))
 	legacyResponse := httptest.NewRecorder()
 	h.apiUpdateSupplierFeature(legacyResponse, legacy)
-	if legacyResponse.Code != http.StatusOK || config.GetSupplierIntegration().PollIntervalSeconds != 41 {
+	if legacyResponse.Code != http.StatusOK || config.GetSupplierIntegration().PollIntervalSeconds != 1 {
 		t.Fatalf("legacy settings status=%d config=%+v", legacyResponse.Code, config.GetSupplierIntegration())
 	}
 }

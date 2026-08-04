@@ -14,7 +14,7 @@ const (
 	DefaultSupplierPurchaseCount       = 1
 	MaxSupplierPurchaseCount           = 500
 	DefaultSupplierPollIntervalSeconds = 5
-	MinSupplierPollIntervalSeconds     = 5
+	MinSupplierPollIntervalSeconds     = 1
 	MaxSupplierPollIntervalSeconds     = 300
 )
 
