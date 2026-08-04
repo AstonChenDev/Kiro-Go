@@ -103,6 +103,8 @@
           <div class="tabs" id="tabBar">
             <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
                 data-i18n="tabs.accounts"></span></button>
+            <button type="button" class="tab" data-tab="suppliers"><i class="fa-solid fa-boxes-stacked tab-icon"></i><span
+                data-i18n="tabs.suppliers"></span></button>
             <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
@@ -231,6 +233,108 @@
 
           <div id="accountsList"></div>
         </div>
+      </div>
+
+      <!-- Supplier integration tab -->
+      <div id="tabSuppliers" class="tab-content hidden">
+        <section class="supplier-hero" aria-labelledby="supplierPageTitle">
+          <div class="supplier-hero-copy">
+            <div class="supplier-eyebrow"><i class="fa-solid fa-bolt"></i><span data-i18n="suppliers.eyebrow"></span></div>
+            <h1 id="supplierPageTitle" data-i18n="suppliers.title"></h1>
+            <p data-i18n="suppliers.subtitle"></p>
+          </div>
+          <div class="supplier-hero-actions">
+            <button class="btn btn-outline btn-sm" id="supplierRefreshBtn" type="button">
+              <i class="fa-solid fa-rotate"></i><span data-i18n="suppliers.refresh"></span>
+            </button>
+            <button class="btn btn-primary btn-sm" id="supplierAddBtn" type="button">
+              <i class="fa-solid fa-plus"></i><span data-i18n="suppliers.add"></span>
+            </button>
+          </div>
+        </section>
+
+        <section class="supplier-control-card">
+          <div class="supplier-control-item supplier-control-item--primary">
+            <div>
+              <p class="supplier-control-title" data-i18n="suppliers.masterSwitch"></p>
+              <p class="supplier-control-hint" data-i18n="suppliers.masterHint"></p>
+            </div>
+            <label class="switch" for="supplierMasterEnabled"><input type="checkbox" id="supplierMasterEnabled"
+                data-i18n-aria-label="suppliers.masterSwitch" /><span class="slider"></span></label>
+          </div>
+          <div class="supplier-control-item">
+            <div>
+              <p class="supplier-control-title" data-i18n="suppliers.autoSwitch"></p>
+              <p class="supplier-control-hint" data-i18n="suppliers.autoHint"></p>
+              <div class="supplier-poll-setting">
+                <label for="supplierPollInterval" data-i18n="suppliers.pollIntervalLabel"></label>
+                <div class="supplier-poll-input">
+                  <input id="supplierPollInterval" type="number" min="5" max="300" step="1" value="5"
+                    inputmode="numeric" data-i18n-aria-label="suppliers.pollIntervalLabel" />
+                  <span data-i18n="suppliers.pollIntervalUnit"></span>
+                </div>
+                <small data-i18n="suppliers.pollIntervalEditHint"></small>
+              </div>
+            </div>
+            <label class="switch" for="supplierAutoEnabled"><input type="checkbox" id="supplierAutoEnabled"
+                data-i18n-aria-label="suppliers.autoSwitch" /><span class="slider"></span></label>
+          </div>
+          <div class="supplier-control-metric">
+            <span data-i18n="suppliers.liveKeys"></span>
+            <strong id="supplierLiveKeyCount">0</strong>
+            <small data-i18n="suppliers.liveKeysHint"></small>
+          </div>
+          <div class="supplier-control-metric">
+            <span data-i18n="suppliers.pendingPurchases"></span>
+            <strong id="supplierPendingCount">0</strong>
+            <small id="supplierPollingHint"></small>
+          </div>
+        </section>
+
+        <section class="supplier-section">
+          <div class="supplier-section-head">
+            <div>
+              <h2 data-i18n="suppliers.providersTitle"></h2>
+              <p data-i18n="suppliers.providersHint"></p>
+            </div>
+          </div>
+          <div id="supplierProviderGrid" class="supplier-provider-grid"></div>
+        </section>
+
+        <section class="supplier-section supplier-keys-section">
+          <div class="supplier-section-head supplier-section-head--wrap">
+            <div>
+              <h2 data-i18n="suppliers.keysTitle"></h2>
+              <p data-i18n="suppliers.keysHint"></p>
+            </div>
+            <div class="supplier-keys-toolbar">
+              <select id="supplierKeysProvider" data-i18n-aria-label="suppliers.selectProvider"></select>
+              <label class="supplier-history-toggle">
+                <input type="checkbox" id="supplierKeysHistory" />
+                <span data-i18n="suppliers.includeHistory"></span>
+              </label>
+              <button class="btn btn-outline btn-sm" id="supplierLoadKeysBtn" type="button" data-i18n="suppliers.loadKeys"></button>
+              <button class="btn btn-primary btn-sm" id="supplierCopyAllKeysBtn" type="button" disabled>
+                <i class="fa-regular fa-copy"></i><span data-i18n="suppliers.copyAll"></span>
+              </button>
+            </div>
+          </div>
+          <div id="supplierKeysList" class="supplier-key-list">
+            <div class="supplier-empty"><i class="fa-solid fa-key"></i><p data-i18n="suppliers.keysEmptyInitial"></p></div>
+          </div>
+          <div id="supplierKeysPagination" class="supplier-pagination hidden"></div>
+        </section>
+
+        <section class="supplier-section">
+          <div class="supplier-section-head supplier-section-head--wrap">
+            <div>
+              <h2 data-i18n="suppliers.batchesTitle"></h2>
+              <p data-i18n="suppliers.batchesHint"></p>
+            </div>
+            <div class="supplier-lifetime-summary" id="supplierLifetimeSummary"></div>
+          </div>
+          <div id="supplierBatchList" class="supplier-batch-list"></div>
+        </section>
       </div>
 
       <!-- Settings tab -->
@@ -673,6 +777,28 @@
           <button class="btn btn-primary" id="apiKeyShowCloseBtn" type="button" data-i18n="apiKeys.closeBtn"></button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="supplierModal" class="modal">
+    <div class="modal-content supplier-modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="supplierModalTitle"></span>
+        <button class="modal-close" id="supplierModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body" id="supplierModalBody"></div>
+    </div>
+  </div>
+
+  <div id="supplierPurchaseModal" class="modal">
+    <div class="modal-content supplier-modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="supplierPurchaseTitle" data-i18n="suppliers.purchaseTitle"></span>
+        <button class="modal-close" id="supplierPurchaseClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body" id="supplierPurchaseBody"></div>
     </div>
   </div>
 

@@ -172,11 +172,16 @@ type Account struct {
 	AuthRegion   string `json:"authRegion,omitempty"`   // Region for token-refresh endpoints; falls back to Region
 	ApiRegion    string `json:"apiRegion,omitempty"`    // Region for API request hosts; falls back to Region
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
-	Region       string `json:"region"`                 // AWS region for OIDC endpoints
-	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds); unused for API Key
-	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
-	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+	// SupplierID and SupplierBatchID identify API-key accounts bought through the
+	// optional supplier integration. They are operational metadata only; the
+	// supplier token and purchase response are never copied into an account.
+	SupplierID      string `json:"supplierId,omitempty"`
+	SupplierBatchID string `json:"supplierBatchId,omitempty"`
+	Region          string `json:"region"`               // AWS region for OIDC endpoints
+	StartUrl        string `json:"startUrl,omitempty"`   // AWS SSO start URL
+	ExpiresAt       int64  `json:"expiresAt,omitempty"`  // Token expiration timestamp (Unix seconds); unused for API Key
+	MachineId       string `json:"machineId,omitempty"`  // UUID machine identifier for request tracking
+	ProfileArn      string `json:"profileArn,omitempty"` // CodeWhisperer/Kiro profile ARN for generation requests
 
 	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
 	// When AuthMethod == "external_idp" the credential is an IdP-issued OAuth token refreshed
@@ -351,6 +356,11 @@ type Config struct {
 	SystemVersion string        `json:"systemVersion,omitempty"`
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+
+	// SupplierIntegration contains the opt-in, multi-provider API-key procurement
+	// configuration. Runtime events and purchase ledgers live in a separate
+	// supplier_state.json file so account configuration stays compact.
+	SupplierIntegration SupplierIntegrationConfig `json:"supplierIntegration,omitempty"`
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -1015,6 +1025,8 @@ func UpdateAccount(id string, account Account) error {
 			account.ClientSecret = a.ClientSecret
 			account.AuthMethod = a.AuthMethod
 			account.Provider = a.Provider
+			account.SupplierID = a.SupplierID
+			account.SupplierBatchID = a.SupplierBatchID
 			account.Region = a.Region
 			account.AuthRegion = a.AuthRegion
 			account.ApiRegion = a.ApiRegion

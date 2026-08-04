@@ -43,6 +43,15 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  let supplierOverview = null;
+  let supplierPageLoaded = false;
+  let supplierOverviewTimer = null;
+  let supplierEditingId = '';
+  let supplierKeysPage = 1;
+  let supplierKeysData = null;
+  let supplierKeysLoading = false;
+  let supplierLastPurchaseKeys = [];
+  let supplierBatchVisibleCount = 10;
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -140,6 +149,7 @@
     renderAccounts();
     renderPromptRules();
     renderLogs(logsCache);
+    renderSupplierPage();
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -676,6 +686,8 @@
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
+    const requestedTab = String(location.hash || '').replace(/^#/, '');
+    if (['accounts', 'suppliers', 'settings', 'api', 'logs'].includes(requestedTab)) switchTab(requestedTab);
     setTimeout(checkUpdate, 2000);
   }
   async function loadStats() {
@@ -3326,12 +3338,511 @@
   }
   function closeUpdateModal() { closeDialog('updateModal'); }
 
+  // Supplier integration
+  async function supplierJSON(path, opts) {
+    const res = await api(path, opts);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    return data;
+  }
+
+  function supplierProviderById(id) {
+    const providers = supplierOverview && Array.isArray(supplierOverview.providers) ? supplierOverview.providers : [];
+    return providers.find(p => p.id === id) || null;
+  }
+
+  function supplierFormatNumber(value) {
+    const number = Number(value || 0);
+    return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/\.00$/, '');
+  }
+
+  function supplierFormatTime(value) {
+    if (!value) return t('suppliers.never');
+    const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString(currentLang === 'zh' ? 'zh-CN' : 'en-US', {
+      month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+    });
+  }
+
+  function supplierFormatDuration(seconds) {
+    seconds = Math.max(0, Number(seconds || 0));
+    if (!seconds) return t('suppliers.never');
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (currentLang === 'zh') {
+      if (days) return days + '天 ' + hours + '小时';
+      if (hours) return hours + '小时 ' + minutes + '分钟';
+      return Math.max(1, minutes) + '分钟';
+    }
+    if (days) return days + 'd ' + hours + 'h';
+    if (hours) return hours + 'h ' + minutes + 'm';
+    return Math.max(1, minutes) + 'm';
+  }
+
+  async function loadSupplierOverview(silent) {
+    try {
+      const data = await supplierJSON('/suppliers/overview');
+      supplierOverview = data;
+      supplierPageLoaded = true;
+      renderSupplierPage();
+      return data;
+    } catch (e) {
+      if (!silent) toastError(t('suppliers.loadFailed') + ': ' + e.message);
+      const grid = $('supplierProviderGrid');
+      if (grid && !supplierOverview) {
+        grid.innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-triangle-exclamation"></i><p>' + escapeHtml(t('suppliers.loadFailed')) + '</p></div>';
+      }
+      return null;
+    }
+  }
+
+  function renderSupplierPage() {
+    if (!supplierOverview) return;
+    const master = $('supplierMasterEnabled');
+    const auto = $('supplierAutoEnabled');
+    if (master) master.checked = !!supplierOverview.enabled;
+    if (auto) {
+      auto.checked = !!supplierOverview.autoPurchaseEnabled;
+      auto.disabled = !supplierOverview.enabled;
+    }
+    if ($('supplierLiveKeyCount')) $('supplierLiveKeyCount').textContent = supplierOverview.liveApiKeyCount || 0;
+    if ($('supplierPendingCount')) $('supplierPendingCount').textContent = supplierOverview.pendingPurchases || 0;
+    if ($('supplierPollingHint')) $('supplierPollingHint').textContent = t('suppliers.pollingHint', supplierOverview.pollIntervalSeconds || 5);
+    if ($('supplierPollInterval')) $('supplierPollInterval').value = supplierOverview.pollIntervalSeconds || 5;
+    if ($('supplierRefreshBtn')) $('supplierRefreshBtn').disabled = !supplierOverview.enabled;
+    if (!supplierOverview.enabled && supplierKeysData) {
+      supplierKeysData = null;
+      $('supplierKeysPagination').classList.add('hidden');
+      $('supplierKeysList').innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-key"></i><p>' + escapeHtml(t('suppliers.keysEmptyInitial')) + '</p></div>';
+    }
+    renderSupplierProviders();
+    renderSupplierProviderSelect();
+    updateSupplierKeysControls();
+    renderSupplierBatches();
+    if (supplierKeysData) renderSupplierKeys();
+  }
+
+  function renderSupplierProviderSelect() {
+    const select = $('supplierKeysProvider');
+    if (!select || !supplierOverview) return;
+    const previous = select.value;
+    const providers = Array.isArray(supplierOverview.providers) ? supplierOverview.providers : [];
+    select.innerHTML = providers.length
+      ? providers.map(p => '<option value="' + escapeAttr(p.id) + '">' + escapeHtml(p.name) + '</option>').join('')
+      : '<option value="">' + escapeHtml(t('suppliers.noProviders')) + '</option>';
+    if (providers.some(p => p.id === previous)) select.value = previous;
+    select.disabled = providers.length === 0;
+    if (select.__customSelect) renderCustomSelectOptions(select);
+  }
+
+  function updateSupplierKeysControls() {
+    const select = $('supplierKeysProvider');
+    const providers = supplierOverview && Array.isArray(supplierOverview.providers) ? supplierOverview.providers : [];
+    const selected = select && providers.find(provider => provider.id === select.value);
+    const canRead = !!(supplierOverview && supplierOverview.enabled && selected && selected.enabled);
+    if ($('supplierLoadKeysBtn')) $('supplierLoadKeysBtn').disabled = !canRead;
+    if ($('supplierKeysHistory')) $('supplierKeysHistory').disabled = !canRead;
+    if (!canRead && $('supplierCopyAllKeysBtn')) $('supplierCopyAllKeysBtn').disabled = true;
+  }
+
+  function renderSupplierProviders() {
+    const grid = $('supplierProviderGrid');
+    if (!grid || !supplierOverview) return;
+    const providers = Array.isArray(supplierOverview.providers) ? supplierOverview.providers : [];
+    if (!providers.length) {
+      grid.innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-box-open"></i><p>' + escapeHtml(t('suppliers.noProviders')) + '</p></div>';
+      return;
+    }
+    grid.innerHTML = providers.map(provider => {
+      const status = provider.status || {};
+      const checked = Number(status.checkedAt || 0) > 0;
+      const autoBlocked = !!provider.autoPurchaseBlocked;
+      const autoBlockReason = provider.autoPurchaseBlock && provider.autoPurchaseBlock.reason;
+      const hasError = autoBlocked || !!status.lastError;
+      const statusClass = hasError ? 'is-error' : (checked ? 'is-ok' : '');
+      const statusText = autoBlocked ? t('suppliers.autoPaused') : (hasError ? t('suppliers.testFailed') : (checked ? t('suppliers.connected') : t('suppliers.notChecked')));
+      const webhook = location.origin + (provider.webhookPath || ('/api/supplier-webhooks/' + provider.id));
+      const actionsDisabled = !supplierOverview.enabled || !provider.enabled;
+      const purchaseDisabled = actionsDisabled || !checked || (!!status.lastError && !autoBlocked);
+      return '<article class="supplier-provider-card' + (provider.enabled ? '' : ' is-disabled') + '">' +
+        '<div class="supplier-provider-top">' +
+        '<div class="supplier-provider-identity"><span class="supplier-provider-icon"><i class="fa-solid fa-server"></i></span><div class="min-w-0">' +
+        '<p class="supplier-provider-name">' + escapeHtml(provider.name) + '</p>' +
+        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + '</span>' +
+        '</div></div>' +
+        '<span class="supplier-status-pill ' + statusClass + '"><i class="fa-solid ' + (hasError ? 'fa-circle-exclamation' : (checked ? 'fa-circle-check' : 'fa-clock')) + '"></i>' + escapeHtml(statusText) + '</span>' +
+        '</div>' +
+        '<div class="supplier-provider-metrics">' +
+        supplierProviderMetric(t('suppliers.balance'), checked ? supplierFormatNumber(status.balance) : '—') +
+        supplierProviderMetric(t('suppliers.stockUS'), checked ? supplierFormatNumber(status.stockUs) : '—') +
+        supplierProviderMetric(t('suppliers.stockEU'), checked ? supplierFormatNumber(status.stockEu) : '—') +
+        supplierProviderMetric(t('suppliers.localAlive'), supplierFormatNumber(provider.aliveCount)) +
+        '</div>' +
+        (checked ? '<div class="supplier-provider-id mb-2">' + escapeHtml(t('suppliers.lastChecked', supplierFormatTime(status.checkedAt))) + ' · ' + escapeHtml(provider.tokenMasked || '') + '</div>' : '') +
+        (hasError ? '<div class="supplier-card-error">' + escapeHtml(autoBlocked ? t(autoBlockReason === 'no_importable_keys' ? 'suppliers.autoPausedHint' : 'suppliers.autoRejectedHint') : status.lastError) + '</div>' : '') +
+        '<div class="supplier-webhook-box" title="' + escapeAttr(webhook) + '"><i class="fa-solid fa-link"></i><code>' + escapeHtml(webhook) + '</code>' +
+        '<button class="btn btn-outline btn-xs" type="button" aria-label="' + escapeAttr(t('suppliers.copyWebhook')) + '" data-supplier-action="copy-webhook" data-id="' + escapeAttr(provider.id) + '"><i class="fa-regular fa-copy"></i></button></div>' +
+        '<div class="supplier-provider-actions">' +
+        '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="test" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.test')) + '</button>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="edit" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.edit')) + '</button>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="keys" data-id="' + escapeAttr(provider.id) + '"' + (actionsDisabled ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.viewKeys')) + '</button>' +
+        '<button class="btn btn-primary btn-xs" type="button" data-supplier-action="purchase" data-id="' + escapeAttr(provider.id) + '"' + (purchaseDisabled ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.purchase')) + '</button>' +
+        '</div></article>';
+    }).join('');
+  }
+
+  function supplierProviderMetric(label, value) {
+    return '<div class="supplier-provider-metric"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(String(value)) + '</strong></div>';
+  }
+
+  async function saveSupplierFeature() {
+    const master = $('supplierMasterEnabled');
+    const auto = $('supplierAutoEnabled');
+    const interval = $('supplierPollInterval');
+    if (!master || !auto || !interval) return;
+    const pollIntervalSeconds = Number(interval.value);
+    if (!Number.isInteger(pollIntervalSeconds) || pollIntervalSeconds < 5 || pollIntervalSeconds > 300) {
+      interval.value = supplierOverview && supplierOverview.pollIntervalSeconds || 5;
+      toastError(t('suppliers.pollIntervalInvalid'));
+      return;
+    }
+    master.disabled = true;
+    auto.disabled = true;
+    interval.disabled = true;
+    try {
+      await supplierJSON('/suppliers/settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          enabled: master.checked,
+          autoPurchaseEnabled: auto.checked,
+          pollIntervalSeconds
+        })
+      });
+      await loadSupplierOverview(true);
+      toastPrimary(t('suppliers.featureSaved'));
+    } catch (e) {
+      await loadSupplierOverview(true);
+      toastError(e.message);
+    } finally {
+      master.disabled = false;
+      auto.disabled = !master.checked;
+      interval.disabled = false;
+    }
+  }
+
+  async function refreshSuppliers() {
+    const btn = $('supplierRefreshBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
+    }
+    try {
+      const result = await supplierJSON('/suppliers/refresh', { method: 'POST' });
+      await loadSupplierOverview(true);
+      if (result.success) toastPrimary(t('suppliers.refreshSuccess'));
+      else toastWarning(t('suppliers.refreshPartial'));
+    } catch (e) {
+      toastError(t('suppliers.refreshPartial') + ': ' + e.message);
+    } finally {
+      if (btn) {
+        btn.disabled = !(supplierOverview && supplierOverview.enabled);
+        btn.removeAttribute('aria-busy');
+      }
+    }
+  }
+
+  function showSupplierModal(id) {
+    supplierEditingId = id || '';
+    const provider = id ? supplierProviderById(id) : null;
+    $('supplierModalTitle').textContent = provider ? t('suppliers.editTitle') : t('suppliers.addTitle');
+    $('supplierModalBody').innerHTML = '<div class="supplier-form-grid">' +
+      '<div class="form-group"><label for="supplierFormId">' + escapeHtml(t('suppliers.formId')) + '</label>' +
+      '<input id="supplierFormId" type="text" maxlength="64" placeholder="' + escapeAttr(t('suppliers.formIdPlaceholder')) + '" value="' + escapeAttr(provider ? provider.id : '') + '"' + (provider ? ' disabled' : '') + ' />' +
+      '<small>' + escapeHtml(t('suppliers.formIdHint')) + '</small></div>' +
+      '<div class="form-group"><label for="supplierFormName">' + escapeHtml(t('suppliers.formName')) + '</label>' +
+      '<input id="supplierFormName" type="text" maxlength="100" placeholder="' + escapeAttr(t('suppliers.formNamePlaceholder')) + '" value="' + escapeAttr(provider ? provider.name : '') + '" /></div>' +
+      '<div class="form-group supplier-form-full"><label for="supplierFormBaseUrl">' + escapeHtml(t('suppliers.formBaseUrl')) + '</label>' +
+      '<input id="supplierFormBaseUrl" type="url" placeholder="' + escapeAttr(t('suppliers.formBaseUrlPlaceholder')) + '" value="' + escapeAttr(provider ? provider.baseUrl : 'https://') + '" /></div>' +
+      '<div class="form-group supplier-form-full"><label for="supplierFormToken">' + escapeHtml(t('suppliers.formToken')) + '</label>' +
+      '<input id="supplierFormToken" type="password" autocomplete="new-password" placeholder="' + escapeAttr(provider ? (provider.tokenMasked || 'km_…') : 'km_…') + '" />' +
+      '<small>' + escapeHtml(provider ? t('suppliers.formTokenEditHint') : t('suppliers.formTokenCreateHint')) + '</small></div>' +
+      '<div class="form-group"><label for="supplierFormPriority">' + escapeHtml(t('suppliers.formPriority')) + '</label>' +
+      '<input id="supplierFormPriority" type="number" min="0" max="10000" value="' + escapeAttr(provider ? provider.priority : 100) + '" />' +
+      '<small>' + escapeHtml(t('suppliers.formPriorityHint')) + '</small></div>' +
+      '<div class="form-group"><label for="supplierFormAutoCount">' + escapeHtml(t('suppliers.formAutoCount')) + '</label>' +
+      '<input id="supplierFormAutoCount" type="number" min="1" max="500" value="' + escapeAttr(provider ? provider.autoPurchaseCount : 1) + '" />' +
+      '<small>' + escapeHtml(t('suppliers.formAutoCountHint')) + '</small></div>' +
+      '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierFormEnabled" type="checkbox"' + (!provider || provider.enabled ? ' checked' : '') + ' /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.formEnabled')) + '</span></label></div>' +
+      '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierFormCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="supplierFormSave" type="button">' + escapeHtml(t('suppliers.save')) + '</button></div>';
+    openDialog('supplierModal');
+    setTimeout(() => $(provider ? 'supplierFormName' : 'supplierFormId').focus(), 0);
+  }
+
+  function closeSupplierModal() {
+    closeDialog('supplierModal');
+    supplierEditingId = '';
+  }
+
+  async function submitSupplierForm() {
+    const id = supplierEditingId || $('supplierFormId').value.trim().toLowerCase();
+    const body = {
+      id,
+      name: $('supplierFormName').value.trim(),
+      baseUrl: $('supplierFormBaseUrl').value.trim(),
+      apiToken: $('supplierFormToken').value.trim(),
+      priority: parseInt($('supplierFormPriority').value || '0', 10),
+      autoPurchaseCount: parseInt($('supplierFormAutoCount').value || '0', 10),
+      enabled: $('supplierFormEnabled').checked
+    };
+    if (!id || !body.name || !body.baseUrl || (!supplierEditingId && !body.apiToken)) {
+      toastWarning(t('common.required'));
+      return;
+    }
+    const btn = $('supplierFormSave');
+    btn.disabled = true;
+    btn.textContent = t('suppliers.saving');
+    try {
+      await supplierJSON(supplierEditingId ? ('/suppliers/' + encodeURIComponent(supplierEditingId)) : '/suppliers', {
+        method: supplierEditingId ? 'PUT' : 'POST',
+        body: JSON.stringify(body)
+      });
+      closeSupplierModal();
+      await loadSupplierOverview(true);
+      toastPrimary(t('suppliers.saved'));
+    } catch (e) {
+      toastError(e.message);
+      btn.disabled = false;
+      btn.textContent = t('suppliers.save');
+    }
+  }
+
+  async function testSupplier(id, button) {
+    if (button) {
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+    }
+    try {
+      await supplierJSON('/suppliers/' + encodeURIComponent(id) + '/test', { method: 'POST' });
+      await loadSupplierOverview(true);
+      toastPrimary(t('suppliers.testSuccess'));
+    } catch (e) {
+      await loadSupplierOverview(true);
+      toastError(t('suppliers.testFailed') + ': ' + e.message);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+      }
+    }
+  }
+
+  function showSupplierPurchase(id) {
+    const provider = supplierProviderById(id);
+    if (!provider) return;
+    const status = provider.status || {};
+    $('supplierPurchaseTitle').textContent = t('suppliers.purchaseTitle') + ' · ' + provider.name;
+    $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-summary">' +
+      escapeHtml(t('suppliers.balance')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.balance)) + '</strong> · ' +
+      escapeHtml(t('suppliers.stockUS')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockUs)) + '</strong> · ' +
+      escapeHtml(t('suppliers.stockEU')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockEu)) + '</strong></div>' +
+      '<div class="supplier-form-grid mt-4">' +
+      '<div class="form-group"><label for="supplierPurchaseRegion">' + escapeHtml(t('suppliers.purchaseRegion')) + '</label><select id="supplierPurchaseRegion">' +
+      '<option value="us">' + escapeHtml(t('suppliers.purchaseUS')) + '</option><option value="eu">' + escapeHtml(t('suppliers.purchaseEU')) + '</option></select></div>' +
+      '<div class="form-group"><label for="supplierPurchaseCount">' + escapeHtml(t('suppliers.purchaseCount')) + '</label><input id="supplierPurchaseCount" type="number" min="1" max="500" value="' + escapeAttr(provider.autoPurchaseCount || 1) + '" /></div>' +
+      '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierPurchaseAutoImport" type="checkbox" checked /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.purchaseAutoImport')) + '</span></label><small class="field-hint-offset">' + escapeHtml(t('suppliers.purchaseImportHint')) + '</small></div>' +
+      '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierPurchaseCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="supplierPurchaseSubmit" type="button" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.purchaseSubmit')) + '</button></div>';
+    openDialog('supplierPurchaseModal');
+    enhanceCustomSelects($('supplierPurchaseBody'));
+  }
+
+  function closeSupplierPurchase() {
+    closeAllCustomSelects();
+    closeDialog('supplierPurchaseModal');
+    supplierLastPurchaseKeys = [];
+  }
+
+  async function submitSupplierPurchase(id) {
+    const btn = $('supplierPurchaseSubmit');
+    const count = parseInt($('supplierPurchaseCount').value || '0', 10);
+    const region = $('supplierPurchaseRegion').value;
+    const autoImport = $('supplierPurchaseAutoImport').checked;
+    if (!count || count < 1 || count > 500) {
+      toastWarning(t('suppliers.formAutoCountHint'));
+      return;
+    }
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      const data = await supplierJSON('/suppliers/' + encodeURIComponent(id) + '/purchase', {
+        method: 'POST', body: JSON.stringify({ count, region, autoImport })
+      });
+      if (data.pending) {
+        $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-result"><div class="supplier-purchase-result-head"><i class="fa-solid fa-clock"></i> ' + escapeHtml(t('suppliers.purchasePending')) + '</div>' +
+          '<div class="modal-footer"><button class="btn btn-primary" id="supplierPurchaseDone" type="button">' + escapeHtml(t('suppliers.close')) + '</button></div></div>';
+        await loadSupplierOverview(true);
+        return;
+      }
+      const purchase = data.purchase || {};
+      const batch = data.batch || {};
+      supplierLastPurchaseKeys = Array.isArray(purchase.keys) ? purchase.keys.map(k => k.key || k.key_value || '').filter(Boolean) : [];
+      $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-result">' +
+        '<div class="supplier-purchase-result-head"><i class="fa-solid fa-circle-check"></i> <strong>' + escapeHtml(t('suppliers.purchaseSuccess', purchase.purchased || 0)) + '</strong><br><span>' + escapeHtml(t('suppliers.purchaseSummary', supplierFormatNumber(purchase.total_debit), batch.imported || 0)) + '</span></div>' +
+        (supplierLastPurchaseKeys.length ? '<div class="supplier-section-head"><h2>' + escapeHtml(t('suppliers.purchaseKeys')) + '</h2><button class="btn btn-outline btn-sm" id="supplierCopyPurchased" type="button"><i class="fa-regular fa-copy"></i> ' + escapeHtml(t('suppliers.copyPurchased')) + '</button></div>' +
+          supplierLastPurchaseKeys.map(key => '<div class="supplier-key-row"><code class="supplier-key-value">' + escapeHtml(key) + '</code><span></span><button class="btn btn-outline btn-xs" type="button" data-purchased-key="' + escapeAttr(key) + '">' + escapeHtml(t('suppliers.copyKey')) + '</button></div>').join('') : '') +
+        '<div class="modal-footer"><button class="btn btn-primary" id="supplierPurchaseDone" type="button">' + escapeHtml(t('suppliers.close')) + '</button></div></div>';
+      await Promise.all([loadSupplierOverview(true), loadAccounts(), loadStats()]);
+    } catch (e) {
+      toastError(e.message);
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+
+  async function loadSupplierKeys(page) {
+    const select = $('supplierKeysProvider');
+    const providerId = select && select.value;
+    if (!providerId || supplierKeysLoading) return;
+    supplierKeysLoading = true;
+    supplierKeysPage = page || 1;
+    $('supplierKeysList').innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-spinner fa-spin"></i><p>' + escapeHtml(t('suppliers.keysLoading')) + '</p></div>';
+    $('supplierKeysPagination').classList.add('hidden');
+    $('supplierCopyAllKeysBtn').disabled = true;
+    try {
+      const history = $('supplierKeysHistory').checked ? '1' : '0';
+      supplierKeysData = await supplierJSON('/suppliers/' + encodeURIComponent(providerId) + '/keys?page=' + supplierKeysPage + '&page_size=50&history=' + history);
+      renderSupplierKeys();
+    } catch (e) {
+      supplierKeysData = null;
+      $('supplierKeysList').innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-circle-exclamation"></i><p>' + escapeHtml(t('suppliers.keysLoadFailed') + ': ' + e.message) + '</p></div>';
+    } finally {
+      supplierKeysLoading = false;
+    }
+  }
+
+  function renderSupplierKeys() {
+    const list = $('supplierKeysList');
+    const pagination = $('supplierKeysPagination');
+    if (!list || !pagination || !supplierKeysData) return;
+    const items = Array.isArray(supplierKeysData.items) ? supplierKeysData.items : [];
+    if (!items.length) {
+      list.innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-key"></i><p>' + escapeHtml(t('suppliers.keysEmpty')) + '</p></div>';
+    } else {
+      list.innerHTML = items.map(item => {
+        const key = item.key || item.key_value || '';
+        const when = item.purchased_at || item.created_at;
+        return '<div class="supplier-key-row"><code class="supplier-key-value">' + escapeHtml(key) + '</code>' +
+          '<span class="supplier-key-meta">' + escapeHtml(t('suppliers.keyStatus', item.status || t('suppliers.unknown'))) + (when ? ' · ' + escapeHtml(t('suppliers.keyTime', supplierFormatTime(when))) : '') + '</span>' +
+          '<button class="btn btn-outline btn-xs" type="button" data-supplier-key="' + escapeAttr(key) + '">' + escapeHtml(t('suppliers.copyKey')) + '</button></div>';
+      }).join('');
+    }
+    const pages = Math.max(1, supplierKeysData.pages || 1);
+    const page = Math.max(1, supplierKeysData.page || supplierKeysPage);
+    pagination.innerHTML = '<button class="btn btn-outline btn-xs" type="button" data-supplier-page="' + (page - 1) + '"' + (page <= 1 ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.previous')) + '</button>' +
+      '<span>' + escapeHtml(t('suppliers.pageInfo', page, pages, supplierKeysData.total || 0)) + '</span>' +
+      '<button class="btn btn-outline btn-xs" type="button" data-supplier-page="' + (page + 1) + '"' + (page >= pages ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.next')) + '</button>';
+    pagination.classList.remove('hidden');
+    $('supplierCopyAllKeysBtn').disabled = !(supplierKeysData.total > 0);
+  }
+
+  async function copyAllSupplierKeys() {
+    const providerId = $('supplierKeysProvider').value;
+    if (!providerId) return;
+    const btn = $('supplierCopyAllKeysBtn');
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      const history = $('supplierKeysHistory').checked ? '1' : '0';
+      const first = await supplierJSON('/suppliers/' + encodeURIComponent(providerId) + '/keys?page=1&page_size=500&history=' + history);
+      let items = Array.isArray(first.items) ? first.items.slice() : [];
+      const declaredTotal = Math.max(items.length, Number(first.total || 0));
+      const expectedPages = Math.max(1, Math.ceil(declaredTotal / 500));
+      // The API contract always includes total. Never trust a faulty supplier
+      // to make the browser follow an unbounded pages value.
+      if (expectedPages > 200) throw new Error(t('suppliers.tooManyKeysToCopy'));
+      const declaredPages = Number(first.pages);
+      const safeDeclaredPages = Number.isFinite(declaredPages) && declaredPages > 0 ? Math.floor(declaredPages) : expectedPages;
+      const pages = Math.min(200, expectedPages, safeDeclaredPages);
+      for (let page = 2; page <= pages; page++) {
+        const next = await supplierJSON('/suppliers/' + encodeURIComponent(providerId) + '/keys?page=' + page + '&page_size=500&history=' + history);
+        if (Array.isArray(next.items)) items = items.concat(next.items);
+      }
+      const keys = items.map(item => item.key || item.key_value || '').filter(Boolean);
+      await copyText(keys.join('\n'));
+      toastPrimary(t('suppliers.allKeysCopied', keys.length));
+    } catch (e) {
+      toastError(e.message);
+    } finally {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+
+  function renderSupplierBatches() {
+    const list = $('supplierBatchList');
+    const summary = $('supplierLifetimeSummary');
+    if (!list || !summary || !supplierOverview) return;
+    const lifetime = supplierOverview.lifetime || {};
+    if (lifetime.samples > 0) {
+      summary.innerHTML = '<span class="supplier-lifetime-chip">' + escapeHtml(t('suppliers.lifetimeSamples', lifetime.samples)) + '</span>' +
+        '<span class="supplier-lifetime-chip">' + escapeHtml(t('suppliers.lifetimeAverage', supplierFormatDuration(lifetime.averageSeconds))) + '</span>' +
+        '<span class="supplier-lifetime-chip">' + escapeHtml(t('suppliers.lifetimeMedian', supplierFormatDuration(lifetime.medianSeconds))) + '</span>';
+    } else {
+      summary.innerHTML = '<span class="supplier-lifetime-chip">' + escapeHtml(t('suppliers.lifetimeNoSamples')) + '</span>';
+    }
+    const batches = Array.isArray(supplierOverview.batches) ? supplierOverview.batches : [];
+    if (!batches.length) {
+      list.innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-clock-rotate-left"></i><p>' + escapeHtml(t('suppliers.batchEmpty')) + '</p></div>';
+      return;
+    }
+    const visibleBatches = batches.slice(0, supplierBatchVisibleCount);
+    list.innerHTML = visibleBatches.map(batch => {
+      const provider = supplierProviderById(batch.providerId);
+      const statusMap = {
+        active: ['is-active', t('suppliers.batchStatusActive')],
+        dead: ['is-dead', t('suppliers.batchStatusDead')],
+        ended_manual: ['', t('suppliers.batchStatusManual')],
+        not_imported: ['', t('suppliers.batchStatusNotImported')]
+      };
+      const status = statusMap[batch.status] || ['', batch.status || t('suppliers.unknown')];
+      const lifetime = batch.lifetimeSeconds || (batch.status === 'active' ? Math.max(0, Math.floor(Date.now() / 1000) - Number(batch.createdAt || 0)) : 0);
+      return '<div class="supplier-batch-row"><div class="supplier-batch-main"><strong>' + escapeHtml(provider ? provider.name : batch.providerId) + ' · ' + escapeHtml(String(batch.region || '').toUpperCase()) + '</strong><small>' + escapeHtml(t('suppliers.batchCreated', supplierFormatTime(batch.createdAt))) + '</small></div>' +
+        '<div class="supplier-batch-cell"><strong>' + escapeHtml((batch.purchased || 0) + ' / ' + (batch.imported || 0)) + '</strong><span>' + escapeHtml(t('suppliers.batchQuantity')) + '</span></div>' +
+        '<div class="supplier-batch-cell"><strong>' + escapeHtml(String(batch.activeCount || 0)) + '</strong><span>' + escapeHtml(t('suppliers.batchActive')) + '</span></div>' +
+        '<div class="supplier-batch-cell"><strong>' + escapeHtml(supplierFormatNumber(batch.totalDebit)) + '</strong><span>' + escapeHtml(t('suppliers.batchCost')) + '</span></div>' +
+        '<div class="supplier-batch-cell"><strong>' + escapeHtml(supplierFormatDuration(lifetime)) + '</strong><span>' + escapeHtml(t('suppliers.batchLifetime')) + '</span></div>' +
+        '<span class="supplier-batch-status ' + status[0] + '">' + escapeHtml(status[1]) + '</span></div>';
+    }).join('') + (batches.length > visibleBatches.length
+      ? '<div class="supplier-batch-more"><button class="btn btn-outline btn-sm" type="button" data-supplier-batches-more>' + escapeHtml(t('suppliers.showMoreBatches', Math.min(10, batches.length - visibleBatches.length), batches.length - visibleBatches.length)) + '</button></div>'
+      : '');
+  }
+
+  function setSupplierOverviewTimer(active) {
+    if (supplierOverviewTimer) {
+      clearInterval(supplierOverviewTimer);
+      supplierOverviewTimer = null;
+    }
+    if (active) supplierOverviewTimer = setInterval(() => loadSupplierOverview(true), 5000);
+  }
+
   // Tabs
   function switchTab(tab) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
-    $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    const content = $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1));
+    if (!content) return;
+    content.classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    if (tab === 'suppliers') {
+      loadSupplierOverview(supplierPageLoaded);
+      setSupplierOverviewTimer(true);
+    } else {
+      setSupplierOverviewTimer(false);
+    }
+    if (history && history.replaceState) history.replaceState(null, '', tab === 'accounts' ? location.pathname + location.search : '#' + tab);
   }
 
   // Event wiring
@@ -3459,6 +3970,105 @@
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
+  }
+
+  function bindSupplierEvents() {
+    $('supplierMasterEnabled').addEventListener('change', saveSupplierFeature);
+    $('supplierAutoEnabled').addEventListener('change', saveSupplierFeature);
+    $('supplierPollInterval').addEventListener('change', saveSupplierFeature);
+    $('supplierRefreshBtn').addEventListener('click', refreshSuppliers);
+    $('supplierAddBtn').addEventListener('click', () => showSupplierModal(''));
+    $('supplierLoadKeysBtn').addEventListener('click', () => loadSupplierKeys(1));
+    $('supplierKeysHistory').addEventListener('change', () => {
+      if (supplierKeysData) loadSupplierKeys(1);
+    });
+    $('supplierKeysProvider').addEventListener('change', () => {
+      supplierKeysData = null;
+      supplierKeysPage = 1;
+      $('supplierCopyAllKeysBtn').disabled = true;
+      $('supplierKeysPagination').classList.add('hidden');
+      $('supplierKeysList').innerHTML = '<div class="supplier-empty"><i class="fa-solid fa-key"></i><p>' + escapeHtml(t('suppliers.keysEmptyInitial')) + '</p></div>';
+      updateSupplierKeysControls();
+    });
+    $('supplierCopyAllKeysBtn').addEventListener('click', copyAllSupplierKeys);
+
+    $('supplierProviderGrid').addEventListener('click', async e => {
+      const button = e.target.closest('[data-supplier-action]');
+      if (!button || button.disabled) return;
+      const id = button.dataset.id;
+      switch (button.dataset.supplierAction) {
+        case 'copy-webhook': {
+          const provider = supplierProviderById(id);
+          if (!provider) return;
+          await copyText(location.origin + provider.webhookPath);
+          toastPrimary(t('common.copied'));
+          break;
+        }
+        case 'test':
+          testSupplier(id, button);
+          break;
+        case 'edit':
+          showSupplierModal(id);
+          break;
+        case 'purchase':
+          showSupplierPurchase(id);
+          break;
+        case 'keys':
+          $('supplierKeysProvider').value = id;
+          syncCustomSelect($('supplierKeysProvider'));
+          loadSupplierKeys(1);
+          $('supplierKeysList').scrollIntoView({ behavior: 'smooth', block: 'start' });
+          break;
+      }
+    });
+
+    $('supplierKeysList').addEventListener('click', async e => {
+      const button = e.target.closest('[data-supplier-key]');
+      if (!button) return;
+      await copyText(button.dataset.supplierKey || '');
+      toastPrimary(t('suppliers.keyCopied'));
+    });
+    $('supplierKeysPagination').addEventListener('click', e => {
+      const button = e.target.closest('[data-supplier-page]');
+      if (!button || button.disabled) return;
+      loadSupplierKeys(parseInt(button.dataset.supplierPage, 10));
+    });
+    $('supplierBatchList').addEventListener('click', e => {
+      if (!e.target.closest('[data-supplier-batches-more]')) return;
+      supplierBatchVisibleCount += 10;
+      renderSupplierBatches();
+    });
+
+    $('supplierModalClose').addEventListener('click', closeSupplierModal);
+    bindDialogBackdropClose('supplierModal', closeSupplierModal);
+    $('supplierModalBody').addEventListener('click', e => {
+      if (e.target.closest('#supplierFormCancel')) closeSupplierModal();
+      if (e.target.closest('#supplierFormSave')) submitSupplierForm();
+    });
+
+    $('supplierPurchaseClose').addEventListener('click', closeSupplierPurchase);
+    bindDialogBackdropClose('supplierPurchaseModal', closeSupplierPurchase);
+    $('supplierPurchaseBody').addEventListener('click', async e => {
+      if (e.target.closest('#supplierPurchaseCancel') || e.target.closest('#supplierPurchaseDone')) {
+        closeSupplierPurchase();
+        return;
+      }
+      const submit = e.target.closest('#supplierPurchaseSubmit');
+      if (submit) {
+        submitSupplierPurchase(submit.dataset.id);
+        return;
+      }
+      if (e.target.closest('#supplierCopyPurchased')) {
+        await copyText(supplierLastPurchaseKeys.join('\n'));
+        toastPrimary(t('suppliers.allKeysCopied', supplierLastPurchaseKeys.length));
+        return;
+      }
+      const keyButton = e.target.closest('[data-purchased-key]');
+      if (keyButton) {
+        await copyText(keyButton.dataset.purchasedKey || '');
+        toastPrimary(t('suppliers.keyCopied'));
+      }
+    });
   }
 
   function bindPromptFilterEvents() {
@@ -3765,6 +4375,7 @@
     bindShellEvents();
     bindAccountEvents();
     bindSettingsEvents();
+    bindSupplierEvents();
     bindPromptFilterEvents();
     bindModalEvents();
     bindDetailEvents();

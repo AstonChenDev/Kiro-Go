@@ -112,6 +112,9 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 
 	logger.Warnf("[AccountFailover] Disabled %s: %s", account.Email, banReason)
 	h.pool.Reload()
+	if h.suppliers != nil && account.SupplierBatchID != "" {
+		h.suppliers.reconcileBatches()
+	}
 }
 
 func (h *Handler) disableAccountOverage(account *config.Account) {

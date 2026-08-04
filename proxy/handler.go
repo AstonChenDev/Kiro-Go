@@ -65,6 +65,10 @@ const requestLogsMaxSize = 500
 // Handler HTTP 处理器
 type Handler struct {
 	pool *pool.AccountPool
+	// suppliers owns the optional multi-provider procurement worker and its
+	// durable webhook/purchase state. It is nil only when state initialization
+	// failed; all supplier routes fail closed in that case.
+	suppliers *supplierManager
 	// 运行时统计 (使用原子操作)
 	totalRequests   int64
 	successRequests int64
@@ -308,6 +312,12 @@ func NewHandler() *Handler {
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+	if suppliers, err := newSupplierManager(h, h.stopRefresh); err != nil {
+		logger.Warnf("[Supplier] integration disabled because state initialization failed: %v", err)
+	} else {
+		h.suppliers = suppliers
+		go suppliers.run()
+	}
 	return h
 }
 
@@ -420,6 +430,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 路由
 	switch {
+	// Public supplier callbacks use a permanent provider-specific path. The
+	// request body is never trusted to choose a supplier or authorize a purchase.
+	case strings.HasPrefix(path, "/api/supplier-webhooks/"):
+		h.handleSupplierWebhook(w, r)
 	// API 端点（需要验证 API Key）
 	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
 		ar := h.authenticateForClaude(w, r)
@@ -2586,6 +2600,28 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	switch {
+	case path == "/suppliers/overview" && r.Method == "GET":
+		h.apiGetSupplierOverview(w, r)
+	case path == "/suppliers/settings" && r.Method == "POST":
+		h.apiUpdateSupplierFeature(w, r)
+	case path == "/suppliers/refresh" && r.Method == "POST":
+		h.apiRefreshSuppliers(w, r)
+	case path == "/suppliers/batches" && r.Method == "GET":
+		h.apiGetSupplierBatches(w, r)
+	case path == "/suppliers" && r.Method == "POST":
+		h.apiCreateSupplier(w, r)
+	case strings.HasPrefix(path, "/suppliers/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/suppliers/"), "/test")
+		h.apiTestSupplier(w, r, id)
+	case strings.HasPrefix(path, "/suppliers/") && strings.HasSuffix(path, "/keys") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/suppliers/"), "/keys")
+		h.apiGetSupplierKeys(w, r, id)
+	case strings.HasPrefix(path, "/suppliers/") && strings.HasSuffix(path, "/purchase") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/suppliers/"), "/purchase")
+		h.apiPurchaseSupplierKeys(w, r, id)
+	case strings.HasPrefix(path, "/suppliers/") && r.Method == "PUT":
+		id := strings.TrimPrefix(path, "/suppliers/")
+		h.apiUpdateSupplier(w, r, id)
 	case path == "/accounts" && r.Method == "GET":
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
