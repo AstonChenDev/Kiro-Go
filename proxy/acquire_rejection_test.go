@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -17,31 +18,32 @@ func TestHandlersReturnSchedulerSlotWhenAcquireRejects(t *testing.T) {
 		{
 			name: "claude stream",
 			call: func(h *Handler, rec *httptest.ResponseRecorder) {
-				h.handleClaudeStream(rec, &KiroPayload{}, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+				h.handleClaudeStream(context.Background(), rec, &KiroPayload{}, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
 			},
 		},
 		{
 			name: "claude non-stream",
 			call: func(h *Handler, rec *httptest.ResponseRecorder) {
-				h.handleClaudeNonStream(rec, &KiroPayload{}, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+				h.handleClaudeNonStream(context.Background(), rec, &KiroPayload{}, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
 			},
 		},
 		{
 			name: "openai stream",
 			call: func(h *Handler, rec *httptest.ResponseRecorder) {
-				h.handleOpenAIStream(rec, &KiroPayload{}, "claude-sonnet-4.5", false, 1, "")
+				h.handleOpenAIStream(context.Background(), rec, &KiroPayload{}, "claude-sonnet-4.5", false, 1, "")
 			},
 		},
 		{
 			name: "openai non-stream",
 			call: func(h *Handler, rec *httptest.ResponseRecorder) {
-				h.handleOpenAINonStream(rec, &KiroPayload{}, "claude-sonnet-4.5", false, 1, "")
+				h.handleOpenAINonStream(context.Background(), rec, &KiroPayload{}, "claude-sonnet-4.5", false, 1, "")
 			},
 		},
 		{
 			name: "responses stream",
 			call: func(h *Handler, rec *httptest.ResponseRecorder) {
 				h.handleResponsesStream(
+					context.Background(),
 					rec,
 					&KiroPayload{},
 					"claude-sonnet-4.5",
@@ -59,6 +61,7 @@ func TestHandlersReturnSchedulerSlotWhenAcquireRejects(t *testing.T) {
 			name: "responses non-stream",
 			call: func(h *Handler, rec *httptest.ResponseRecorder) {
 				h.handleResponsesNonStream(
+					context.Background(),
 					rec,
 					&KiroPayload{},
 					"claude-sonnet-4.5",

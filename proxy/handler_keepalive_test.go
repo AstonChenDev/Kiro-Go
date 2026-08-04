@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	accountpool "kiro-go/pool"
 	"kiro-go/config"
+	accountpool "kiro-go/pool"
 )
 
 // lockedFlushRecorder 是一个并发安全的 ResponseWriter+Flusher。流式 handler 的保活
@@ -62,6 +63,9 @@ func newStalledEventStreamServer(t *testing.T, stallFor time.Duration) *httptest
 		time.Sleep(stallFor)
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "second",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
 		}))
 		flusher.Flush()
 	}))
@@ -142,7 +146,7 @@ func TestClaudeStreamEmitsKeepaliveDuringUpstreamStall(t *testing.T) {
 
 	model := "claude-opus-4-8"
 	rec := newLockedFlushRecorder()
-	h.handleClaudeStream(rec, keepaliveTestPayload(model), model, false, claudeThinkingResponseOptions{}, 1000, nil, "")
+	h.handleClaudeStream(context.Background(), rec, keepaliveTestPayload(model), model, false, claudeThinkingResponseOptions{}, 1000, nil, "")
 
 	body := rec.body()
 	if !strings.Contains(body, ": keepalive") {
@@ -185,7 +189,7 @@ func TestOpenAIStreamEmitsKeepaliveDuringUpstreamStall(t *testing.T) {
 
 	model := "claude-opus-4-8"
 	rec := newLockedFlushRecorder()
-	h.handleOpenAIStream(rec, keepaliveTestPayload(model), model, false, 1000, "")
+	h.handleOpenAIStream(context.Background(), rec, keepaliveTestPayload(model), model, false, 1000, "")
 
 	body := rec.body()
 	if !strings.Contains(body, ": keepalive") {

@@ -301,15 +301,18 @@ func (p *AccountPool) CooldownAccount(id string, duration time.Duration) {
 	p.cooldowns[id] = time.Now().Add(duration)
 }
 
-// ResetTransientState clears per-account cooldowns, error counters and runtime
-// stats and rewinds the round-robin cursor. Intended for test isolation: the
-// pool is a process-wide singleton, so a prior test's failures/cooldowns would
-// otherwise leak into later tests that reuse the same account IDs.
+// ResetTransientState clears per-account cooldowns, error counters, rate-limit
+// windows, active streams and runtime stats, then rewinds the round-robin
+// cursor. Intended for test isolation: the pool is a process-wide singleton,
+// so a prior test's dispatch state would otherwise leak into later tests that
+// reuse the same account IDs.
 func (p *AccountPool) ResetTransientState() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.cooldowns = make(map[string]time.Time)
 	p.errorCounts = make(map[string]int)
+	p.activeSSE = make(map[string]int)
+	p.reqTimestamps = make(map[string][]time.Time)
 	p.runtimeStats = make(map[string]*accountRuntimeStats)
 	p.currentIndex = 0
 }
