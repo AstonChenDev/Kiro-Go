@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -23,6 +25,15 @@ func maskSupplierToken(token string) string {
 		return "••••••••"
 	}
 	return token[:6] + "…" + token[len(token)-4:]
+}
+
+func supplierProviderCapabilities(provider config.SupplierProvider) map[string]bool {
+	kiroApp := config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroApp
+	return map[string]bool{
+		"balance":           kiroApp,
+		"regions":           kiroApp,
+		"webhookManagement": !kiroApp,
+	}
 }
 
 func (h *Handler) supplierReady(w http.ResponseWriter) bool {
@@ -64,6 +75,8 @@ func (h *Handler) apiGetSupplierOverview(w http.ResponseWriter, _ *http.Request)
 			"id":                  provider.ID,
 			"name":                provider.Name,
 			"baseUrl":             provider.BaseURL,
+			"apiType":             config.EffectiveSupplierAPIType(provider.APIType),
+			"capabilities":        supplierProviderCapabilities(provider),
 			"enabled":             provider.Enabled,
 			"priority":            provider.Priority,
 			"autoPurchaseCount":   provider.AutoPurchaseCount,
@@ -129,6 +142,7 @@ type supplierProviderRequest struct {
 	Name              string `json:"name"`
 	BaseURL           string `json:"baseUrl"`
 	APIToken          string `json:"apiToken"`
+	APIType           string `json:"apiType"`
 	Enabled           bool   `json:"enabled"`
 	Priority          int    `json:"priority"`
 	AutoPurchaseCount int    `json:"autoPurchaseCount"`
@@ -143,6 +157,7 @@ func (r supplierProviderRequest) configValue(id string) config.SupplierProvider 
 		Name:              r.Name,
 		BaseURL:           r.BaseURL,
 		APIToken:          r.APIToken,
+		APIType:           r.APIType,
 		Enabled:           r.Enabled,
 		Priority:          r.Priority,
 		AutoPurchaseCount: r.AutoPurchaseCount,
@@ -172,6 +187,19 @@ func (h *Handler) apiUpdateSupplier(w http.ResponseWriter, r *http.Request, id s
 	var body supplierProviderRequest
 	if err := decodeSupplierJSON(r, &body); err != nil {
 		writeSupplierError(w, http.StatusBadRequest, err)
+		return
+	}
+	existing := config.GetSupplierProvider(id)
+	if existing == nil {
+		writeSupplierError(w, http.StatusNotFound, config.ErrSupplierNotFound)
+		return
+	}
+	requestedAPIType := config.EffectiveSupplierAPIType(body.APIType)
+	if strings.TrimSpace(body.APIType) == "" {
+		requestedAPIType = config.EffectiveSupplierAPIType(existing.APIType)
+	}
+	if requestedAPIType != config.EffectiveSupplierAPIType(existing.APIType) && h.suppliers != nil && h.suppliers.store.hasPendingIntentForProvider(existing.ID) {
+		writeSupplierError(w, http.StatusConflict, errors.New("cannot change supplier API protocol while a purchase is pending"))
 		return
 	}
 	provider, err := config.UpdateSupplierProvider(id, body.configValue(id))
@@ -215,6 +243,46 @@ func (h *Handler) apiTestSupplier(w http.ResponseWriter, _ *http.Request, id str
 		}
 	}
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "stock": stock})
+}
+
+func (h *Handler) apiSetupSupplierWebhook(w http.ResponseWriter, r *http.Request, id string) {
+	if !h.supplierReady(w) {
+		return
+	}
+	provider := config.GetSupplierProvider(id)
+	if provider == nil {
+		writeSupplierError(w, http.StatusNotFound, config.ErrSupplierNotFound)
+		return
+	}
+	if config.EffectiveSupplierAPIType(provider.APIType) != config.SupplierAPITypeAWSMy {
+		writeSupplierError(w, http.StatusBadRequest, errSupplierOperationUnsupported)
+		return
+	}
+	var body struct {
+		WebhookURL string `json:"webhookUrl"`
+	}
+	if err := decodeSupplierJSON(r, &body); err != nil {
+		writeSupplierError(w, http.StatusBadRequest, err)
+		return
+	}
+	body.WebhookURL = strings.TrimSpace(body.WebhookURL)
+	u, err := url.Parse(body.WebhookURL)
+	expectedPath := "/api/supplier-webhooks/" + provider.ID
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		u.Path != expectedPath || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
+		writeSupplierError(w, http.StatusBadRequest, fmt.Errorf("webhookUrl must be a public absolute URL ending in %s", expectedPath))
+		return
+	}
+	api := h.suppliers.apiFactory(*provider)
+	if err := api.SetWebhook(body.WebhookURL); err != nil {
+		writeSupplierError(w, http.StatusBadGateway, fmt.Errorf("save supplier webhook: %w", err))
+		return
+	}
+	if err := api.TestWebhook(); err != nil {
+		writeSupplierError(w, http.StatusBadGateway, fmt.Errorf("webhook was saved but its connection test failed: %w", err))
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "webhookUrl": body.WebhookURL})
 }
 
 func (h *Handler) apiRefreshSuppliers(w http.ResponseWriter, _ *http.Request) {
@@ -345,6 +413,7 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusNotFound, config.ErrSupplierNotFound)
 		return
 	}
+	awsMyProtocol := config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeAWSMy
 	if !h.suppliers.allowWebhook(provider.ID) {
 		w.Header().Set("Retry-After", "60")
 		writeSupplierError(w, http.StatusTooManyRequests, errors.New("webhook rate limit exceeded"))
@@ -381,6 +450,10 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id is required"))
 				return
 			}
+			if awsMyProtocol && !isSupplier32HexID(event.EventID) {
+				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
+				return
+			}
 			if len(event.EventID) > 256 {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id is too long"))
 				return
@@ -391,6 +464,7 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 	}
 	if !integration.Enabled || !provider.Enabled {
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":       true,
 			"accepted": false,
 			"reason":   "supplier integration is disabled",
 		})
@@ -417,17 +491,61 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusBadRequest, errors.New("event or event_id is too long"))
 		return
 	}
-	added, err := h.suppliers.store.recordEvent(provider.ID, event)
+	if awsMyProtocol {
+		if !isSupplier32HexID(event.EventID) {
+			writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
+			return
+		}
+		suppliedToken := strings.TrimSpace(r.Header.Get("X-API-Key"))
+		expectedToken := strings.TrimSpace(provider.APIToken)
+		if suppliedToken == "" || subtle.ConstantTimeCompare([]byte(suppliedToken), []byte(expectedToken)) != 1 {
+			writeSupplierError(w, http.StatusUnauthorized, errors.New("invalid supplier webhook API key"))
+			return
+		}
+	}
+
+	var intent *supplierPurchaseIntent
+	pendingEvent := false
+	legacyInventoryWake := false
+	switch event.Event {
+	case "new_keys_available":
+		if awsMyProtocol {
+			value, intentErr := newSupplierWebhookPurchaseIntent(*provider, event)
+			if intentErr != nil {
+				writeSupplierError(w, http.StatusBadRequest, intentErr)
+				return
+			}
+			intent = &value
+		} else {
+			// Preserve the original KiroApp behavior: its inventory event only
+			// wakes the normal zero-live-key replenishment check. The AWS My
+			// protocol is the one that defines an exact callback extraction order.
+			legacyInventoryWake = true
+		}
+	case "all_keys_dead":
+		if awsMyProtocol {
+			if event.Dead < 1 {
+				writeSupplierError(w, http.StatusBadRequest, errors.New("dead must be greater than zero"))
+				return
+			}
+			pendingEvent = true
+		}
+	}
+
+	added, workAdded, err := h.suppliers.store.recordEventAndIntent(provider.ID, event, intent, pendingEvent)
 	if err != nil {
 		writeSupplierError(w, http.StatusInternalServerError, fmt.Errorf("persist webhook event: %w", err))
 		return
 	}
-	if added && event.Event == "new_keys_available" {
+	queued := workAdded || (added && legacyInventoryWake)
+	if queued {
 		h.suppliers.signal(provider.ID)
 	}
 	json.NewEncoder(w).Encode(map[string]any{
+		"ok":        true,
 		"accepted":  true,
 		"duplicate": !added,
+		"queued":    queued,
 	})
 }
 

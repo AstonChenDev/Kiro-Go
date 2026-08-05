@@ -575,6 +575,18 @@
   line-height: 1.5;
 }
 
+.supplier-static-field {
+  min-height: 2.5rem;
+  display: flex;
+  align-items: center;
+  padding: .55rem .7rem;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: .75rem;
+}
+
 .supplier-purchase-result {
   display: grid;
   gap: .55rem;

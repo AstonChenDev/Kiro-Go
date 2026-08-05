@@ -3393,6 +3393,14 @@
     return providers.find(p => p.id === id) || null;
   }
 
+  function supplierCapabilities(provider) {
+    return provider && provider.capabilities || { balance: true, regions: true };
+  }
+
+  function supplierAPITypeLabel(provider) {
+    return t(provider && provider.apiType === 'aws_my' ? 'suppliers.apiTypeAWSMy' : 'suppliers.apiTypeKiroApp');
+  }
+
   function supplierFormatNumber(value) {
     const number = Number(value || 0);
     return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/\.00$/, '');
@@ -3499,6 +3507,7 @@
     }
     grid.innerHTML = providers.map(provider => {
       const status = provider.status || {};
+      const capabilities = supplierCapabilities(provider);
       const checked = Number(status.checkedAt || 0) > 0;
       const autoBlocked = !!provider.autoPurchaseBlocked;
       const autoBlockReason = provider.autoPurchaseBlock && provider.autoPurchaseBlock.reason;
@@ -3508,18 +3517,22 @@
       const webhook = location.origin + (provider.webhookPath || ('/api/supplier-webhooks/' + provider.id));
       const actionsDisabled = !supplierOverview.enabled || !provider.enabled;
       const purchaseDisabled = actionsDisabled || !checked || (!!status.lastError && !autoBlocked);
+      const metrics = capabilities.regions
+        ? supplierProviderMetric(t('suppliers.balance'), checked ? supplierFormatNumber(status.balance) : '—') +
+          supplierProviderMetric(t('suppliers.stockUS'), checked ? supplierFormatNumber(status.stockUs) : '—') +
+          supplierProviderMetric(t('suppliers.stockEU'), checked ? supplierFormatNumber(status.stockEu) : '—')
+        : supplierProviderMetric(t('suppliers.balance'), checked ? t('suppliers.notProvided') : '—') +
+          supplierProviderMetric(t('suppliers.availableStock'), checked ? supplierFormatNumber(status.stock) : '—') +
+          supplierProviderMetric(t('suppliers.remoteKeys'), checked ? supplierFormatNumber(status.keyCount) : '—');
       return '<article class="supplier-provider-card' + (provider.enabled ? '' : ' is-disabled') + '">' +
         '<div class="supplier-provider-top">' +
         '<div class="supplier-provider-identity"><span class="supplier-provider-icon"><i class="fa-solid fa-server"></i></span><div class="min-w-0">' +
         '<p class="supplier-provider-name">' + escapeHtml(provider.name) + '</p>' +
-        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + '</span>' +
+        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(supplierAPITypeLabel(provider)) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + '</span>' +
         '</div></div>' +
         '<span class="supplier-status-pill ' + statusClass + '"><i class="fa-solid ' + (hasError ? 'fa-circle-exclamation' : (checked ? 'fa-circle-check' : 'fa-clock')) + '"></i>' + escapeHtml(statusText) + '</span>' +
         '</div>' +
-        '<div class="supplier-provider-metrics">' +
-        supplierProviderMetric(t('suppliers.balance'), checked ? supplierFormatNumber(status.balance) : '—') +
-        supplierProviderMetric(t('suppliers.stockUS'), checked ? supplierFormatNumber(status.stockUs) : '—') +
-        supplierProviderMetric(t('suppliers.stockEU'), checked ? supplierFormatNumber(status.stockEu) : '—') +
+        '<div class="supplier-provider-metrics">' + metrics +
         supplierProviderMetric(t('suppliers.localAlive'), supplierFormatNumber(provider.aliveCount)) +
         '</div>' +
         (checked ? '<div class="supplier-provider-id mb-2">' + escapeHtml(t('suppliers.lastChecked', supplierFormatTime(status.checkedAt))) + ' · ' + escapeHtml(provider.tokenMasked || '') + '</div>' : '') +
@@ -3527,6 +3540,7 @@
         '<div class="supplier-webhook-box" title="' + escapeAttr(webhook) + '"><i class="fa-solid fa-link"></i><code>' + escapeHtml(webhook) + '</code>' +
         '<button class="btn btn-outline btn-xs" type="button" aria-label="' + escapeAttr(t('suppliers.copyWebhook')) + '" data-supplier-action="copy-webhook" data-id="' + escapeAttr(provider.id) + '"><i class="fa-regular fa-copy"></i></button></div>' +
         '<div class="supplier-provider-actions">' +
+        (capabilities.webhookManagement ? '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="setup-webhook" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.setupWebhook')) + '</button>' : '') +
         '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="test" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.test')) + '</button>' +
         '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="edit" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.edit')) + '</button>' +
         '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="keys" data-id="' + escapeAttr(provider.id) + '"' + (actionsDisabled ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.viewKeys')) + '</button>' +
@@ -3605,10 +3619,14 @@
       '<small>' + escapeHtml(t('suppliers.formIdHint')) + '</small></div>' +
       '<div class="form-group"><label for="supplierFormName">' + escapeHtml(t('suppliers.formName')) + '</label>' +
       '<input id="supplierFormName" type="text" maxlength="100" placeholder="' + escapeAttr(t('suppliers.formNamePlaceholder')) + '" value="' + escapeAttr(provider ? provider.name : '') + '" /></div>' +
+      '<div class="form-group supplier-form-full"><label for="supplierFormAPIType">' + escapeHtml(t('suppliers.formAPIType')) + '</label>' +
+      '<select id="supplierFormAPIType"><option value="kiroapp"' + (!provider || provider.apiType !== 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroApp')) + '</option>' +
+      '<option value="aws_my"' + (provider && provider.apiType === 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeAWSMy')) + '</option></select>' +
+      '<small>' + escapeHtml(t('suppliers.formAPITypeHint')) + '</small></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormBaseUrl">' + escapeHtml(t('suppliers.formBaseUrl')) + '</label>' +
       '<input id="supplierFormBaseUrl" type="url" placeholder="' + escapeAttr(t('suppliers.formBaseUrlPlaceholder')) + '" value="' + escapeAttr(provider ? provider.baseUrl : 'https://') + '" /></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormToken">' + escapeHtml(t('suppliers.formToken')) + '</label>' +
-      '<input id="supplierFormToken" type="password" autocomplete="new-password" placeholder="' + escapeAttr(provider ? (provider.tokenMasked || 'km_…') : 'km_…') + '" />' +
+      '<input id="supplierFormToken" type="password" autocomplete="new-password" placeholder="' + escapeAttr(provider ? (provider.tokenMasked || t('suppliers.formTokenPlaceholder')) : t('suppliers.formTokenPlaceholder')) + '" />' +
       '<small>' + escapeHtml(provider ? t('suppliers.formTokenEditHint') : t('suppliers.formTokenCreateHint')) + '</small></div>' +
       '<div class="form-group"><label for="supplierFormPriority">' + escapeHtml(t('suppliers.formPriority')) + '</label>' +
       '<input id="supplierFormPriority" type="number" min="0" max="10000" value="' + escapeAttr(provider ? provider.priority : 100) + '" />' +
@@ -3620,6 +3638,7 @@
       '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierFormCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="supplierFormSave" type="button">' + escapeHtml(t('suppliers.save')) + '</button></div>';
     openDialog('supplierModal');
+    enhanceCustomSelects($('supplierModalBody'));
     setTimeout(() => $(provider ? 'supplierFormName' : 'supplierFormId').focus(), 0);
   }
 
@@ -3635,6 +3654,7 @@
       name: $('supplierFormName').value.trim(),
       baseUrl: $('supplierFormBaseUrl').value.trim(),
       apiToken: $('supplierFormToken').value.trim(),
+      apiType: $('supplierFormAPIType').value,
       priority: parseInt($('supplierFormPriority').value || '0', 10),
       autoPurchaseCount: parseInt($('supplierFormAutoCount').value || '0', 10),
       enabled: $('supplierFormEnabled').checked
@@ -3681,18 +3701,45 @@
     }
   }
 
+  async function setupSupplierWebhook(id, button) {
+    const provider = supplierProviderById(id);
+    if (!provider) return;
+    const webhookUrl = location.origin + provider.webhookPath;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    try {
+      await supplierJSON('/suppliers/' + encodeURIComponent(id) + '/webhook/setup', {
+        method: 'POST', body: JSON.stringify({ webhookUrl })
+      });
+      toastPrimary(t('suppliers.setupWebhookSuccess'));
+    } catch (e) {
+      toastError(t('suppliers.setupWebhookFailed') + ': ' + e.message);
+    } finally {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+  }
+
   function showSupplierPurchase(id) {
     const provider = supplierProviderById(id);
     if (!provider) return;
     const status = provider.status || {};
+    const capabilities = supplierCapabilities(provider);
+    const summary = capabilities.regions
+      ? escapeHtml(t('suppliers.balance')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.balance)) + '</strong> · ' +
+        escapeHtml(t('suppliers.stockUS')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockUs)) + '</strong> · ' +
+        escapeHtml(t('suppliers.stockEU')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockEu)) + '</strong>'
+      : escapeHtml(t('suppliers.availableStock')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stock)) + '</strong> · ' +
+        escapeHtml(t('suppliers.balance')) + ': <strong>' + escapeHtml(t('suppliers.notProvided')) + '</strong>';
+    const regionField = capabilities.regions
+      ? '<div class="form-group"><label for="supplierPurchaseRegion">' + escapeHtml(t('suppliers.purchaseRegion')) + '</label><select id="supplierPurchaseRegion">' +
+        '<option value="us">' + escapeHtml(t('suppliers.purchaseUS')) + '</option><option value="eu">' + escapeHtml(t('suppliers.purchaseEU')) + '</option></select></div>'
+      : '<div class="form-group"><label>' + escapeHtml(t('suppliers.purchaseRegion')) + '</label><div class="supplier-static-field">' + escapeHtml(t('suppliers.regionlessUS')) + '</div></div>';
     $('supplierPurchaseTitle').textContent = t('suppliers.purchaseTitle') + ' · ' + provider.name;
     $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-summary">' +
-      escapeHtml(t('suppliers.balance')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.balance)) + '</strong> · ' +
-      escapeHtml(t('suppliers.stockUS')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockUs)) + '</strong> · ' +
-      escapeHtml(t('suppliers.stockEU')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockEu)) + '</strong></div>' +
+      summary + '</div>' +
       '<div class="supplier-form-grid mt-4">' +
-      '<div class="form-group"><label for="supplierPurchaseRegion">' + escapeHtml(t('suppliers.purchaseRegion')) + '</label><select id="supplierPurchaseRegion">' +
-      '<option value="us">' + escapeHtml(t('suppliers.purchaseUS')) + '</option><option value="eu">' + escapeHtml(t('suppliers.purchaseEU')) + '</option></select></div>' +
+      regionField +
       '<div class="form-group"><label for="supplierPurchaseCount">' + escapeHtml(t('suppliers.purchaseCount')) + '</label><input id="supplierPurchaseCount" type="number" min="1" max="500" value="' + escapeAttr(provider.autoPurchaseCount || 1) + '" /></div>' +
       '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierPurchaseAutoImport" type="checkbox" checked /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.purchaseAutoImport')) + '</span></label><small class="field-hint-offset">' + escapeHtml(t('suppliers.purchaseImportHint')) + '</small></div>' +
       '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierPurchaseCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
@@ -3710,7 +3757,8 @@
   async function submitSupplierPurchase(id) {
     const btn = $('supplierPurchaseSubmit');
     const count = parseInt($('supplierPurchaseCount').value || '0', 10);
-    const region = $('supplierPurchaseRegion').value;
+    const regionElement = $('supplierPurchaseRegion');
+    const region = regionElement ? regionElement.value : 'us';
     const autoImport = $('supplierPurchaseAutoImport').checked;
     if (!count || count < 1 || count > 500) {
       toastWarning(t('suppliers.formAutoCountHint'));
@@ -3730,9 +3778,13 @@
       }
       const purchase = data.purchase || {};
       const batch = data.batch || {};
+      const provider = supplierProviderById(id);
+      const purchaseSummary = supplierCapabilities(provider).balance
+        ? t('suppliers.purchaseSummary', supplierFormatNumber(purchase.total_debit), batch.imported || 0)
+        : t('suppliers.purchaseSummaryNoBalance', batch.imported || 0);
       supplierLastPurchaseKeys = Array.isArray(purchase.keys) ? purchase.keys.map(k => k.key || k.key_value || '').filter(Boolean) : [];
       $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-result">' +
-        '<div class="supplier-purchase-result-head"><i class="fa-solid fa-circle-check"></i> <strong>' + escapeHtml(t('suppliers.purchaseSuccess', purchase.purchased || 0)) + '</strong><br><span>' + escapeHtml(t('suppliers.purchaseSummary', supplierFormatNumber(purchase.total_debit), batch.imported || 0)) + '</span></div>' +
+        '<div class="supplier-purchase-result-head"><i class="fa-solid fa-circle-check"></i> <strong>' + escapeHtml(t('suppliers.purchaseSuccess', purchase.purchased || 0)) + '</strong><br><span>' + escapeHtml(purchaseSummary) + '</span></div>' +
         (supplierLastPurchaseKeys.length ? '<div class="supplier-section-head"><h2>' + escapeHtml(t('suppliers.purchaseKeys')) + '</h2><button class="btn btn-outline btn-sm" id="supplierCopyPurchased" type="button"><i class="fa-regular fa-copy"></i> ' + escapeHtml(t('suppliers.copyPurchased')) + '</button></div>' +
           supplierLastPurchaseKeys.map(key => '<div class="supplier-key-row"><code class="supplier-key-value">' + escapeHtml(key) + '</code><span></span><button class="btn btn-outline btn-xs" type="button" data-purchased-key="' + escapeAttr(key) + '">' + escapeHtml(t('suppliers.copyKey')) + '</button></div>').join('') : '') +
         '<div class="modal-footer"><button class="btn btn-primary" id="supplierPurchaseDone" type="button">' + escapeHtml(t('suppliers.close')) + '</button></div></div>';
@@ -4047,6 +4099,9 @@
         }
         case 'test':
           testSupplier(id, button);
+          break;
+        case 'setup-webhook':
+          setupSupplierWebhook(id, button);
           break;
         case 'edit':
           showSupplierModal(id);

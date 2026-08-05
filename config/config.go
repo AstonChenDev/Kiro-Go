@@ -1128,6 +1128,63 @@ func SetAccountBanStatus(id, status, reason string) error {
 	return nil
 }
 
+// DisableSupplierAPIKeyAccounts atomically disables enabled API-key accounts
+// whose supplier reports the exact keys as dead. Matching uses one-way
+// fingerprints so plaintext supplier keys are never retained in an auxiliary
+// data structure or written to logs.
+func DisableSupplierAPIKeyAccounts(providerID string, keys []string, reason string) (int, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" || len(keys) == 0 {
+		return 0, nil
+	}
+	fingerprints := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key = strings.TrimSpace(key); key != "" {
+			fingerprints[APIKeyFingerprint(key)] = struct{}{}
+		}
+	}
+	if len(fingerprints) == 0 {
+		return 0, nil
+	}
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	type previousAccount struct {
+		index   int
+		account Account
+	}
+	previous := make([]previousAccount, 0)
+	now := time.Now().Unix()
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		if account.SupplierID != providerID || !account.Enabled || !IsAPIKeyAccount(account) {
+			continue
+		}
+		key := strings.TrimSpace(account.KiroApiKey)
+		if key == "" {
+			key = strings.TrimSpace(account.AccessToken)
+		}
+		if _, dead := fingerprints[APIKeyFingerprint(key)]; !dead {
+			continue
+		}
+		previous = append(previous, previousAccount{index: i, account: *account})
+		account.Enabled = false
+		account.BanStatus = "BANNED"
+		account.BanReason = reason
+		account.BanTime = now
+	}
+	if len(previous) == 0 {
+		return 0, nil
+	}
+	if err := saveLocked(); err != nil {
+		for _, item := range previous {
+			cfg.Accounts[item.index] = item.account
+		}
+		return 0, err
+	}
+	return len(previous), nil
+}
+
 // ClearAccountBanStatus marks an account active without replacing any
 // credential fields from a potentially stale caller snapshot.
 func ClearAccountBanStatus(id string) error {

@@ -16,6 +16,8 @@ const (
 	DefaultSupplierPollIntervalSeconds = 5
 	MinSupplierPollIntervalSeconds     = 1
 	MaxSupplierPollIntervalSeconds     = 300
+	SupplierAPITypeKiroApp             = "kiroapp"
+	SupplierAPITypeAWSMy               = "aws_my"
 )
 
 var supplierIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -32,18 +34,37 @@ type SupplierIntegrationConfig struct {
 	Providers           []SupplierProvider `json:"providers,omitempty"`
 }
 
-// SupplierProvider describes one API-compatible supplier. ID is immutable once
-// created because it forms the permanent webhook path.
+// SupplierProvider describes one supplier. ID is immutable once created because
+// it forms the permanent webhook path. APIType selects the provider-specific
+// wire protocol; an empty value from older configurations means KiroApp.
 type SupplierProvider struct {
 	ID                string `json:"id"`
 	Name              string `json:"name"`
 	BaseURL           string `json:"baseUrl"`
 	APIToken          string `json:"apiToken"`
+	APIType           string `json:"apiType,omitempty"`
 	Enabled           bool   `json:"enabled"`
 	Priority          int    `json:"priority"`
 	AutoPurchaseCount int    `json:"autoPurchaseCount"`
 	CreatedAt         int64  `json:"createdAt"`
 	UpdatedAt         int64  `json:"updatedAt"`
+}
+
+func EffectiveSupplierAPIType(apiType string) string {
+	apiType = strings.ToLower(strings.TrimSpace(apiType))
+	if apiType == "" {
+		return SupplierAPITypeKiroApp
+	}
+	return apiType
+}
+
+func validateSupplierAPIType(apiType string) error {
+	switch EffectiveSupplierAPIType(apiType) {
+	case SupplierAPITypeKiroApp, SupplierAPITypeAWSMy:
+		return nil
+	default:
+		return errors.New("apiType must be kiroapp or aws_my")
+	}
 }
 
 func NormalizeSupplierID(id string) (string, error) {
@@ -94,6 +115,10 @@ func normalizeSupplierProvider(provider *SupplierProvider, creating bool) error 
 		return err
 	}
 	provider.APIToken = strings.TrimSpace(provider.APIToken)
+	provider.APIType = EffectiveSupplierAPIType(provider.APIType)
+	if err := validateSupplierAPIType(provider.APIType); err != nil {
+		return err
+	}
 	if creating && provider.APIToken == "" {
 		return errors.New("apiToken is required")
 	}
@@ -112,6 +137,9 @@ func normalizeSupplierProvider(provider *SupplierProvider, creating bool) error 
 func cloneSupplierConfig(in SupplierIntegrationConfig) SupplierIntegrationConfig {
 	out := in
 	out.Providers = append([]SupplierProvider(nil), in.Providers...)
+	for i := range out.Providers {
+		out.Providers[i].APIType = EffectiveSupplierAPIType(out.Providers[i].APIType)
+	}
 	return out
 }
 
@@ -146,6 +174,7 @@ func GetSupplierProvider(id string) *SupplierProvider {
 	for i := range cfg.SupplierIntegration.Providers {
 		if cfg.SupplierIntegration.Providers[i].ID == id {
 			provider := cfg.SupplierIntegration.Providers[i]
+			provider.APIType = EffectiveSupplierAPIType(provider.APIType)
 			return &provider
 		}
 	}
@@ -218,6 +247,7 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 		return SupplierProvider{}, err
 	}
 	update.ID = normalizedID
+	apiTypeProvided := strings.TrimSpace(update.APIType) != ""
 	if err := normalizeSupplierProvider(&update, false); err != nil {
 		return SupplierProvider{}, err
 	}
@@ -231,6 +261,9 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 		previous := cfg.SupplierIntegration.Providers[i]
 		update.CreatedAt = previous.CreatedAt
 		update.UpdatedAt = time.Now().Unix()
+		if !apiTypeProvided {
+			update.APIType = EffectiveSupplierAPIType(previous.APIType)
+		}
 		if update.APIToken == "" {
 			update.APIToken = previous.APIToken
 		}

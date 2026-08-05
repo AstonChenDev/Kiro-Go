@@ -34,13 +34,19 @@ type supplierWebhookEvent struct {
 	StockEU         int     `json:"stock_eu,omitempty"`
 	PriceUS         float64 `json:"price_us,omitempty"`
 	PriceEU         float64 `json:"price_eu,omitempty"`
+	Dead            int     `json:"dead,omitempty"`
 }
 
 type supplierEventRecord struct {
-	ProviderID string `json:"providerId"`
-	EventID    string `json:"eventId"`
-	Event      string `json:"event"`
-	ReceivedAt int64  `json:"receivedAt"`
+	ProviderID string               `json:"providerId"`
+	EventID    string               `json:"eventId"`
+	Event      string               `json:"event"`
+	Payload    supplierWebhookEvent `json:"payload,omitempty"`
+	Status     string               `json:"status,omitempty"` // pending, complete
+	Attempts   int                  `json:"attempts,omitempty"`
+	LastError  string               `json:"lastError,omitempty"`
+	ReceivedAt int64                `json:"receivedAt"`
+	UpdatedAt  int64                `json:"updatedAt,omitempty"`
 }
 
 type supplierProviderStatus struct {
@@ -57,18 +63,20 @@ type supplierProviderStatus struct {
 }
 
 type supplierPurchaseIntent struct {
-	ID            string `json:"id"`
-	ProviderID    string `json:"providerId"`
-	Region        string `json:"region"`
-	Count         int    `json:"count"`
-	ClientOrderID string `json:"clientOrderId"`
-	AutoImport    bool   `json:"autoImport"`
-	Trigger       string `json:"trigger"`
-	Status        string `json:"status"` // pending, complete, failed
-	Attempts      int    `json:"attempts"`
-	LastError     string `json:"lastError,omitempty"`
-	CreatedAt     int64  `json:"createdAt"`
-	UpdatedAt     int64  `json:"updatedAt"`
+	ID              string `json:"id"`
+	ProviderID      string `json:"providerId"`
+	Region          string `json:"region"`
+	Count           int    `json:"count"`
+	ClientOrderID   string `json:"clientOrderId"`
+	SupplierOrderID string `json:"supplierOrderId,omitempty"`
+	AutoImport      bool   `json:"autoImport"`
+	Trigger         string `json:"trigger"`
+	Status          string `json:"status"` // pending, complete, failed
+	Attempts        int    `json:"attempts"`
+	MustResolve     bool   `json:"mustResolve,omitempty"`
+	LastError       string `json:"lastError,omitempty"`
+	CreatedAt       int64  `json:"createdAt"`
+	UpdatedAt       int64  `json:"updatedAt"`
 }
 
 // supplierAutoBlock is a durable circuit breaker. A supplier that reports a
@@ -139,7 +147,7 @@ func newSupplierStateStore(dir string) (*supplierStateStore, error) {
 
 func newSupplierPersistentState() supplierPersistentState {
 	return supplierPersistentState{
-		Version:         1,
+		Version:         2,
 		Events:          make(map[string]supplierEventRecord),
 		ProviderStatus:  make(map[string]supplierProviderStatus),
 		PurchaseIntents: make(map[string]supplierPurchaseIntent),
@@ -149,8 +157,8 @@ func newSupplierPersistentState() supplierPersistentState {
 }
 
 func (s *supplierStateStore) ensureMapsLocked() {
-	if s.state.Version == 0 {
-		s.state.Version = 1
+	if s.state.Version < 2 {
+		s.state.Version = 2
 	}
 	if s.state.Events == nil {
 		s.state.Events = make(map[string]supplierEventRecord)
@@ -229,33 +237,117 @@ func supplierEventKey(providerID, eventID string) string {
 	return providerID + ":" + eventID
 }
 
+func supplierIntentKey(providerID, intentID string) string {
+	return providerID + ":" + intentID
+}
+
+func findSupplierIntent(intents map[string]supplierPurchaseIntent, providerID, intentID string) (string, supplierPurchaseIntent, bool) {
+	key := supplierIntentKey(providerID, intentID)
+	if intent, ok := intents[key]; ok {
+		return key, intent, true
+	}
+	// Version-1 state used the bare client order ID as the map key. Continue to
+	// update those records in place while all newly written entries are scoped.
+	if intent, ok := intents[intentID]; ok && intent.ProviderID == providerID {
+		return intentID, intent, true
+	}
+	return key, supplierPurchaseIntent{}, false
+}
+
 // recordEvent returns false for an already-processed event. The record is
 // persisted before the caller acknowledges the webhook, so retries after a
 // process restart remain harmless.
 func (s *supplierStateStore) recordEvent(providerID string, event supplierWebhookEvent) (bool, error) {
+	added, _, err := s.recordEventAndIntent(providerID, event, nil, false)
+	return added, err
+}
+
+// recordEventAndIntent atomically records a webhook and its exact supplier
+// purchase intent. This closes the crash window where an acknowledged callback
+// could otherwise be durable while the corresponding extraction order was not.
+// The second return value reports newly queued work. It also repairs version-1
+// event records that were persisted before durable webhook work existed.
+// pendingEvent is used for non-purchase work such as all_keys_dead syncing.
+func (s *supplierStateStore) recordEventAndIntent(providerID string, event supplierWebhookEvent, intent *supplierPurchaseIntent, pendingEvent bool) (bool, bool, error) {
 	key := supplierEventKey(providerID, event.EventID)
-	s.mu.RLock()
-	_, exists := s.state.Events[key]
-	s.mu.RUnlock()
-	if exists {
-		return false, nil
-	}
 	added := false
+	workAdded := false
 	err := s.mutate(func(candidate *supplierPersistentState) error {
-		if _, duplicate := candidate.Events[key]; duplicate {
+		existingEvent, duplicate := candidate.Events[key]
+		if intent != nil {
+			storageKey, existing, duplicate := findSupplierIntent(candidate.PurchaseIntents, intent.ProviderID, intent.ID)
+			if duplicate {
+				if existing.ProviderID != intent.ProviderID || existing.ClientOrderID != intent.ClientOrderID ||
+					existing.Count != intent.Count || existing.SupplierOrderID != intent.SupplierOrderID {
+					return errors.New("purchase_order_id conflicts with an existing supplier purchase")
+				}
+			} else {
+				candidate.PurchaseIntents[storageKey] = *intent
+				workAdded = true
+				trimSupplierIntents(candidate.PurchaseIntents)
+			}
+		}
+		if duplicate {
+			// Version-1 records have no status or payload. A supplier retry after
+			// upgrading must repair the missing durable work instead of being
+			// discarded merely because its event ID was already observed.
+			if existingEvent.Status == "" && (workAdded || pendingEvent) {
+				existingEvent.Payload = event
+				existingEvent.UpdatedAt = supplierNow().Unix()
+				if pendingEvent {
+					existingEvent.Status = "pending"
+					workAdded = true
+				} else {
+					existingEvent.Status = "complete"
+				}
+				candidate.Events[key] = existingEvent
+			}
 			return nil
+		}
+		now := supplierNow().Unix()
+		status := "complete"
+		if pendingEvent {
+			status = "pending"
+			workAdded = true
 		}
 		candidate.Events[key] = supplierEventRecord{
 			ProviderID: providerID,
 			EventID:    event.EventID,
 			Event:      event.Event,
-			ReceivedAt: supplierNow().Unix(),
+			Payload:    event,
+			Status:     status,
+			ReceivedAt: now,
+			UpdatedAt:  now,
 		}
 		added = true
 		trimSupplierEvents(candidate.Events)
 		return nil
 	})
-	return added, err
+	return added, workAdded, err
+}
+
+func (s *supplierStateStore) pendingWebhookEvents() []supplierEventRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]supplierEventRecord, 0)
+	for _, event := range s.state.Events {
+		if event.Status == "pending" {
+			items = append(items, event)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ReceivedAt < items[j].ReceivedAt })
+	return items
+}
+
+func (s *supplierStateStore) updateWebhookEvent(event supplierEventRecord) error {
+	key := supplierEventKey(event.ProviderID, event.EventID)
+	return s.mutate(func(candidate *supplierPersistentState) error {
+		if _, exists := candidate.Events[key]; !exists {
+			return errors.New("supplier webhook event not found")
+		}
+		candidate.Events[key] = event
+		return nil
+	})
 }
 
 func trimSupplierEvents(events map[string]supplierEventRecord) {
@@ -268,10 +360,14 @@ func trimSupplierEvents(events map[string]supplierEventRecord) {
 	}
 	ordered := make([]eventKeyTime, 0, len(events))
 	for key, event := range events {
+		if event.Status == "pending" {
+			continue
+		}
 		ordered = append(ordered, eventKeyTime{key: key, ts: event.ReceivedAt})
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ts < ordered[j].ts })
-	for i := 0; i < len(ordered)-maxSupplierEvents; i++ {
+	remove := len(events) - maxSupplierEvents
+	for i := 0; i < len(ordered) && i < remove; i++ {
 		delete(events, ordered[i].key)
 	}
 }
@@ -312,10 +408,11 @@ func (s *supplierStateStore) providerStatuses() map[string]supplierProviderStatu
 
 func (s *supplierStateStore) createIntent(intent supplierPurchaseIntent) error {
 	return s.mutate(func(candidate *supplierPersistentState) error {
-		if _, exists := candidate.PurchaseIntents[intent.ID]; exists {
+		key, _, exists := findSupplierIntent(candidate.PurchaseIntents, intent.ProviderID, intent.ID)
+		if exists {
 			return errors.New("purchase intent already exists")
 		}
-		candidate.PurchaseIntents[intent.ID] = intent
+		candidate.PurchaseIntents[key] = intent
 		trimSupplierIntents(candidate.PurchaseIntents)
 		return nil
 	})
@@ -325,25 +422,30 @@ func trimSupplierIntents(intents map[string]supplierPurchaseIntent) {
 	if len(intents) <= maxSupplierIntents {
 		return
 	}
-	completed := make([]supplierPurchaseIntent, 0, len(intents))
-	for _, intent := range intents {
+	type keyedIntent struct {
+		key    string
+		intent supplierPurchaseIntent
+	}
+	completed := make([]keyedIntent, 0, len(intents))
+	for key, intent := range intents {
 		if intent.Status != "pending" {
-			completed = append(completed, intent)
+			completed = append(completed, keyedIntent{key: key, intent: intent})
 		}
 	}
-	sort.Slice(completed, func(i, j int) bool { return completed[i].UpdatedAt < completed[j].UpdatedAt })
+	sort.Slice(completed, func(i, j int) bool { return completed[i].intent.UpdatedAt < completed[j].intent.UpdatedAt })
 	remove := len(intents) - maxSupplierIntents
 	for i := 0; i < len(completed) && i < remove; i++ {
-		delete(intents, completed[i].ID)
+		delete(intents, completed[i].key)
 	}
 }
 
 func (s *supplierStateStore) updateIntent(intent supplierPurchaseIntent) error {
 	return s.mutate(func(candidate *supplierPersistentState) error {
-		if _, exists := candidate.PurchaseIntents[intent.ID]; !exists {
+		key, _, exists := findSupplierIntent(candidate.PurchaseIntents, intent.ProviderID, intent.ID)
+		if !exists {
 			return errors.New("purchase intent not found")
 		}
-		candidate.PurchaseIntents[intent.ID] = intent
+		candidate.PurchaseIntents[key] = intent
 		return nil
 	})
 }
@@ -359,6 +461,17 @@ func (s *supplierStateStore) pendingIntents() []supplierPurchaseIntent {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt < items[j].CreatedAt })
 	return items
+}
+
+func (s *supplierStateStore) hasPendingIntentForProvider(providerID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, intent := range s.state.PurchaseIntents {
+		if intent.ProviderID == providerID && intent.Status == "pending" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *supplierStateStore) autoBlocks() map[string]supplierAutoBlock {

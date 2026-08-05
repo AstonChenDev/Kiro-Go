@@ -2754,6 +2754,9 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetSupplierBatches(w, r)
 	case path == "/suppliers" && r.Method == "POST":
 		h.apiCreateSupplier(w, r)
+	case strings.HasPrefix(path, "/suppliers/") && strings.HasSuffix(path, "/webhook/setup") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/suppliers/"), "/webhook/setup")
+		h.apiSetupSupplierWebhook(w, r, id)
 	case strings.HasPrefix(path, "/suppliers/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/suppliers/"), "/test")
 		h.apiTestSupplier(w, r, id)

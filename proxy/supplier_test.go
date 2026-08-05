@@ -28,7 +28,13 @@ type fakeSupplierAPI struct {
 	purchaseCalls   int
 	purchaseIDs     []string
 	purchaseRegions []string
+	purchaseCounts  []int
+	purchaseOrders  []string
 	stockCallCh     chan struct{}
+	setWebhookURL   string
+	setWebhookErr   error
+	webhookTestErr  error
+	webhookTests    int
 }
 
 func (f *fakeSupplierAPI) GetStock() (supplierStock, error) {
@@ -55,13 +61,29 @@ func (f *fakeSupplierAPI) GetKeys(bool, int, int) (supplierKeysPage, error) {
 	return f.keys, f.keysErr
 }
 
-func (f *fakeSupplierAPI) Purchase(_ int, region, clientOrderID string) (supplierPurchaseResponse, error) {
+func (f *fakeSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPurchaseResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.purchaseCalls++
-	f.purchaseIDs = append(f.purchaseIDs, clientOrderID)
-	f.purchaseRegions = append(f.purchaseRegions, region)
+	f.purchaseIDs = append(f.purchaseIDs, request.ClientOrderID)
+	f.purchaseRegions = append(f.purchaseRegions, request.Region)
+	f.purchaseCounts = append(f.purchaseCounts, request.Count)
+	f.purchaseOrders = append(f.purchaseOrders, request.SupplierOrderID)
 	return f.purchase, f.purchaseErr
+}
+
+func (f *fakeSupplierAPI) SetWebhook(webhookURL string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setWebhookURL = webhookURL
+	return f.setWebhookErr
+}
+
+func (f *fakeSupplierAPI) TestWebhook() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.webhookTests++
+	return f.webhookTestErr
 }
 
 func newSupplierTestManager(t *testing.T, fake *fakeSupplierAPI) (*Handler, *supplierManager, config.SupplierProvider) {
@@ -233,6 +255,20 @@ func TestSupplierPurchaseEUUsesExpectedAccountRegion(t *testing.T) {
 	}
 }
 
+func TestAWSMyManualPurchaseRejectsUnsupportedEUSelection(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	if _, err := manager.startPurchase(provider, 1, "eu", true, "manual"); err == nil || !strings.Contains(err.Error(), "regionless") {
+		t.Fatalf("AWS My EU purchase error = %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 0 {
+		t.Fatalf("unsupported AWS My EU purchase made %d call(s)", fake.purchaseCalls)
+	}
+}
+
 func TestManualPurchaseCanSkipAutomaticImport(t *testing.T) {
 	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
 		Purchased: 1,
@@ -261,8 +297,8 @@ func TestSupplierPurchaseRetriesSameIdAfterAmbiguousFailure(t *testing.T) {
 		t.Fatalf("first purchase = %+v, %v; want pending error", outcome, err)
 	}
 	pending := manager.store.pendingIntents()
-	if len(pending) != 1 {
-		t.Fatalf("pending intents = %d, want 1", len(pending))
+	if len(pending) != 1 || !pending[0].MustResolve {
+		t.Fatalf("pending intents = %+v, want one must-resolve retry", pending)
 	}
 
 	fake.mu.Lock()
@@ -511,6 +547,331 @@ func TestSupplierWebhookIsProviderScopedDurableAndDeduplicated(t *testing.T) {
 	if duplicate, _ := response["duplicate"].(bool); duplicate {
 		t.Fatalf("event id should be scoped per permanent provider route: %#v", response)
 	}
+	if ok, _ := response["ok"].(bool); !ok {
+		t.Fatalf("normal webhook did not include strict success acknowledgement: %#v", response)
+	}
+}
+
+func TestAWSMyWebhookAuthenticatesAndExtractsExactOrderOnce(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 2, Requested: 2, Keys: []supplierKey{{Key: "ksk_webhook_one"}, {Key: "ksk_webhook_two"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+
+	body := `{"event":"new_keys_available","event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","purchase_order_id":"0123456789ABCDEF0123456789ABCDEF","message":"new keys","new_keys":2}`
+	call := func(eventBody, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(eventBody))
+		if token != "" {
+			req.Header.Set("X-API-Key", token)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	healthCheck := call(`{"event":"webhook_test","event_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","message":"Webhook测试消息"}`, "")
+	if healthCheck.Code != http.StatusOK || strings.TrimSpace(healthCheck.Body.String()) != `{"ok":"true"}` {
+		t.Fatalf("AWS My webhook_test status=%d body=%s", healthCheck.Code, healthCheck.Body.String())
+	}
+
+	unauthorized := call(body, "")
+	if unauthorized.Code != http.StatusUnauthorized || len(manager.store.state.Events) != 0 {
+		t.Fatalf("missing webhook auth status=%d body=%s events=%d", unauthorized.Code, unauthorized.Body.String(), len(manager.store.state.Events))
+	}
+	wrong := call(body, "wrong-token")
+	if wrong.Code != http.StatusUnauthorized || len(manager.store.state.Events) != 0 {
+		t.Fatalf("wrong webhook auth status=%d body=%s events=%d", wrong.Code, wrong.Body.String(), len(manager.store.state.Events))
+	}
+
+	first := call(body, provider.APIToken)
+	var ack map[string]any
+	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &ack) != nil || ack["ok"] != true || ack["queued"] != true {
+		t.Fatalf("first webhook status=%d body=%s", first.Code, first.Body.String())
+	}
+	reloadedStore, err := newSupplierStateStore(filepath.Dir(manager.store.path))
+	if err != nil {
+		t.Fatalf("reload webhook state: %v", err)
+	}
+	manager.store = reloadedStore
+	pending := manager.store.pendingIntents()
+	if len(pending) != 1 || pending[0].ClientOrderID != "0123456789ABCDEF0123456789ABCDEF" || pending[0].Count != 2 || pending[0].SupplierOrderID != "" {
+		t.Fatalf("queued intent = %+v", pending)
+	}
+	manager.processPendingIntents()
+	if liveAPIKeyCount() != 2 {
+		t.Fatalf("webhook import live count = %d", liveAPIKeyCount())
+	}
+
+	duplicate := call(body, provider.APIToken)
+	ack = nil
+	if duplicate.Code != http.StatusOK || json.Unmarshal(duplicate.Body.Bytes(), &ack) != nil || ack["ok"] != true || ack["duplicate"] != true {
+		t.Fatalf("duplicate webhook status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	manager.processPendingIntents()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || len(fake.purchaseIDs) != 1 || fake.purchaseIDs[0] != "0123456789ABCDEF0123456789ABCDEF" ||
+		fake.purchaseCounts[0] != 2 || fake.purchaseRegions[0] != "us" || fake.purchaseOrders[0] != "" {
+		t.Fatalf("exact webhook purchase calls=%d ids=%#v counts=%#v regions=%#v orders=%#v", fake.purchaseCalls, fake.purchaseIDs, fake.purchaseCounts, fake.purchaseRegions, fake.purchaseOrders)
+	}
+}
+
+func TestWebhookRetryRepairsLegacyEventWithoutDurableWork(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, Keys: []supplierKey{{Key: "ksk_repaired_legacy_event"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+
+	eventID := "abababababababababababababababab"
+	manager.store.state.Events[supplierEventKey(provider.ID, eventID)] = supplierEventRecord{
+		ProviderID: provider.ID, EventID: eventID, Event: "new_keys_available", ReceivedAt: supplierNow().Unix(),
+	}
+	if err := manager.store.saveCandidate(manager.store.state); err != nil {
+		t.Fatalf("persist legacy event: %v", err)
+	}
+	body := `{"event":"new_keys_available","event_id":"` + eventID + `","purchase_order_id":"ABCDEF0123456789ABCDEF0123456789","new_keys":1}`
+	req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body))
+	req.Header.Set("X-API-Key", provider.APIToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"duplicate":true`) || !strings.Contains(rec.Body.String(), `"queued":true`) {
+		t.Fatalf("legacy retry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	manager.processPendingIntents()
+	if liveAPIKeyCount() != 1 || len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("legacy repair live=%d pending=%d", liveAPIKeyCount(), len(manager.store.pendingIntents()))
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseIDs[0] != "ABCDEF0123456789ABCDEF0123456789" {
+		t.Fatalf("legacy repair purchase calls=%d ids=%#v", fake.purchaseCalls, fake.purchaseIDs)
+	}
+}
+
+func TestAWSMyWebhookSetupUsesOnlyThePermanentProviderPath(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	h, _, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+
+	invalid := httptest.NewRecorder()
+	h.apiSetupSupplierWebhook(invalid, httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/vendor-a/webhook/setup", strings.NewReader(`{"webhookUrl":"https://kiro.example/wrong"}`)), provider.ID)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid webhook setup status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+
+	webhookURL := "https://kiro.example/api/supplier-webhooks/" + provider.ID
+	valid := httptest.NewRecorder()
+	h.apiSetupSupplierWebhook(valid, httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/vendor-a/webhook/setup", strings.NewReader(`{"webhookUrl":"`+webhookURL+`"}`)), provider.ID)
+	if valid.Code != http.StatusOK || !strings.Contains(valid.Body.String(), `"success":true`) {
+		t.Fatalf("valid webhook setup status=%d body=%s", valid.Code, valid.Body.String())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.setWebhookURL != webhookURL || fake.webhookTests != 1 {
+		t.Fatalf("webhook setup url=%q tests=%d", fake.setWebhookURL, fake.webhookTests)
+	}
+}
+
+func TestKiroAppWebhookPreservesLegacyZeroPoolInventoryWake(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "batch-original", Keys: []supplierKey{{Key: "ksk_original_webhook"}},
+	}, stock: supplierStock{Stock: 1, StockUS: 1}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	body := `{"event":"new_keys_available","event_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","new_keys":1,"order_id":"batch-original","purchase_order_id":"fedcba9876543210fedcba9876543210"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(manager.store.pendingIntents()) != 0 || len(manager.wake) != 1 {
+		t.Fatalf("legacy webhook pending=%d wake=%d", len(manager.store.pendingIntents()), len(manager.wake))
+	}
+	manager.maybeAutoPurchase(provider.ID)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseIDs[0] == "fedcba9876543210fedcba9876543210" || fake.purchaseOrders[0] != "" || fake.purchaseCounts[0] != 1 {
+		t.Fatalf("legacy KiroApp webhook changed purchase semantics: ids=%#v orders=%#v counts=%#v", fake.purchaseIDs, fake.purchaseOrders, fake.purchaseCounts)
+	}
+}
+
+func TestWebhookPurchaseIsIndependentOfZeroPoolAutoReplenishmentSwitch(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, Keys: []supplierKey{{Key: "ksk_after_auto_enabled"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	if err := config.UpdateSupplierFeature(true, false); err != nil {
+		t.Fatalf("disable automatic replenishment: %v", err)
+	}
+	body := `{"event":"new_keys_available","event_id":"dddddddddddddddddddddddddddddddd","purchase_order_id":"11111111111111111111111111111111","new_keys":1}`
+	req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body))
+	req.Header.Set("X-API-Key", provider.APIToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	manager.processPendingIntents()
+	if liveAPIKeyCount() != 1 || len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("exact webhook purchase live=%d pending=%d", liveAPIKeyCount(), len(manager.store.pendingIntents()))
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 {
+		t.Fatalf("automatic replenishment switch suppressed exact webhook extraction: calls=%d", fake.purchaseCalls)
+	}
+}
+
+func TestWebhookPurchaseObeysMasterSwitchBeforeFirstAttempt(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, Keys: []supplierKey{{Key: "ksk_after_master_enabled"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	body := `{"event":"new_keys_available","event_id":"99999999999999999999999999999999","purchase_order_id":"22222222222222222222222222222222","new_keys":1}`
+	req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body))
+	req.Header.Set("X-API-Key", provider.APIToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := config.UpdateSupplierFeature(false, false); err != nil {
+		t.Fatalf("disable supplier feature: %v", err)
+	}
+	manager.processPendingIntents()
+	fake.mu.Lock()
+	callsWhileDisabled := fake.purchaseCalls
+	fake.mu.Unlock()
+	if callsWhileDisabled != 0 || len(manager.store.pendingIntents()) != 1 {
+		t.Fatalf("disabled master calls=%d pending=%d", callsWhileDisabled, len(manager.store.pendingIntents()))
+	}
+	if err := config.UpdateSupplierFeature(true, false); err != nil {
+		t.Fatalf("enable supplier feature: %v", err)
+	}
+	manager.processPendingIntents()
+	if liveAPIKeyCount() != 1 || len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("re-enabled exact extraction live=%d pending=%d", liveAPIKeyCount(), len(manager.store.pendingIntents()))
+	}
+}
+
+func TestAWSMyAllKeysDeadIsDurableAndDisablesMatchingAccounts(t *testing.T) {
+	originalNow := supplierNow
+	current := time.Unix(10_000, 0)
+	supplierNow = func() time.Time { return current }
+	defer func() { supplierNow = originalNow }()
+
+	fake := &fakeSupplierAPI{keysErr: errors.New("history temporarily unavailable")}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	if added, _, err := config.AddAccounts([]config.Account{
+		{ID: "dead-one", AuthMethod: "api_key", KiroApiKey: "ksk_dead_one", AccessToken: "ksk_dead_one", SupplierID: provider.ID, SupplierBatchID: "batch-dead", Enabled: true},
+		{ID: "dead-two", AuthMethod: "api_key", KiroApiKey: "ksk_dead_two", AccessToken: "ksk_dead_two", SupplierID: provider.ID, SupplierBatchID: "batch-dead", Enabled: true},
+		{ID: "unrelated", AuthMethod: "api_key", KiroApiKey: "ksk_unrelated", AccessToken: "ksk_unrelated", SupplierID: "other", Enabled: true},
+	}); err != nil || added != 3 {
+		t.Fatalf("AddAccounts = %d, %v", added, err)
+	}
+	if err := manager.store.upsertBatch(supplierBatch{
+		ID: "batch-dead", ProviderID: provider.ID, ClientOrderID: "batch-dead", Region: "us", Trigger: "webhook",
+		Purchased: 2, Imported: 2, AccountIDs: []string{"dead-one", "dead-two"}, Status: "active", ActiveCount: 2, CreatedAt: current.Unix() - 100,
+	}); err != nil {
+		t.Fatalf("upsertBatch: %v", err)
+	}
+
+	body := `{"event":"all_keys_dead","event_id":"cccccccccccccccccccccccccccccccc","message":"all dead","dead":2}`
+	req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body))
+	req.Header.Set("X-API-Key", provider.APIToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("all_keys_dead status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	manager.processPendingWebhookEvents()
+	if len(manager.store.pendingWebhookEvents()) != 1 {
+		t.Fatalf("failed history sync was not kept durable: %+v", manager.store.pendingWebhookEvents())
+	}
+
+	fake.mu.Lock()
+	fake.keysErr = nil
+	fake.keys = supplierKeysPage{
+		Items: []supplierKey{{Key: "ksk_dead_one", Status: "dead"}, {Key: "ksk_dead_two", Status: "dead"}, {Key: "ksk_unrelated", Status: "dead"}},
+		Total: 3, Page: 1, PageSize: 500, Pages: 1,
+	}
+	fake.mu.Unlock()
+	current = current.Add(6 * time.Second)
+	manager.processPendingWebhookEvents()
+	if len(manager.store.pendingWebhookEvents()) != 0 {
+		t.Fatalf("successful dead-key sync remained pending: %+v", manager.store.pendingWebhookEvents())
+	}
+	byID := make(map[string]config.Account)
+	for _, account := range config.GetAccounts() {
+		byID[account.ID] = account
+	}
+	if byID["dead-one"].Enabled || byID["dead-two"].Enabled || !byID["unrelated"].Enabled {
+		t.Fatalf("dead-key sync accounts = %+v", byID)
+	}
+	batches := manager.store.batches()
+	if len(batches) != 1 || batches[0].Status != "dead" || batches[0].ActiveCount != 0 || batches[0].LifetimeSeconds <= 0 {
+		t.Fatalf("dead-key batch lifecycle = %+v", batches)
+	}
+}
+
+func TestKiroAppAllKeysDeadKeepsLegacyNotificationOnlyBehavior(t *testing.T) {
+	fake := &fakeSupplierAPI{keys: supplierKeysPage{
+		Items: []supplierKey{{Key: "ksk_legacy_stays_enabled", Status: "dead"}}, Total: 1, Pages: 1,
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	if added, _, err := config.AddAccounts([]config.Account{{
+		ID: "legacy-key", AuthMethod: "api_key", KiroApiKey: "ksk_legacy_stays_enabled", AccessToken: "ksk_legacy_stays_enabled",
+		SupplierID: provider.ID, Enabled: true,
+	}}); err != nil || added != 1 {
+		t.Fatalf("AddAccounts = %d, %v", added, err)
+	}
+	body := `{"event":"all_keys_dead","event_id":"legacy-event-id","message":"legacy notification","dead":1}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy all_keys_dead status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	manager.processPendingWebhookEvents()
+	if len(manager.store.pendingWebhookEvents()) != 0 {
+		t.Fatalf("legacy notification unexpectedly queued reconciliation: %+v", manager.store.pendingWebhookEvents())
+	}
+	accounts := config.GetAccounts()
+	if len(accounts) != 1 || !accounts[0].Enabled {
+		t.Fatalf("legacy notification changed accounts: %+v", accounts)
+	}
 }
 
 func TestSupplierWebhookEmptyBodyIsAReadOnlyHealthCheck(t *testing.T) {
@@ -598,6 +959,10 @@ func TestSupplierWebhookDisabledAcknowledgesWithoutQueueing(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	var disabledAck map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &disabledAck); err != nil || disabledAck["ok"] != true || disabledAck["accepted"] != false {
+		t.Fatalf("disabled webhook acknowledgement=%s err=%v", rec.Body.String(), err)
+	}
 	if len(manager.store.state.Events) != 0 {
 		t.Fatalf("disabled integration persisted events: %+v", manager.store.state.Events)
 	}
@@ -653,6 +1018,9 @@ func TestSupplierAdminOverviewRequiresAuthAndDoesNotExposeToken(t *testing.T) {
 	if !strings.Contains(body, `"tokenMasked"`) || !strings.Contains(body, `"webhookPath":"/api/supplier-webhooks/vendor-a"`) {
 		t.Fatalf("overview missing safe supplier metadata: %s", body)
 	}
+	if !strings.Contains(body, `"apiType":"kiroapp"`) || !strings.Contains(body, `"capabilities":{"balance":true`) {
+		t.Fatalf("overview missing protocol capabilities: %s", body)
+	}
 }
 
 func TestSupplierBatchLifetimeExcludesManualShutdowns(t *testing.T) {
@@ -695,6 +1063,7 @@ func TestSupplierBatchLifetimeExcludesManualShutdowns(t *testing.T) {
 
 func TestHTTPSupplierAPIContract(t *testing.T) {
 	var purchaseID string
+	var purchaseOrderID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer km_contract" {
 			t.Errorf("Authorization = %q", got)
@@ -715,6 +1084,7 @@ func TestHTTPSupplierAPIContract(t *testing.T) {
 				t.Errorf("decode purchase: %v", err)
 			}
 			purchaseID, _ = body["client_order_id"].(string)
+			purchaseOrderID, _ = body["order_id"].(string)
 			json.NewEncoder(w).Encode(map[string]any{"purchased": 1, "requested": 1, "order_id": "o1", "keys": []map[string]any{{"key": "ksk_purchase"}}})
 		default:
 			http.Error(w, fmt.Sprintf("unexpected path %s", r.URL.Path), http.StatusNotFound)
@@ -734,9 +1104,180 @@ func TestHTTPSupplierAPIContract(t *testing.T) {
 	if err != nil || len(keys.Items) != 1 || keys.Items[0].Value() != "ksk_list" {
 		t.Fatalf("GetKeys = %+v, %v", keys, err)
 	}
-	purchased, err := api.Purchase(1, "us", "0123456789abcdef0123456789abcdef")
-	if err != nil || purchased.Purchased != 1 || purchaseID != "0123456789abcdef0123456789abcdef" {
-		t.Fatalf("Purchase = %+v, %v id=%q", purchased, err, purchaseID)
+	purchased, err := api.Purchase(supplierPurchaseRequest{Count: 1, Region: "us", ClientOrderID: "0123456789abcdef0123456789abcdef", SupplierOrderID: "batch-1"})
+	if err != nil || purchased.Purchased != 1 || purchaseID != "0123456789abcdef0123456789abcdef" || purchaseOrderID != "batch-1" {
+		t.Fatalf("Purchase = %+v, %v id=%q order=%q", purchased, err, purchaseID, purchaseOrderID)
+	}
+}
+
+func TestAWSMySupplierAPIContract(t *testing.T) {
+	var purchaseBody map[string]any
+	var configuredWebhook string
+	var webhookTestCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "aws_contract" {
+			t.Errorf("X-API-Key = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("unexpected Authorization = %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/my/profile":
+			json.NewEncoder(w).Encode(map[string]any{"name": "AWS商户A", "webhook_url": "https://example.com/webhook"})
+		case "/api/my/stock":
+			json.NewEncoder(w).Encode(map[string]any{"max": 12})
+		case "/api/my/keys":
+			if r.URL.Query().Get("history") != "1" || r.URL.Query().Get("page") != "" || r.URL.Query().Get("page_size") != "" {
+				t.Errorf("unexpected keys query: %s", r.URL.RawQuery)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"count": 3, "active": 2,
+				"keys": []map[string]any{
+					{"key": "ksk_aws_one", "status": "active", "created_at": "2026-08-04 10:30:00"},
+					{"key": "ksk_aws_two", "status": "active", "created_at": "2026-08-04 10:31:00"},
+					{"key": "ksk_aws_dead", "status": "dead", "created_at": "2026-08-03 09:20:00"},
+				},
+			})
+		case "/api/my/purchase":
+			if err := json.NewDecoder(r.Body).Decode(&purchaseBody); err != nil {
+				t.Errorf("decode purchase: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"client_order_id": "0123456789abcdef0123456789abcdef",
+				"purchased":       2,
+				"keys":            []map[string]any{{"key": "ksk_new_one"}, {"key": "ksk_new_two"}},
+			})
+		case "/api/my/webhook":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode webhook setup: %v", err)
+			}
+			configuredWebhook = body["webhook_url"]
+			json.NewEncoder(w).Encode(map[string]any{"name": "AWS商户A", "webhook_url": configuredWebhook})
+		case "/api/my/webhook/test":
+			webhookTestCalls++
+			json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.Error(w, fmt.Sprintf("unexpected path %s", r.URL.Path), http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	api := newHTTPSupplierAPI(config.SupplierProvider{
+		BaseURL: server.URL, APIToken: "aws_contract", APIType: config.SupplierAPITypeAWSMy,
+	})
+	profile, err := api.GetProfile()
+	if err != nil || profile.User.Name != "AWS商户A" || profile.User.Balance != 0 {
+		t.Fatalf("GetProfile = %+v, %v", profile, err)
+	}
+	stock, err := api.GetStock()
+	if err != nil || stock.Stock != 12 || stock.StockUS != 12 || stock.StockEU != 0 {
+		t.Fatalf("GetStock = %+v, %v", stock, err)
+	}
+	keys, err := api.GetKeys(true, 2, 2)
+	if err != nil || keys.Total != 3 || keys.Pages != 2 || len(keys.Items) != 1 || keys.Items[0].Value() != "ksk_aws_dead" {
+		t.Fatalf("GetKeys = %+v, %v", keys, err)
+	}
+	purchased, err := api.Purchase(supplierPurchaseRequest{
+		Count: 2, Region: "us", ClientOrderID: "0123456789abcdef0123456789abcdef", SupplierOrderID: "must-not-be-sent",
+	})
+	if err != nil || purchased.Purchased != 2 || purchased.Requested != 2 || len(purchased.Keys) != 2 {
+		t.Fatalf("Purchase = %+v, %v", purchased, err)
+	}
+	if purchaseBody["client_order_id"] != "0123456789abcdef0123456789abcdef" || purchaseBody["count"] != float64(2) {
+		t.Fatalf("purchase body = %#v", purchaseBody)
+	}
+	if _, sent := purchaseBody["region"]; sent {
+		t.Fatalf("AWS My purchase sent unsupported region: %#v", purchaseBody)
+	}
+	if _, sent := purchaseBody["order_id"]; sent {
+		t.Fatalf("AWS My purchase sent unsupported order_id: %#v", purchaseBody)
+	}
+	if err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/aws-vendor"); err != nil {
+		t.Fatalf("SetWebhook: %v", err)
+	}
+	if err := api.TestWebhook(); err != nil {
+		t.Fatalf("TestWebhook: %v", err)
+	}
+	if configuredWebhook != "https://kiro.example/api/supplier-webhooks/aws-vendor" || webhookTestCalls != 1 {
+		t.Fatalf("webhook setup url=%q testCalls=%d", configuredWebhook, webhookTestCalls)
+	}
+}
+
+func TestAWSMyPurchaseRejectsMalformedSuccessfulResponses(t *testing.T) {
+	request := supplierPurchaseRequest{Count: 2, Region: "us", ClientOrderID: "0123456789abcdef0123456789abcdef"}
+	tests := []struct {
+		name     string
+		response map[string]any
+	}{
+		{
+			name: "wrong order id",
+			response: map[string]any{"client_order_id": "fedcba9876543210fedcba9876543210", "purchased": 2,
+				"keys": []map[string]string{{"key": "ksk_one"}, {"key": "ksk_two"}}},
+		},
+		{
+			name: "partial delivery",
+			response: map[string]any{"client_order_id": request.ClientOrderID, "purchased": 1,
+				"keys": []map[string]string{{"key": "ksk_one"}}},
+		},
+		{
+			name: "empty key",
+			response: map[string]any{"client_order_id": request.ClientOrderID, "purchased": 2,
+				"keys": []map[string]string{{"key": "ksk_one"}, {"key": ""}}},
+		},
+		{
+			name: "duplicate key",
+			response: map[string]any{"client_order_id": request.ClientOrderID, "purchased": 2,
+				"keys": []map[string]string{{"key": "ksk_same"}, {"key": "ksk_same"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				json.NewEncoder(w).Encode(tt.response)
+			}))
+			defer server.Close()
+			api := newHTTPSupplierAPI(config.SupplierProvider{
+				BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeAWSMy,
+			})
+			if _, err := api.Purchase(request); err == nil {
+				t.Fatalf("malformed response was accepted: %#v", tt.response)
+			}
+		})
+	}
+}
+
+func TestAWSMyWebhookManagementRequiresPositiveConfirmation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/my/webhook":
+			json.NewEncoder(w).Encode(map[string]any{"webhook_url": "https://wrong.example/api/supplier-webhooks/vendor"})
+		case "/api/my/webhook/test":
+			json.NewEncoder(w).Encode(map[string]any{"ok": false})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeAWSMy})
+	if err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/vendor"); err == nil {
+		t.Fatal("mismatched webhook confirmation was accepted")
+	}
+	if err := api.TestWebhook(); err == nil {
+		t.Fatal("ok=false webhook test was accepted")
+	}
+}
+
+func TestAWSMySupplierErrorCodeControlsRetrySafety(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"code": "ORDER_PROCESSING", "message": "订单正在处理"})
+	}))
+	defer server.Close()
+	api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeAWSMy})
+	_, err := api.GetStock()
+	if err == nil || !isRetryableSupplierError(err) || !strings.Contains(err.Error(), "ORDER_PROCESSING") {
+		t.Fatalf("ORDER_PROCESSING classification = %v", err)
 	}
 }
 
