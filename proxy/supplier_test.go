@@ -547,6 +547,45 @@ func TestSupplierWebhookEmptyBodyIsAReadOnlyHealthCheck(t *testing.T) {
 	}
 }
 
+func TestSupplierWebhookTestEventIsAReadOnlyHealthCheck(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	h, manager, _ := newSupplierTestManager(t, fake)
+	call := func() *httptest.ResponseRecorder {
+		body := `{"event":"webhook_test","event_id":"087f03fc29ec4ca89a26b984fe977fb9","message":"Webhook测试消息"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/vendor-a", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	assertReadOnlyOK := func(label string, response *httptest.ResponseRecorder) {
+		t.Helper()
+		if response.Code != http.StatusOK || strings.TrimSpace(response.Body.String()) != `{"ok":"true"}` {
+			t.Fatalf("%s status=%d body=%q", label, response.Code, response.Body.String())
+		}
+		if len(manager.store.state.Events) != 0 || len(manager.wake) != 0 {
+			t.Fatalf("%s changed webhook state: events=%d wake=%d", label, len(manager.store.state.Events), len(manager.wake))
+		}
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if fake.purchaseCalls != 0 {
+			t.Fatalf("%s triggered %d purchases", label, fake.purchaseCalls)
+		}
+	}
+
+	assertReadOnlyOK("enabled test", call())
+	assertReadOnlyOK("repeated test", call())
+	if err := config.UpdateSupplierFeature(false, true); err != nil {
+		t.Fatalf("disable supplier feature: %v", err)
+	}
+	assertReadOnlyOK("disabled test", call())
+
+	missingEventID := httptest.NewRecorder()
+	h.ServeHTTP(missingEventID, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/vendor-a", strings.NewReader(`{"event":"webhook_test"}`)))
+	if missingEventID.Code != http.StatusBadRequest {
+		t.Fatalf("missing event_id status=%d body=%s", missingEventID.Code, missingEventID.Body.String())
+	}
+}
+
 func TestSupplierWebhookDisabledAcknowledgesWithoutQueueing(t *testing.T) {
 	fake := &fakeSupplierAPI{}
 	h, manager, _ := newSupplierTestManager(t, fake)

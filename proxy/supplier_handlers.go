@@ -367,6 +367,28 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 	}
 
 	integration := config.GetSupplierIntegration()
+	r.Body = io.NopCloser(bytes.NewReader(payload))
+	var event supplierWebhookEvent
+	decodeErr := decodeSupplierJSON(r, &event)
+	if decodeErr == nil {
+		event.Event = strings.TrimSpace(event.Event)
+		event.EventID = strings.TrimSpace(event.EventID)
+		// Providers use this event to verify a configured callback URL. It must
+		// remain a read-only health check even while the integration or provider
+		// is disabled, and must never enter the durable event/purchase workflow.
+		if event.Event == "webhook_test" {
+			if event.EventID == "" {
+				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id is required"))
+				return
+			}
+			if len(event.EventID) > 256 {
+				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id is too long"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
+			return
+		}
+	}
 	if !integration.Enabled || !provider.Enabled {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"accepted": false,
@@ -374,9 +396,8 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		})
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(payload))
-	var event supplierWebhookEvent
-	if err := decodeSupplierJSON(r, &event); err != nil {
+	if decodeErr != nil {
+		err := decodeErr
 		if errors.Is(err, io.EOF) {
 			err = errors.New("request body is required")
 		}
@@ -388,8 +409,6 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusBadRequest, err)
 		return
 	}
-	event.Event = strings.TrimSpace(event.Event)
-	event.EventID = strings.TrimSpace(event.EventID)
 	if event.Event == "" || event.EventID == "" {
 		writeSupplierError(w, http.StatusBadRequest, errors.New("event and event_id are required"))
 		return
