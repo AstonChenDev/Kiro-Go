@@ -22,6 +22,7 @@ const (
 type supplierWebhookEvent struct {
 	Event           string  `json:"event"`
 	EventID         string  `json:"event_id"`
+	BatchID         string  `json:"batch_id,omitempty"`
 	Visibility      string  `json:"visibility,omitempty"`
 	NewKeys         int     `json:"new_keys,omitempty"`
 	SuppliedCount   int     `json:"supplied_count,omitempty"`
@@ -50,21 +51,26 @@ type supplierEventRecord struct {
 }
 
 type supplierProviderStatus struct {
-	ProviderID string  `json:"providerId"`
-	CheckedAt  int64   `json:"checkedAt"`
-	Stock      int     `json:"stock"`
-	StockUS    int     `json:"stockUs"`
-	StockEU    int     `json:"stockEu"`
-	PriceMin   float64 `json:"priceMin"`
-	PriceMax   float64 `json:"priceMax"`
-	Balance    float64 `json:"balance"`
-	KeyCount   int     `json:"keyCount"`
-	LastError  string  `json:"lastError,omitempty"`
+	ProviderID       string                `json:"providerId"`
+	PurchaseSource   string                `json:"purchaseSource"`
+	CheckedAt        int64                 `json:"checkedAt"`
+	Stock            int                   `json:"stock"`
+	StockUS          int                   `json:"stockUs"`
+	StockEU          int                   `json:"stockEu"`
+	PriceMin         float64               `json:"priceMin"`
+	PriceMax         float64               `json:"priceMax"`
+	Balance          float64               `json:"balance"`
+	KeyCount         int                   `json:"keyCount"`
+	PublicOrderCount int                   `json:"publicOrderCount,omitempty"`
+	PublicBatches    []supplierPublicBatch `json:"publicBatches,omitempty"`
+	LastError        string                `json:"lastError,omitempty"`
 }
 
 type supplierPurchaseIntent struct {
 	ID              string `json:"id"`
 	ProviderID      string `json:"providerId"`
+	PurchaseSource  string `json:"purchaseSource,omitempty"`
+	PublicBatchID   string `json:"publicBatchId,omitempty"`
 	Region          string `json:"region"`
 	Count           int    `json:"count"`
 	ClientOrderID   string `json:"clientOrderId"`
@@ -94,6 +100,8 @@ type supplierAutoBlock struct {
 type supplierBatch struct {
 	ID              string   `json:"id"`
 	ProviderID      string   `json:"providerId"`
+	PurchaseSource  string   `json:"purchaseSource,omitempty"`
+	PublicBatchID   string   `json:"publicBatchId,omitempty"`
 	SupplierOrderID string   `json:"supplierOrderId,omitempty"`
 	ClientOrderID   string   `json:"clientOrderId"`
 	Region          string   `json:"region"`
@@ -147,7 +155,7 @@ func newSupplierStateStore(dir string) (*supplierStateStore, error) {
 
 func newSupplierPersistentState() supplierPersistentState {
 	return supplierPersistentState{
-		Version:         2,
+		Version:         3,
 		Events:          make(map[string]supplierEventRecord),
 		ProviderStatus:  make(map[string]supplierProviderStatus),
 		PurchaseIntents: make(map[string]supplierPurchaseIntent),
@@ -157,8 +165,8 @@ func newSupplierPersistentState() supplierPersistentState {
 }
 
 func (s *supplierStateStore) ensureMapsLocked() {
-	if s.state.Version < 2 {
-		s.state.Version = 2
+	if s.state.Version < 3 {
+		s.state.Version = 3
 	}
 	if s.state.Events == nil {
 		s.state.Events = make(map[string]supplierEventRecord)
@@ -184,6 +192,7 @@ func cloneSupplierState(in supplierPersistentState) supplierPersistentState {
 		out.Events[k] = v
 	}
 	for k, v := range in.ProviderStatus {
+		v.PublicBatches = append([]supplierPublicBatch(nil), v.PublicBatches...)
 		out.ProviderStatus[k] = v
 	}
 	for k, v := range in.PurchaseIntents {
@@ -278,7 +287,9 @@ func (s *supplierStateStore) recordEventAndIntent(providerID string, event suppl
 			storageKey, existing, duplicate := findSupplierIntent(candidate.PurchaseIntents, intent.ProviderID, intent.ID)
 			if duplicate {
 				if existing.ProviderID != intent.ProviderID || existing.ClientOrderID != intent.ClientOrderID ||
-					existing.Count != intent.Count || existing.SupplierOrderID != intent.SupplierOrderID {
+					existing.Count != intent.Count || existing.SupplierOrderID != intent.SupplierOrderID ||
+					config.EffectiveSupplierPurchaseSource(existing.PurchaseSource) != config.EffectiveSupplierPurchaseSource(intent.PurchaseSource) ||
+					existing.PublicBatchID != intent.PublicBatchID {
 					return errors.New("purchase_order_id conflicts with an existing supplier purchase")
 				}
 			} else {
@@ -380,14 +391,17 @@ func (s *supplierStateStore) setProviderStatus(status supplierProviderStatus) er
 	// visible in memory but persist an unchanged snapshot at most once a minute
 	// to avoid a disk write every five seconds while the pool is empty.
 	unchanged := exists &&
+		previous.PurchaseSource == status.PurchaseSource && supplierPublicBatchesEqual(previous.PublicBatches, status.PublicBatches) &&
 		previous.Stock == status.Stock && previous.StockUS == status.StockUS && previous.StockEU == status.StockEU &&
 		previous.PriceMin == status.PriceMin && previous.PriceMax == status.PriceMax && previous.Balance == status.Balance &&
-		previous.KeyCount == status.KeyCount && previous.LastError == status.LastError
+		previous.KeyCount == status.KeyCount && previous.PublicOrderCount == status.PublicOrderCount && previous.LastError == status.LastError
 	if unchanged && status.CheckedAt-previous.CheckedAt < 60 {
+		status.PublicBatches = append([]supplierPublicBatch(nil), status.PublicBatches...)
 		s.state.ProviderStatus[status.ProviderID] = status
 		return nil
 	}
 	candidate := cloneSupplierState(s.state)
+	status.PublicBatches = append([]supplierPublicBatch(nil), status.PublicBatches...)
 	candidate.ProviderStatus[status.ProviderID] = status
 	if err := s.saveCandidate(candidate); err != nil {
 		return err
@@ -401,9 +415,29 @@ func (s *supplierStateStore) providerStatuses() map[string]supplierProviderStatu
 	defer s.mu.RUnlock()
 	out := make(map[string]supplierProviderStatus, len(s.state.ProviderStatus))
 	for k, v := range s.state.ProviderStatus {
+		v.PublicBatches = append([]supplierPublicBatch(nil), v.PublicBatches...)
 		out[k] = v
 	}
 	return out
+}
+
+func supplierPublicBatchesEqual(left, right []supplierPublicBatch) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].BatchID != right[i].BatchID || left[i].Available != right[i].Available ||
+			left[i].PublishedAt != right[i].PublishedAt {
+			return false
+		}
+		if (left[i].LastHealthCheckAt == nil) != (right[i].LastHealthCheckAt == nil) {
+			return false
+		}
+		if left[i].LastHealthCheckAt != nil && *left[i].LastHealthCheckAt != *right[i].LastHealthCheckAt {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *supplierStateStore) createIntent(intent supplierPurchaseIntent) error {

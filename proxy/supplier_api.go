@@ -49,14 +49,48 @@ func isRetryableSupplierError(err error) bool {
 		(apiErr.StatusCode == http.StatusConflict && apiErr.Code == "ORDER_PROCESSING")
 }
 
+func isSupplierPublicInventoryRaceError(err error) bool {
+	var apiErr *supplierAPIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.Code {
+	case "STOCK_CHANGED", "BATCH_NOT_AVAILABLE", "INSUFFICIENT_BATCH_STOCK", "NO_STOCK", "BATCH_NOT_FOUND":
+		return true
+	default:
+		return false
+	}
+}
+
 type supplierStock struct {
-	Stock    int     `json:"stock"`
-	StockUS  int     `json:"stock_us"`
-	StockEU  int     `json:"stock_eu"`
-	Price    float64 `json:"price"`
-	PriceMin float64 `json:"price_min"`
-	PriceMax float64 `json:"price_max"`
-	Balance  float64 `json:"balance"`
+	Stock    int                   `json:"stock"`
+	StockUS  int                   `json:"stock_us"`
+	StockEU  int                   `json:"stock_eu"`
+	Price    float64               `json:"price"`
+	PriceMin float64               `json:"price_min"`
+	PriceMax float64               `json:"price_max"`
+	Balance  float64               `json:"balance"`
+	Batches  []supplierPublicBatch `json:"-"`
+}
+
+type supplierPublicBatch struct {
+	BatchID           string  `json:"batch_id"`
+	Available         int     `json:"available"`
+	PublishedAt       string  `json:"published_at,omitempty"`
+	LastHealthCheckAt *string `json:"last_health_check_at,omitempty"`
+}
+
+type supplierPublicStock struct {
+	Total   int                   `json:"total"`
+	Batches []supplierPublicBatch `json:"batches"`
+}
+
+type supplierPublicPurchaseOrder struct {
+	ClientOrderID string `json:"client_order_id"`
+	Requested     int    `json:"requested"`
+	Purchased     int    `json:"purchased"`
+	SourceIP      string `json:"source_ip,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
 }
 
 type supplierProfile struct {
@@ -99,6 +133,7 @@ type supplierKeysPage struct {
 }
 
 type supplierPurchaseResponse struct {
+	BatchID       string        `json:"batch_id,omitempty"`
 	ClientOrderID string        `json:"client_order_id,omitempty"`
 	Purchased     int           `json:"purchased"`
 	Requested     int           `json:"requested"`
@@ -113,12 +148,16 @@ type supplierPurchaseResponse struct {
 type supplierPurchaseRequest struct {
 	Count           int
 	Region          string
+	PurchaseSource  string
+	BatchID         string
 	ClientOrderID   string
 	SupplierOrderID string
 }
 
 type supplierAPI interface {
 	GetStock() (supplierStock, error)
+	GetPublicStock() (supplierPublicStock, error)
+	GetPublicPurchaseOrders() ([]supplierPublicPurchaseOrder, error)
 	GetProfile() (supplierProfile, error)
 	GetKeys(history bool, page, pageSize int) (supplierKeysPage, error)
 	Purchase(request supplierPurchaseRequest) (supplierPurchaseResponse, error)
@@ -184,9 +223,9 @@ func (c *httpSupplierAPI) do(method, path string, body any, target any) error {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiBody struct {
-			Error   string `json:"error"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
+			Error   string          `json:"error"`
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
 		}
 		_ = json.Unmarshal(payload, &apiBody)
 		message := strings.TrimSpace(apiBody.Error)
@@ -202,7 +241,12 @@ func (c *httpSupplierAPI) do(method, path string, body any, target any) error {
 		if len(message) > 500 {
 			message = message[:500]
 		}
-		return &supplierAPIError{StatusCode: resp.StatusCode, Code: strings.TrimSpace(apiBody.Code), Message: message}
+		code := strings.TrimSpace(string(apiBody.Code))
+		code = strings.Trim(code, `"`)
+		if code == "null" {
+			code = ""
+		}
+		return &supplierAPIError{StatusCode: resp.StatusCode, Code: code, Message: message}
 	}
 	if target == nil || len(payload) == 0 {
 		return nil
@@ -232,6 +276,70 @@ func (c *httpSupplierAPI) GetStock() (supplierStock, error) {
 	var out supplierStock
 	err := c.do(http.MethodGet, "/api/me/stock", nil, &out)
 	return out, err
+}
+
+func (c *httpSupplierAPI) GetPublicStock() (supplierPublicStock, error) {
+	if c.apiType() != config.SupplierAPITypeAWSMy {
+		return supplierPublicStock{}, errSupplierOperationUnsupported
+	}
+	var out supplierPublicStock
+	if err := c.do(http.MethodGet, "/api/public/stock", nil, &out); err != nil {
+		return supplierPublicStock{}, err
+	}
+	if out.Total < 0 {
+		return supplierPublicStock{}, errors.New("supplier returned a negative public stock total")
+	}
+	sum := 0
+	seen := make(map[string]struct{}, len(out.Batches))
+	for i := range out.Batches {
+		out.Batches[i].BatchID = strings.TrimSpace(out.Batches[i].BatchID)
+		if out.Batches[i].BatchID == "" {
+			return supplierPublicStock{}, errors.New("supplier public stock contains an empty batch_id")
+		}
+		if out.Batches[i].Available < 0 {
+			return supplierPublicStock{}, errors.New("supplier public stock contains a negative batch quantity")
+		}
+		if _, duplicate := seen[out.Batches[i].BatchID]; duplicate {
+			return supplierPublicStock{}, errors.New("supplier public stock contains duplicate batch_id values")
+		}
+		seen[out.Batches[i].BatchID] = struct{}{}
+		if out.Batches[i].Available > out.Total || sum > out.Total-out.Batches[i].Available {
+			return supplierPublicStock{}, fmt.Errorf("supplier public stock total mismatch: total=%d", out.Total)
+		}
+		sum += out.Batches[i].Available
+	}
+	if sum != out.Total {
+		return supplierPublicStock{}, fmt.Errorf("supplier public stock total mismatch: total=%d batches=%d", out.Total, sum)
+	}
+	return out, nil
+}
+
+func (c *httpSupplierAPI) GetPublicPurchaseOrders() ([]supplierPublicPurchaseOrder, error) {
+	if c.apiType() != config.SupplierAPITypeAWSMy {
+		return nil, errSupplierOperationUnsupported
+	}
+	var out []supplierPublicPurchaseOrder
+	if err := c.do(http.MethodGet, "/api/public/purchase-orders", nil, &out); err != nil {
+		return nil, err
+	}
+	if len(out) > 50 {
+		return nil, errors.New("supplier returned more than 50 public purchase orders")
+	}
+	seen := make(map[string]struct{}, len(out))
+	for i := range out {
+		out[i].ClientOrderID = strings.TrimSpace(out[i].ClientOrderID)
+		if !isSupplier32HexID(out[i].ClientOrderID) {
+			return nil, errors.New("supplier public order contains an invalid client_order_id")
+		}
+		if out[i].Requested < 1 || out[i].Purchased != out[i].Requested {
+			return nil, errors.New("supplier public order contains an invalid quantity")
+		}
+		if _, duplicate := seen[out[i].ClientOrderID]; duplicate {
+			return nil, errors.New("supplier returned duplicate public purchase orders")
+		}
+		seen[out[i].ClientOrderID] = struct{}{}
+	}
+	return out, nil
 }
 
 func (c *httpSupplierAPI) GetProfile() (supplierProfile, error) {
@@ -315,7 +423,16 @@ func (c *httpSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 	}
 	path := "/api/me/purchase"
 	if c.apiType() == config.SupplierAPITypeAWSMy {
-		path = "/api/my/purchase"
+		if config.EffectiveSupplierPurchaseSource(request.PurchaseSource) == config.SupplierPurchaseSourcePublic {
+			request.BatchID = strings.TrimSpace(request.BatchID)
+			if request.BatchID == "" {
+				return out, errors.New("batch_id is required for a public supplier purchase")
+			}
+			path = "/api/public/purchase"
+			body["batch_id"] = request.BatchID
+		} else {
+			path = "/api/my/purchase"
+		}
 	} else {
 		if request.Region != "" {
 			body["region"] = request.Region
@@ -334,6 +451,9 @@ func (c *httpSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 		}
 		if out.Purchased != request.Count || len(out.Keys) != out.Purchased {
 			return out, fmt.Errorf("supplier purchase response is incomplete: requested %d, purchased %d, returned %d keys", request.Count, out.Purchased, len(out.Keys))
+		}
+		if config.EffectiveSupplierPurchaseSource(request.PurchaseSource) == config.SupplierPurchaseSourcePublic && out.BatchID != request.BatchID {
+			return out, errors.New("supplier public purchase response returned a different batch_id")
 		}
 		seen := make(map[string]struct{}, len(out.Keys))
 		for _, item := range out.Keys {

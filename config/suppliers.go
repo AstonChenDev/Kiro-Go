@@ -18,6 +18,8 @@ const (
 	MaxSupplierPollIntervalSeconds     = 300
 	SupplierAPITypeKiroApp             = "kiroapp"
 	SupplierAPITypeAWSMy               = "aws_my"
+	SupplierPurchaseSourceOwn          = "own"
+	SupplierPurchaseSourcePublic       = "public"
 )
 
 var supplierIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -43,6 +45,7 @@ type SupplierProvider struct {
 	BaseURL           string `json:"baseUrl"`
 	APIToken          string `json:"apiToken"`
 	APIType           string `json:"apiType,omitempty"`
+	PurchaseSource    string `json:"purchaseSource,omitempty"`
 	Enabled           bool   `json:"enabled"`
 	Priority          int    `json:"priority"`
 	AutoPurchaseCount int    `json:"autoPurchaseCount"`
@@ -56,6 +59,30 @@ func EffectiveSupplierAPIType(apiType string) string {
 		return SupplierAPITypeKiroApp
 	}
 	return apiType
+}
+
+// EffectiveSupplierPurchaseSource keeps providers saved before public pools
+// existed on their original own-inventory behavior.
+func EffectiveSupplierPurchaseSource(source string) string {
+	source = strings.ToLower(strings.TrimSpace(source))
+	if source == "" {
+		return SupplierPurchaseSourceOwn
+	}
+	return source
+}
+
+func validateSupplierPurchaseSource(apiType, source string) error {
+	switch EffectiveSupplierPurchaseSource(source) {
+	case SupplierPurchaseSourceOwn:
+		return nil
+	case SupplierPurchaseSourcePublic:
+		if EffectiveSupplierAPIType(apiType) != SupplierAPITypeAWSMy {
+			return errors.New("public purchaseSource requires aws_my apiType")
+		}
+		return nil
+	default:
+		return errors.New("purchaseSource must be own or public")
+	}
 }
 
 func validateSupplierAPIType(apiType string) error {
@@ -119,6 +146,10 @@ func normalizeSupplierProvider(provider *SupplierProvider, creating bool) error 
 	if err := validateSupplierAPIType(provider.APIType); err != nil {
 		return err
 	}
+	provider.PurchaseSource = EffectiveSupplierPurchaseSource(provider.PurchaseSource)
+	if err := validateSupplierPurchaseSource(provider.APIType, provider.PurchaseSource); err != nil {
+		return err
+	}
 	if creating && provider.APIToken == "" {
 		return errors.New("apiToken is required")
 	}
@@ -139,6 +170,7 @@ func cloneSupplierConfig(in SupplierIntegrationConfig) SupplierIntegrationConfig
 	out.Providers = append([]SupplierProvider(nil), in.Providers...)
 	for i := range out.Providers {
 		out.Providers[i].APIType = EffectiveSupplierAPIType(out.Providers[i].APIType)
+		out.Providers[i].PurchaseSource = EffectiveSupplierPurchaseSource(out.Providers[i].PurchaseSource)
 	}
 	return out
 }
@@ -175,6 +207,7 @@ func GetSupplierProvider(id string) *SupplierProvider {
 		if cfg.SupplierIntegration.Providers[i].ID == id {
 			provider := cfg.SupplierIntegration.Providers[i]
 			provider.APIType = EffectiveSupplierAPIType(provider.APIType)
+			provider.PurchaseSource = EffectiveSupplierPurchaseSource(provider.PurchaseSource)
 			return &provider
 		}
 	}
@@ -248,6 +281,7 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 	}
 	update.ID = normalizedID
 	apiTypeProvided := strings.TrimSpace(update.APIType) != ""
+	purchaseSourceProvided := strings.TrimSpace(update.PurchaseSource) != ""
 	if err := normalizeSupplierProvider(&update, false); err != nil {
 		return SupplierProvider{}, err
 	}
@@ -263,6 +297,16 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 		update.UpdatedAt = time.Now().Unix()
 		if !apiTypeProvided {
 			update.APIType = EffectiveSupplierAPIType(previous.APIType)
+		}
+		if !purchaseSourceProvided {
+			if apiTypeProvided && update.APIType != EffectiveSupplierAPIType(previous.APIType) {
+				update.PurchaseSource = SupplierPurchaseSourceOwn
+			} else {
+				update.PurchaseSource = EffectiveSupplierPurchaseSource(previous.PurchaseSource)
+			}
+		}
+		if err := validateSupplierPurchaseSource(update.APIType, update.PurchaseSource); err != nil {
+			return SupplierProvider{}, err
 		}
 		if update.APIToken == "" {
 			update.APIToken = previous.APIToken

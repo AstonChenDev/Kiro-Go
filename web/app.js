@@ -3401,6 +3401,10 @@
     return t(provider && provider.apiType === 'aws_my' ? 'suppliers.apiTypeAWSMy' : 'suppliers.apiTypeKiroApp');
   }
 
+  function supplierPurchaseSourceLabel(provider) {
+    return t(provider && provider.purchaseSource === 'public' ? 'suppliers.sourcePublic' : 'suppliers.sourceOwn');
+  }
+
   function supplierFormatNumber(value) {
     const number = Number(value || 0);
     return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/\.00$/, '');
@@ -3516,19 +3520,25 @@
       const statusText = autoBlocked ? t('suppliers.autoPaused') : (hasError ? t('suppliers.testFailed') : (checked ? t('suppliers.connected') : t('suppliers.notChecked')));
       const webhook = location.origin + (provider.webhookPath || ('/api/supplier-webhooks/' + provider.id));
       const actionsDisabled = !supplierOverview.enabled || !provider.enabled;
-      const purchaseDisabled = actionsDisabled || !checked || (!!status.lastError && !autoBlocked);
+      const publicBatches = Array.isArray(status.publicBatches) ? status.publicBatches.filter(batch => Number(batch.available || 0) > 0) : [];
+      const usesPublicPool = provider.purchaseSource === 'public';
+      const purchaseDisabled = actionsDisabled || !checked || (!!status.lastError && !autoBlocked) || (usesPublicPool && publicBatches.length === 0);
       const metrics = capabilities.regions
         ? supplierProviderMetric(t('suppliers.balance'), checked ? supplierFormatNumber(status.balance) : '—') +
           supplierProviderMetric(t('suppliers.stockUS'), checked ? supplierFormatNumber(status.stockUs) : '—') +
           supplierProviderMetric(t('suppliers.stockEU'), checked ? supplierFormatNumber(status.stockEu) : '—')
-        : supplierProviderMetric(t('suppliers.balance'), checked ? t('suppliers.notProvided') : '—') +
-          supplierProviderMetric(t('suppliers.availableStock'), checked ? supplierFormatNumber(status.stock) : '—') +
-          supplierProviderMetric(t('suppliers.remoteKeys'), checked ? supplierFormatNumber(status.keyCount) : '—');
+        : usesPublicPool
+          ? supplierProviderMetric(t('suppliers.publicStock'), checked ? supplierFormatNumber(status.stock) : '—') +
+            supplierProviderMetric(t('suppliers.publicBatchCount'), checked ? supplierFormatNumber(publicBatches.length) : '—') +
+            supplierProviderMetric(t('suppliers.assignedKeys'), checked ? supplierFormatNumber(status.keyCount) : '—')
+          : supplierProviderMetric(t('suppliers.balance'), checked ? t('suppliers.notProvided') : '—') +
+            supplierProviderMetric(t('suppliers.availableStock'), checked ? supplierFormatNumber(status.stock) : '—') +
+            supplierProviderMetric(t('suppliers.remoteKeys'), checked ? supplierFormatNumber(status.keyCount) : '—');
       return '<article class="supplier-provider-card' + (provider.enabled ? '' : ' is-disabled') + '">' +
         '<div class="supplier-provider-top">' +
         '<div class="supplier-provider-identity"><span class="supplier-provider-icon"><i class="fa-solid fa-server"></i></span><div class="min-w-0">' +
         '<p class="supplier-provider-name">' + escapeHtml(provider.name) + '</p>' +
-        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(supplierAPITypeLabel(provider)) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + '</span>' +
+        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(supplierAPITypeLabel(provider)) + ' · ' + escapeHtml(supplierPurchaseSourceLabel(provider)) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + '</span>' +
         '</div></div>' +
         '<span class="supplier-status-pill ' + statusClass + '"><i class="fa-solid ' + (hasError ? 'fa-circle-exclamation' : (checked ? 'fa-circle-check' : 'fa-clock')) + '"></i>' + escapeHtml(statusText) + '</span>' +
         '</div>' +
@@ -3623,6 +3633,10 @@
       '<select id="supplierFormAPIType"><option value="kiroapp"' + (!provider || provider.apiType !== 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroApp')) + '</option>' +
       '<option value="aws_my"' + (provider && provider.apiType === 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeAWSMy')) + '</option></select>' +
       '<small>' + escapeHtml(t('suppliers.formAPITypeHint')) + '</small></div>' +
+      '<div class="form-group supplier-form-full"><label for="supplierFormPurchaseSource">' + escapeHtml(t('suppliers.formPurchaseSource')) + '</label>' +
+      '<select id="supplierFormPurchaseSource"><option value="own"' + (!provider || provider.purchaseSource !== 'public' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.sourceOwn')) + '</option>' +
+      '<option value="public"' + (provider && provider.purchaseSource === 'public' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.sourcePublic')) + '</option></select>' +
+      '<small id="supplierPurchaseSourceHint"></small></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormBaseUrl">' + escapeHtml(t('suppliers.formBaseUrl')) + '</label>' +
       '<input id="supplierFormBaseUrl" type="url" placeholder="' + escapeAttr(t('suppliers.formBaseUrlPlaceholder')) + '" value="' + escapeAttr(provider ? provider.baseUrl : 'https://') + '" /></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormToken">' + escapeHtml(t('suppliers.formToken')) + '</label>' +
@@ -3639,7 +3653,22 @@
       '<button class="btn btn-primary" id="supplierFormSave" type="button">' + escapeHtml(t('suppliers.save')) + '</button></div>';
     openDialog('supplierModal');
     enhanceCustomSelects($('supplierModalBody'));
+    $('supplierFormAPIType').addEventListener('change', syncSupplierPurchaseSourceAvailability);
+    $('supplierFormPurchaseSource').addEventListener('change', syncSupplierPurchaseSourceAvailability);
+    syncSupplierPurchaseSourceAvailability();
     setTimeout(() => $(provider ? 'supplierFormName' : 'supplierFormId').focus(), 0);
+  }
+
+  function syncSupplierPurchaseSourceAvailability() {
+    const apiType = $('supplierFormAPIType');
+    const source = $('supplierFormPurchaseSource');
+    const hint = $('supplierPurchaseSourceHint');
+    if (!apiType || !source || !hint) return;
+    const publicSupported = apiType.value === 'aws_my';
+    if (!publicSupported) source.value = 'own';
+    source.disabled = !publicSupported;
+    hint.textContent = t(source.value === 'public' ? 'suppliers.formPurchaseSourcePublicHint' : 'suppliers.formPurchaseSourceOwnHint');
+    syncCustomSelect(source);
   }
 
   function closeSupplierModal() {
@@ -3655,6 +3684,7 @@
       baseUrl: $('supplierFormBaseUrl').value.trim(),
       apiToken: $('supplierFormToken').value.trim(),
       apiType: $('supplierFormAPIType').value,
+      purchaseSource: $('supplierFormPurchaseSource').value,
       priority: parseInt($('supplierFormPriority').value || '0', 10),
       autoPurchaseCount: parseInt($('supplierFormAutoCount').value || '0', 10),
       enabled: $('supplierFormEnabled').checked
@@ -3725,27 +3755,54 @@
     if (!provider) return;
     const status = provider.status || {};
     const capabilities = supplierCapabilities(provider);
+    const usesPublicPool = provider.purchaseSource === 'public';
+    const publicBatches = Array.isArray(status.publicBatches) ? status.publicBatches.filter(batch => Number(batch.available || 0) > 0) : [];
     const summary = capabilities.regions
       ? escapeHtml(t('suppliers.balance')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.balance)) + '</strong> · ' +
         escapeHtml(t('suppliers.stockUS')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockUs)) + '</strong> · ' +
         escapeHtml(t('suppliers.stockEU')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stockEu)) + '</strong>'
-      : escapeHtml(t('suppliers.availableStock')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stock)) + '</strong> · ' +
-        escapeHtml(t('suppliers.balance')) + ': <strong>' + escapeHtml(t('suppliers.notProvided')) + '</strong>';
+      : escapeHtml(usesPublicPool ? t('suppliers.publicStock') : t('suppliers.availableStock')) + ': <strong>' + escapeHtml(supplierFormatNumber(status.stock)) + '</strong> · ' +
+        escapeHtml(t('suppliers.purchaseSource')) + ': <strong>' + escapeHtml(supplierPurchaseSourceLabel(provider)) + '</strong>';
     const regionField = capabilities.regions
       ? '<div class="form-group"><label for="supplierPurchaseRegion">' + escapeHtml(t('suppliers.purchaseRegion')) + '</label><select id="supplierPurchaseRegion">' +
         '<option value="us">' + escapeHtml(t('suppliers.purchaseUS')) + '</option><option value="eu">' + escapeHtml(t('suppliers.purchaseEU')) + '</option></select></div>'
       : '<div class="form-group"><label>' + escapeHtml(t('suppliers.purchaseRegion')) + '</label><div class="supplier-static-field">' + escapeHtml(t('suppliers.regionlessUS')) + '</div></div>';
+    const batchField = usesPublicPool
+      ? (publicBatches.length
+        ? '<div class="form-group supplier-form-full"><label for="supplierPurchaseBatch">' + escapeHtml(t('suppliers.publicBatch')) + '</label><select id="supplierPurchaseBatch">' +
+          publicBatches.map(batch => '<option value="' + escapeAttr(batch.batch_id) + '" data-available="' + escapeAttr(batch.available) + '">' +
+            escapeHtml(t('suppliers.publicBatchOption', batch.batch_id, batch.available, supplierFormatTime(batch.published_at))) + '</option>').join('') +
+          '</select><small>' + escapeHtml(t('suppliers.publicBatchHint')) + '</small></div>'
+        : '<div class="supplier-card-error supplier-form-full">' + escapeHtml(t('suppliers.publicBatchEmpty')) + '</div>')
+      : '';
+    const initialMax = usesPublicPool && publicBatches.length ? Math.min(500, Number(publicBatches[0].available || 0)) : 500;
+    const initialCount = Math.max(1, Math.min(Number(provider.autoPurchaseCount || 1), initialMax || 1));
     $('supplierPurchaseTitle').textContent = t('suppliers.purchaseTitle') + ' · ' + provider.name;
     $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-summary">' +
       summary + '</div>' +
       '<div class="supplier-form-grid mt-4">' +
       regionField +
-      '<div class="form-group"><label for="supplierPurchaseCount">' + escapeHtml(t('suppliers.purchaseCount')) + '</label><input id="supplierPurchaseCount" type="number" min="1" max="500" value="' + escapeAttr(provider.autoPurchaseCount || 1) + '" /></div>' +
+      '<div class="form-group"><label for="supplierPurchaseCount">' + escapeHtml(t('suppliers.purchaseCount')) + '</label><input id="supplierPurchaseCount" type="number" min="1" max="' + escapeAttr(initialMax) + '" value="' + escapeAttr(initialCount) + '" /></div>' +
+      batchField +
       '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierPurchaseAutoImport" type="checkbox" checked /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.purchaseAutoImport')) + '</span></label><small class="field-hint-offset">' + escapeHtml(t('suppliers.purchaseImportHint')) + '</small></div>' +
       '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierPurchaseCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
-      '<button class="btn btn-primary" id="supplierPurchaseSubmit" type="button" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.purchaseSubmit')) + '</button></div>';
+      '<button class="btn btn-primary" id="supplierPurchaseSubmit" type="button" data-id="' + escapeAttr(provider.id) + '"' + (usesPublicPool && !publicBatches.length ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.purchaseSubmit')) + '</button></div>';
     openDialog('supplierPurchaseModal');
     enhanceCustomSelects($('supplierPurchaseBody'));
+    if ($('supplierPurchaseBatch')) {
+      $('supplierPurchaseBatch').addEventListener('change', syncSupplierPublicPurchaseCount);
+      syncSupplierPublicPurchaseCount();
+    }
+  }
+
+  function syncSupplierPublicPurchaseCount() {
+    const select = $('supplierPurchaseBatch');
+    const input = $('supplierPurchaseCount');
+    if (!select || !input) return;
+    const option = select.selectedOptions && select.selectedOptions[0];
+    const available = Math.max(1, Math.min(500, Number(option && option.dataset.available || 1)));
+    input.max = String(available);
+    if (Number(input.value || 0) > available) input.value = String(available);
   }
 
   function closeSupplierPurchase() {
@@ -3759,8 +3816,11 @@
     const count = parseInt($('supplierPurchaseCount').value || '0', 10);
     const regionElement = $('supplierPurchaseRegion');
     const region = regionElement ? regionElement.value : 'us';
+    const batchElement = $('supplierPurchaseBatch');
+    const batchId = batchElement ? batchElement.value : '';
     const autoImport = $('supplierPurchaseAutoImport').checked;
-    if (!count || count < 1 || count > 500) {
+    const maxCount = Math.min(500, Number($('supplierPurchaseCount').max || 500));
+    if (!count || count < 1 || count > maxCount) {
       toastWarning(t('suppliers.formAutoCountHint'));
       return;
     }
@@ -3768,7 +3828,7 @@
     btn.setAttribute('aria-busy', 'true');
     try {
       const data = await supplierJSON('/suppliers/' + encodeURIComponent(id) + '/purchase', {
-        method: 'POST', body: JSON.stringify({ count, region, autoImport })
+        method: 'POST', body: JSON.stringify({ count, region, batchId, autoImport })
       });
       if (data.pending) {
         $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-result"><div class="supplier-purchase-result-head"><i class="fa-solid fa-clock"></i> ' + escapeHtml(t('suppliers.purchasePending')) + '</div>' +
@@ -3903,7 +3963,9 @@
       };
       const status = statusMap[batch.status] || ['', batch.status || t('suppliers.unknown')];
       const lifetime = batch.lifetimeSeconds || (batch.status === 'active' ? Math.max(0, Math.floor(Date.now() / 1000) - Number(batch.createdAt || 0)) : 0);
-      return '<div class="supplier-batch-row"><div class="supplier-batch-main"><strong>' + escapeHtml(provider ? provider.name : batch.providerId) + ' · ' + escapeHtml(String(batch.region || '').toUpperCase()) + '</strong><small>' + escapeHtml(t('suppliers.batchCreated', supplierFormatTime(batch.createdAt))) + '</small></div>' +
+      const source = batch.purchaseSource === 'public' ? t('suppliers.sourcePublic') : t('suppliers.sourceOwn');
+      const sourceDetail = batch.publicBatchId ? ' · ' + t('suppliers.publicBatchShort', batch.publicBatchId) : '';
+      return '<div class="supplier-batch-row"><div class="supplier-batch-main"><strong>' + escapeHtml(provider ? provider.name : batch.providerId) + ' · ' + escapeHtml(String(batch.region || '').toUpperCase()) + '</strong><small>' + escapeHtml(source + sourceDetail + ' · ' + t('suppliers.batchCreated', supplierFormatTime(batch.createdAt))) + '</small></div>' +
         '<div class="supplier-batch-cell"><strong>' + escapeHtml((batch.purchased || 0) + ' / ' + (batch.imported || 0)) + '</strong><span>' + escapeHtml(t('suppliers.batchQuantity')) + '</span></div>' +
         '<div class="supplier-batch-cell"><strong>' + escapeHtml(String(batch.activeCount || 0)) + '</strong><span>' + escapeHtml(t('suppliers.batchActive')) + '</span></div>' +
         '<div class="supplier-batch-cell"><strong>' + escapeHtml(supplierFormatNumber(batch.totalDebit)) + '</strong><span>' + escapeHtml(t('suppliers.batchCost')) + '</span></div>' +

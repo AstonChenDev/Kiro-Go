@@ -32,6 +32,9 @@ func TestSupplierProviderLifecycleKeepsPermanentIDAndSecret(t *testing.T) {
 	if created.APIType != SupplierAPITypeKiroApp {
 		t.Fatalf("legacy/default API type = %q", created.APIType)
 	}
+	if created.PurchaseSource != SupplierPurchaseSourceOwn {
+		t.Fatalf("legacy/default purchase source = %q", created.PurchaseSource)
+	}
 
 	updated, err := UpdateSupplierProvider("vendor-a", SupplierProvider{
 		Name:              "Renamed Vendor",
@@ -59,6 +62,54 @@ func TestSupplierProviderLifecycleKeepsPermanentIDAndSecret(t *testing.T) {
 	got := GetSupplierIntegration()
 	if !got.Enabled || !got.AutoPurchaseEnabled || len(got.Providers) != 1 {
 		t.Fatalf("unexpected supplier integration: %+v", got)
+	}
+}
+
+func TestSupplierPublicPurchaseSourceIsValidatedAndPreserved(t *testing.T) {
+	initSupplierTestConfig(t)
+	created, err := AddSupplierProvider(SupplierProvider{
+		ID: "public-vendor", Name: "Public Vendor", BaseURL: "https://public.example", APIToken: "secret",
+		APIType: SupplierAPITypeAWSMy, PurchaseSource: SupplierPurchaseSourcePublic, Enabled: true, AutoPurchaseCount: 2,
+	})
+	if err != nil {
+		t.Fatalf("AddSupplierProvider: %v", err)
+	}
+	if created.PurchaseSource != SupplierPurchaseSourcePublic {
+		t.Fatalf("created purchase source = %q", created.PurchaseSource)
+	}
+
+	updated, err := UpdateSupplierProvider(created.ID, SupplierProvider{
+		Name: "Public Vendor Updated", BaseURL: created.BaseURL, Enabled: true, AutoPurchaseCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("legacy UpdateSupplierProvider: %v", err)
+	}
+	if updated.APIType != SupplierAPITypeAWSMy || updated.PurchaseSource != SupplierPurchaseSourcePublic {
+		t.Fatalf("legacy update lost public source: %+v", updated)
+	}
+
+	changed, err := UpdateSupplierProvider(created.ID, SupplierProvider{
+		Name: "Kiro Vendor", BaseURL: created.BaseURL, APIType: SupplierAPITypeKiroApp,
+		Enabled: true, AutoPurchaseCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("change API protocol: %v", err)
+	}
+	if changed.PurchaseSource != SupplierPurchaseSourceOwn {
+		t.Fatalf("protocol change did not reset purchase source: %+v", changed)
+	}
+
+	if _, err := AddSupplierProvider(SupplierProvider{
+		ID: "invalid-public", Name: "Invalid Public", BaseURL: "https://invalid.example", APIToken: "secret",
+		APIType: SupplierAPITypeKiroApp, PurchaseSource: SupplierPurchaseSourcePublic, AutoPurchaseCount: 1,
+	}); err == nil {
+		t.Fatal("public source was accepted for KiroApp protocol")
+	}
+	if _, err := AddSupplierProvider(SupplierProvider{
+		ID: "invalid-source", Name: "Invalid Source", BaseURL: "https://invalid.example", APIToken: "secret",
+		APIType: SupplierAPITypeAWSMy, PurchaseSource: "shared-ish", AutoPurchaseCount: 1,
+	}); err == nil {
+		t.Fatal("unknown purchase source was accepted")
 	}
 }
 

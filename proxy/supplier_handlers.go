@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +31,7 @@ func supplierProviderCapabilities(provider config.SupplierProvider) map[string]b
 	return map[string]bool{
 		"balance":           kiroApp,
 		"regions":           kiroApp,
+		"publicPool":        !kiroApp,
 		"webhookManagement": !kiroApp,
 	}
 }
@@ -76,6 +76,7 @@ func (h *Handler) apiGetSupplierOverview(w http.ResponseWriter, _ *http.Request)
 			"name":                provider.Name,
 			"baseUrl":             provider.BaseURL,
 			"apiType":             config.EffectiveSupplierAPIType(provider.APIType),
+			"purchaseSource":      config.EffectiveSupplierPurchaseSource(provider.PurchaseSource),
 			"capabilities":        supplierProviderCapabilities(provider),
 			"enabled":             provider.Enabled,
 			"priority":            provider.Priority,
@@ -143,6 +144,7 @@ type supplierProviderRequest struct {
 	BaseURL           string `json:"baseUrl"`
 	APIToken          string `json:"apiToken"`
 	APIType           string `json:"apiType"`
+	PurchaseSource    string `json:"purchaseSource"`
 	Enabled           bool   `json:"enabled"`
 	Priority          int    `json:"priority"`
 	AutoPurchaseCount int    `json:"autoPurchaseCount"`
@@ -158,6 +160,7 @@ func (r supplierProviderRequest) configValue(id string) config.SupplierProvider 
 		BaseURL:           r.BaseURL,
 		APIToken:          r.APIToken,
 		APIType:           r.APIType,
+		PurchaseSource:    r.PurchaseSource,
 		Enabled:           r.Enabled,
 		Priority:          r.Priority,
 		AutoPurchaseCount: r.AutoPurchaseCount,
@@ -198,9 +201,19 @@ func (h *Handler) apiUpdateSupplier(w http.ResponseWriter, r *http.Request, id s
 	if strings.TrimSpace(body.APIType) == "" {
 		requestedAPIType = config.EffectiveSupplierAPIType(existing.APIType)
 	}
-	if requestedAPIType != config.EffectiveSupplierAPIType(existing.APIType) && h.suppliers != nil && h.suppliers.store.hasPendingIntentForProvider(existing.ID) {
-		writeSupplierError(w, http.StatusConflict, errors.New("cannot change supplier API protocol while a purchase is pending"))
-		return
+	requestedPurchaseSource := config.EffectiveSupplierPurchaseSource(body.PurchaseSource)
+	if strings.TrimSpace(body.PurchaseSource) == "" {
+		requestedPurchaseSource = config.EffectiveSupplierPurchaseSource(existing.PurchaseSource)
+	}
+	if h.suppliers != nil && h.suppliers.store.hasPendingIntentForProvider(existing.ID) {
+		if requestedAPIType != config.EffectiveSupplierAPIType(existing.APIType) {
+			writeSupplierError(w, http.StatusConflict, errors.New("cannot change supplier API protocol while a purchase is pending"))
+			return
+		}
+		if requestedPurchaseSource != config.EffectiveSupplierPurchaseSource(existing.PurchaseSource) {
+			writeSupplierError(w, http.StatusConflict, errors.New("cannot change supplier purchase source while a purchase is pending"))
+			return
+		}
 	}
 	provider, err := config.UpdateSupplierProvider(id, body.configValue(id))
 	if err != nil {
@@ -349,13 +362,14 @@ func (h *Handler) apiPurchaseSupplierKeys(w http.ResponseWriter, r *http.Request
 	var body struct {
 		Count      int    `json:"count"`
 		Region     string `json:"region"`
+		BatchID    string `json:"batchId"`
 		AutoImport bool   `json:"autoImport"`
 	}
 	if err := decodeSupplierJSON(r, &body); err != nil {
 		writeSupplierError(w, http.StatusBadRequest, err)
 		return
 	}
-	outcome, err := h.suppliers.startPurchase(*provider, body.Count, body.Region, body.AutoImport, "manual")
+	outcome, err := h.suppliers.startPurchaseFromBatch(*provider, body.Count, body.Region, body.AutoImport, "manual", body.BatchID)
 	if err != nil {
 		if outcome.Pending {
 			w.WriteHeader(http.StatusAccepted)
@@ -496,20 +510,22 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 			writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
 			return
 		}
-		suppliedToken := strings.TrimSpace(r.Header.Get("X-API-Key"))
-		expectedToken := strings.TrimSpace(provider.APIToken)
-		if suppliedToken == "" || subtle.ConstantTimeCompare([]byte(suppliedToken), []byte(expectedToken)) != 1 {
-			writeSupplierError(w, http.StatusUnauthorized, errors.New("invalid supplier webhook API key"))
+		// The merchant API key authenticates only Kiro-Go's outbound API calls.
+		// The documented supplier callback intentionally carries no API key, so
+		// inbound authenticity is bounded by the provider-specific fixed URL,
+		// strict event IDs, durable idempotency, size limits, and rate limiting.
+		if len(strings.TrimSpace(event.BatchID)) > 256 {
+			writeSupplierError(w, http.StatusBadRequest, errors.New("batch_id is too long"))
 			return
 		}
 	}
 
 	var intent *supplierPurchaseIntent
 	pendingEvent := false
-	legacyInventoryWake := false
+	inventoryWake := false
 	switch event.Event {
 	case "new_keys_available":
-		if awsMyProtocol {
+		if awsMyProtocol && config.EffectiveSupplierPurchaseSource(provider.PurchaseSource) == config.SupplierPurchaseSourceOwn {
 			value, intentErr := newSupplierWebhookPurchaseIntent(*provider, event)
 			if intentErr != nil {
 				writeSupplierError(w, http.StatusBadRequest, intentErr)
@@ -517,10 +533,11 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 			}
 			intent = &value
 		} else {
-			// Preserve the original KiroApp behavior: its inventory event only
-			// wakes the normal zero-live-key replenishment check. The AWS My
-			// protocol is the one that defines an exact callback extraction order.
-			legacyInventoryWake = true
+			// KiroApp inventory notifications and AWS public-pool notifications
+			// wake the normal zero-live-key check. Public extraction must query
+			// /api/public/stock and generate its own client_order_id; the callback's
+			// purchase_order_id is valid only for the batch owner on /api/my.
+			inventoryWake = true
 		}
 	case "all_keys_dead":
 		if awsMyProtocol {
@@ -537,7 +554,7 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusInternalServerError, fmt.Errorf("persist webhook event: %w", err))
 		return
 	}
-	queued := workAdded || (added && legacyInventoryWake)
+	queued := workAdded || (added && inventoryWake)
 	if queued {
 		h.suppliers.signal(provider.ID)
 	}

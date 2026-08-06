@@ -20,6 +20,10 @@ type fakeSupplierAPI struct {
 	mu              sync.Mutex
 	stock           supplierStock
 	stockErr        error
+	publicStock     supplierPublicStock
+	publicStockErr  error
+	publicOrders    []supplierPublicPurchaseOrder
+	publicOrdersErr error
 	profile         supplierProfile
 	keys            supplierKeysPage
 	keysErr         error
@@ -30,6 +34,8 @@ type fakeSupplierAPI struct {
 	purchaseRegions []string
 	purchaseCounts  []int
 	purchaseOrders  []string
+	purchaseSources []string
+	purchaseBatches []string
 	stockCallCh     chan struct{}
 	setWebhookURL   string
 	setWebhookErr   error
@@ -47,6 +53,24 @@ func (f *fakeSupplierAPI) GetStock() (supplierStock, error) {
 		}
 	}
 	return f.stock, f.stockErr
+}
+
+func (f *fakeSupplierAPI) GetPublicStock() (supplierPublicStock, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stockCallCh != nil {
+		select {
+		case f.stockCallCh <- struct{}{}:
+		default:
+		}
+	}
+	return f.publicStock, f.publicStockErr
+}
+
+func (f *fakeSupplierAPI) GetPublicPurchaseOrders() ([]supplierPublicPurchaseOrder, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]supplierPublicPurchaseOrder(nil), f.publicOrders...), f.publicOrdersErr
 }
 
 func (f *fakeSupplierAPI) GetProfile() (supplierProfile, error) {
@@ -69,6 +93,8 @@ func (f *fakeSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 	f.purchaseRegions = append(f.purchaseRegions, request.Region)
 	f.purchaseCounts = append(f.purchaseCounts, request.Count)
 	f.purchaseOrders = append(f.purchaseOrders, request.SupplierOrderID)
+	f.purchaseSources = append(f.purchaseSources, request.PurchaseSource)
+	f.purchaseBatches = append(f.purchaseBatches, request.BatchID)
 	return f.purchase, f.purchaseErr
 }
 
@@ -237,6 +263,35 @@ func TestSupplierManagerReschedulesPollIntervalWithoutRestart(t *testing.T) {
 	}
 }
 
+func TestSupplierPurchaseSourceCannotChangeWhileOrderIsPending(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	now := supplierNow().Unix()
+	if err := manager.store.createIntent(supplierPurchaseIntent{
+		ID: "0123456789abcdef0123456789abcdef", ProviderID: updated.ID,
+		PurchaseSource: config.SupplierPurchaseSourceOwn, Region: "us", Count: 1,
+		ClientOrderID: "0123456789abcdef0123456789abcdef", Status: "pending", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create pending intent: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"name":%q,"baseUrl":%q,"apiType":"aws_my","purchaseSource":"public","enabled":true,"priority":1,"autoPurchaseCount":1}`, updated.Name, updated.BaseURL)
+	rec := httptest.NewRecorder()
+	h.apiUpdateSupplier(rec, httptest.NewRequest(http.MethodPut, "/admin/api/suppliers/"+updated.ID, strings.NewReader(body)), updated.ID)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "purchase source") {
+		t.Fatalf("pending source change status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	got := config.GetSupplierProvider(updated.ID)
+	if got == nil || got.PurchaseSource != config.SupplierPurchaseSourceOwn {
+		t.Fatalf("pending source change mutated provider: %+v", got)
+	}
+}
+
 func TestSupplierPurchaseEUUsesExpectedAccountRegion(t *testing.T) {
 	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
 		Purchased: 1,
@@ -348,6 +403,172 @@ func TestAutomaticPurchaseRequiresZeroLiveKeysAndUsesUS(t *testing.T) {
 	}
 	if len(fake.purchaseRegions) != 1 || fake.purchaseRegions[0] != "us" {
 		t.Fatalf("purchase regions = %#v", fake.purchaseRegions)
+	}
+}
+
+func TestPublicPoolManualPurchaseUsesSelectedBatchAndImports(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 5, Batches: []supplierPublicBatch{
+			{BatchID: "1005117684943163392", Available: 2, PublishedAt: "2026-08-05 10:00:00"},
+			{BatchID: "1005117779411472384", Available: 3, PublishedAt: "2026-08-05 11:00:00"},
+		}},
+		purchase: supplierPurchaseResponse{
+			BatchID: "1005117779411472384", Purchased: 2, Requested: 2,
+			Keys: []supplierKey{{Key: "ksk_public_manual_one"}, {Key: "ksk_public_manual_two"}},
+		},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+
+	outcome, err := manager.startPurchaseFromBatch(updated, 2, "us", true, "manual", "1005117779411472384")
+	if err != nil {
+		t.Fatalf("public manual purchase: %v", err)
+	}
+	if outcome.Batch.Imported != 2 || outcome.Batch.PurchaseSource != config.SupplierPurchaseSourcePublic ||
+		outcome.Batch.PublicBatchID != "1005117779411472384" {
+		t.Fatalf("public batch = %+v", outcome.Batch)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseSources[0] != config.SupplierPurchaseSourcePublic ||
+		fake.purchaseBatches[0] != "1005117779411472384" || fake.purchaseCounts[0] != 2 {
+		t.Fatalf("public request sources=%#v batches=%#v counts=%#v", fake.purchaseSources, fake.purchaseBatches, fake.purchaseCounts)
+	}
+}
+
+func TestPublicPoolAdminPurchasePassesSelectedBatch(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 1, Batches: []supplierPublicBatch{{BatchID: "admin-selected", Available: 1}}},
+		purchase: supplierPurchaseResponse{
+			BatchID: "admin-selected", Purchased: 1, Requested: 1, Keys: []supplierKey{{Key: "ksk_admin_public"}},
+		},
+	}
+	h, _, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/"+updated.ID+"/purchase", strings.NewReader(`{"count":1,"region":"us","batchId":"admin-selected","autoImport":false}`))
+	rec := httptest.NewRecorder()
+	h.apiPurchaseSupplierKeys(rec, req, updated.ID)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"publicBatchId":"admin-selected"`) {
+		t.Fatalf("admin public purchase status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseBatches[0] != "admin-selected" || fake.purchaseSources[0] != config.SupplierPurchaseSourcePublic {
+		t.Fatalf("admin public request batches=%#v sources=%#v", fake.purchaseBatches, fake.purchaseSources)
+	}
+}
+
+func TestPublicPoolAutomaticPurchaseSelectsOneBatchAndClampsCount(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 5, Batches: []supplierPublicBatch{
+			{BatchID: "small-old", Available: 2, PublishedAt: "2026-08-05 10:00:00"},
+			{BatchID: "large-new", Available: 3, PublishedAt: "2026-08-05 11:00:00"},
+		}},
+		purchase: supplierPurchaseResponse{
+			BatchID: "large-new", Purchased: 3, Requested: 3,
+			Keys: []supplierKey{{Key: "ksk_public_auto_one"}, {Key: "ksk_public_auto_two"}, {Key: "ksk_public_auto_three"}},
+		},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	provider.AutoPurchaseCount = 4
+	if _, err := config.UpdateSupplierProvider(provider.ID, provider); err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+
+	manager.maybeAutoPurchase(provider.ID)
+	if liveAPIKeyCount() != 3 {
+		t.Fatalf("public automatic import live=%d, want 3", liveAPIKeyCount())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseBatches[0] != "large-new" || fake.purchaseCounts[0] != 3 ||
+		fake.purchaseSources[0] != config.SupplierPurchaseSourcePublic {
+		t.Fatalf("public automatic requests batches=%#v counts=%#v sources=%#v", fake.purchaseBatches, fake.purchaseCounts, fake.purchaseSources)
+	}
+}
+
+func TestPublicPoolStockContentionRetriesNextPollWithNewOrder(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 1, Batches: []supplierPublicBatch{{BatchID: "contended", Available: 1}}},
+		purchaseErr: &supplierAPIError{StatusCode: http.StatusConflict, Code: "STOCK_CHANGED", Message: "stock changed"},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	provider.AutoPurchaseCount = 1
+	if _, err := config.UpdateSupplierProvider(provider.ID, provider); err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+
+	manager.maybeAutoPurchase(provider.ID)
+	manager.maybeAutoPurchase(provider.ID)
+	if manager.autoPurchaseBlocked(provider.ID) {
+		t.Fatal("expected public inventory contention to remain eligible for the next poll")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 2 || fake.purchaseIDs[0] == fake.purchaseIDs[1] {
+		t.Fatalf("contention calls=%d ids=%#v", fake.purchaseCalls, fake.purchaseIDs)
+	}
+}
+
+func TestPublicPoolAmbiguousFailurePersistsExactRetryAcrossRestart(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 2, Batches: []supplierPublicBatch{{BatchID: "restart-batch", Available: 2}}},
+		purchaseErr: errors.New("connection reset after request write"),
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+
+	outcome, err := manager.startPurchaseFromBatch(updated, 2, "us", false, "manual", "restart-batch")
+	if err == nil || !outcome.Pending {
+		t.Fatalf("initial public purchase = %+v, %v", outcome, err)
+	}
+	reloaded, err := newSupplierStateStore(filepath.Dir(manager.store.path))
+	if err != nil {
+		t.Fatalf("reload supplier state: %v", err)
+	}
+	manager.store = reloaded
+	pending := manager.store.pendingIntents()
+	if len(pending) != 1 || pending[0].PurchaseSource != config.SupplierPurchaseSourcePublic ||
+		pending[0].PublicBatchID != "restart-batch" || pending[0].Count != 2 {
+		t.Fatalf("persisted public intent = %+v", pending)
+	}
+
+	fake.mu.Lock()
+	fake.purchaseErr = nil
+	fake.purchase = supplierPurchaseResponse{
+		BatchID: "restart-batch", Purchased: 2, Requested: 2,
+		Keys: []supplierKey{{Key: "ksk_public_restart_one"}, {Key: "ksk_public_restart_two"}},
+	}
+	fake.mu.Unlock()
+	if _, err := manager.executeIntent(pending[0]); err != nil {
+		t.Fatalf("retry public purchase: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 2 || fake.purchaseIDs[0] != fake.purchaseIDs[1] ||
+		fake.purchaseBatches[0] != fake.purchaseBatches[1] || fake.purchaseCounts[0] != fake.purchaseCounts[1] ||
+		fake.purchaseSources[0] != config.SupplierPurchaseSourcePublic || fake.purchaseSources[1] != config.SupplierPurchaseSourcePublic {
+		t.Fatalf("public retries ids=%#v batches=%#v counts=%#v sources=%#v", fake.purchaseIDs, fake.purchaseBatches, fake.purchaseCounts, fake.purchaseSources)
 	}
 }
 
@@ -552,7 +773,7 @@ func TestSupplierWebhookIsProviderScopedDurableAndDeduplicated(t *testing.T) {
 	}
 }
 
-func TestAWSMyWebhookAuthenticatesAndExtractsExactOrderOnce(t *testing.T) {
+func TestAWSMyWebhookNeedsNoCredentialsAndExtractsExactOrderOnce(t *testing.T) {
 	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
 		Purchased: 2, Requested: 2, Keys: []supplierKey{{Key: "ksk_webhook_one"}, {Key: "ksk_webhook_two"}},
 	}}
@@ -579,16 +800,9 @@ func TestAWSMyWebhookAuthenticatesAndExtractsExactOrderOnce(t *testing.T) {
 		t.Fatalf("AWS My webhook_test status=%d body=%s", healthCheck.Code, healthCheck.Body.String())
 	}
 
-	unauthorized := call(body, "")
-	if unauthorized.Code != http.StatusUnauthorized || len(manager.store.state.Events) != 0 {
-		t.Fatalf("missing webhook auth status=%d body=%s events=%d", unauthorized.Code, unauthorized.Body.String(), len(manager.store.state.Events))
-	}
-	wrong := call(body, "wrong-token")
-	if wrong.Code != http.StatusUnauthorized || len(manager.store.state.Events) != 0 {
-		t.Fatalf("wrong webhook auth status=%d body=%s events=%d", wrong.Code, wrong.Body.String(), len(manager.store.state.Events))
-	}
-
-	first := call(body, provider.APIToken)
+	// The supplier contract deliberately sends no API credential on callbacks.
+	// Kiro-Go uses the token stored on the provider only for the outbound extract.
+	first := call(body, "")
 	var ack map[string]any
 	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &ack) != nil || ack["ok"] != true || ack["queued"] != true {
 		t.Fatalf("first webhook status=%d body=%s", first.Code, first.Body.String())
@@ -607,7 +821,8 @@ func TestAWSMyWebhookAuthenticatesAndExtractsExactOrderOnce(t *testing.T) {
 		t.Fatalf("webhook import live count = %d", liveAPIKeyCount())
 	}
 
-	duplicate := call(body, provider.APIToken)
+	// An unrelated header must not change callback semantics either.
+	duplicate := call(body, "wrong-token")
 	ack = nil
 	if duplicate.Code != http.StatusOK || json.Unmarshal(duplicate.Body.Bytes(), &ack) != nil || ack["ok"] != true || ack["duplicate"] != true {
 		t.Fatalf("duplicate webhook status=%d body=%s", duplicate.Code, duplicate.Body.String())
@@ -616,7 +831,8 @@ func TestAWSMyWebhookAuthenticatesAndExtractsExactOrderOnce(t *testing.T) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	if fake.purchaseCalls != 1 || len(fake.purchaseIDs) != 1 || fake.purchaseIDs[0] != "0123456789ABCDEF0123456789ABCDEF" ||
-		fake.purchaseCounts[0] != 2 || fake.purchaseRegions[0] != "us" || fake.purchaseOrders[0] != "" {
+		fake.purchaseCounts[0] != 2 || fake.purchaseRegions[0] != "us" || fake.purchaseOrders[0] != "" ||
+		fake.purchaseSources[0] != config.SupplierPurchaseSourceOwn || fake.purchaseBatches[0] != "" {
 		t.Fatalf("exact webhook purchase calls=%d ids=%#v counts=%#v regions=%#v orders=%#v", fake.purchaseCalls, fake.purchaseIDs, fake.purchaseCounts, fake.purchaseRegions, fake.purchaseOrders)
 	}
 }
@@ -707,6 +923,47 @@ func TestKiroAppWebhookPreservesLegacyZeroPoolInventoryWake(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.purchaseCalls != 1 || fake.purchaseIDs[0] == "fedcba9876543210fedcba9876543210" || fake.purchaseOrders[0] != "" || fake.purchaseCounts[0] != 1 {
 		t.Fatalf("legacy KiroApp webhook changed purchase semantics: ids=%#v orders=%#v counts=%#v", fake.purchaseIDs, fake.purchaseOrders, fake.purchaseCounts)
+	}
+}
+
+func TestPublicPoolWebhookWakesFreshPublicExtractionInsteadOfUsingOwnerOrder(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 1, Batches: []supplierPublicBatch{{BatchID: "public-notified-batch", Available: 1}}},
+		purchase: supplierPurchaseResponse{
+			BatchID: "public-notified-batch", Purchased: 1, Requested: 1,
+			Keys: []supplierKey{{Key: "ksk_from_public_notification"}},
+		},
+	}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	provider.AutoPurchaseCount = 1
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+
+	ownerOrderID := "33333333333333333333333333333333"
+	body := `{"event":"new_keys_available","event_id":"abababababababababababababababab","purchase_order_id":"` + ownerOrderID + `","batch_id":"public-notified-batch","new_keys":1}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"queued":true`) {
+		t.Fatalf("public webhook status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(manager.store.pendingIntents()) != 0 || len(manager.wake) != 1 {
+		t.Fatalf("public webhook pending=%d wake=%d", len(manager.store.pendingIntents()), len(manager.wake))
+	}
+
+	manager.maybeAutoPurchase(provider.ID)
+	if liveAPIKeyCount() != 1 {
+		t.Fatalf("public notification import live=%d", liveAPIKeyCount())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseIDs[0] == ownerOrderID || fake.purchaseSources[0] != config.SupplierPurchaseSourcePublic ||
+		fake.purchaseBatches[0] != "public-notified-batch" {
+		t.Fatalf("public notification ids=%#v sources=%#v batches=%#v", fake.purchaseIDs, fake.purchaseSources, fake.purchaseBatches)
 	}
 }
 
@@ -1112,6 +1369,7 @@ func TestHTTPSupplierAPIContract(t *testing.T) {
 
 func TestAWSMySupplierAPIContract(t *testing.T) {
 	var purchaseBody map[string]any
+	var publicPurchaseBody map[string]any
 	var configuredWebhook string
 	var webhookTestCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1126,6 +1384,19 @@ func TestAWSMySupplierAPIContract(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]any{"name": "AWS商户A", "webhook_url": "https://example.com/webhook"})
 		case "/api/my/stock":
 			json.NewEncoder(w).Encode(map[string]any{"max": 12})
+		case "/api/public/stock":
+			json.NewEncoder(w).Encode(map[string]any{
+				"total": 3,
+				"batches": []map[string]any{
+					{"batch_id": "1005117684943163392", "available": 2, "published_at": "2026-08-05 10:00:00", "last_health_check_at": "2026-08-05 10:05:00"},
+					{"batch_id": "1005117779411472384", "available": 1, "published_at": "2026-08-05 11:00:00", "last_health_check_at": nil},
+				},
+			})
+		case "/api/public/purchase-orders":
+			json.NewEncoder(w).Encode([]map[string]any{{
+				"client_order_id": "fedcba9876543210fedcba9876543210", "requested": 1, "purchased": 1,
+				"source_ip": "203.0.113.10", "created_at": "2026-08-05 10:30:00",
+			}})
 		case "/api/my/keys":
 			if r.URL.Query().Get("history") != "1" || r.URL.Query().Get("page") != "" || r.URL.Query().Get("page_size") != "" {
 				t.Errorf("unexpected keys query: %s", r.URL.RawQuery)
@@ -1146,6 +1417,16 @@ func TestAWSMySupplierAPIContract(t *testing.T) {
 				"client_order_id": "0123456789abcdef0123456789abcdef",
 				"purchased":       2,
 				"keys":            []map[string]any{{"key": "ksk_new_one"}, {"key": "ksk_new_two"}},
+			})
+		case "/api/public/purchase":
+			if err := json.NewDecoder(r.Body).Decode(&publicPurchaseBody); err != nil {
+				t.Errorf("decode public purchase: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"batch_id":        "1005117684943163392",
+				"client_order_id": "fedcba9876543210fedcba9876543210",
+				"purchased":       1,
+				"keys":            []map[string]any{{"key": "ksk_public_contract"}},
 			})
 		case "/api/my/webhook":
 			var body map[string]string
@@ -1174,6 +1455,14 @@ func TestAWSMySupplierAPIContract(t *testing.T) {
 	if err != nil || stock.Stock != 12 || stock.StockUS != 12 || stock.StockEU != 0 {
 		t.Fatalf("GetStock = %+v, %v", stock, err)
 	}
+	publicStock, err := api.GetPublicStock()
+	if err != nil || publicStock.Total != 3 || len(publicStock.Batches) != 2 || publicStock.Batches[1].Available != 1 {
+		t.Fatalf("GetPublicStock = %+v, %v", publicStock, err)
+	}
+	publicOrders, err := api.GetPublicPurchaseOrders()
+	if err != nil || len(publicOrders) != 1 || publicOrders[0].Purchased != 1 || publicOrders[0].SourceIP != "203.0.113.10" {
+		t.Fatalf("GetPublicPurchaseOrders = %+v, %v", publicOrders, err)
+	}
 	keys, err := api.GetKeys(true, 2, 2)
 	if err != nil || keys.Total != 3 || keys.Pages != 2 || len(keys.Items) != 1 || keys.Items[0].Value() != "ksk_aws_dead" {
 		t.Fatalf("GetKeys = %+v, %v", keys, err)
@@ -1192,6 +1481,17 @@ func TestAWSMySupplierAPIContract(t *testing.T) {
 	}
 	if _, sent := purchaseBody["order_id"]; sent {
 		t.Fatalf("AWS My purchase sent unsupported order_id: %#v", purchaseBody)
+	}
+	publicPurchased, err := api.Purchase(supplierPurchaseRequest{
+		Count: 1, Region: "us", PurchaseSource: config.SupplierPurchaseSourcePublic,
+		BatchID: "1005117684943163392", ClientOrderID: "fedcba9876543210fedcba9876543210",
+	})
+	if err != nil || publicPurchased.Purchased != 1 || publicPurchased.BatchID != "1005117684943163392" {
+		t.Fatalf("public Purchase = %+v, %v", publicPurchased, err)
+	}
+	if publicPurchaseBody["batch_id"] != "1005117684943163392" || publicPurchaseBody["count"] != float64(1) ||
+		publicPurchaseBody["client_order_id"] != "fedcba9876543210fedcba9876543210" {
+		t.Fatalf("public purchase body = %#v", publicPurchaseBody)
 	}
 	if err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/aws-vendor"); err != nil {
 		t.Fatalf("SetWebhook: %v", err)
@@ -1247,6 +1547,51 @@ func TestAWSMyPurchaseRejectsMalformedSuccessfulResponses(t *testing.T) {
 	}
 }
 
+func TestAWSPublicAPIRejectsMalformedInventoryAndOrderHistory(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		response any
+		call     func(supplierAPI) error
+	}{
+		{
+			name: "stock total mismatch", path: "/api/public/stock",
+			response: map[string]any{"total": 2, "batches": []map[string]any{{"batch_id": "batch-one", "available": 1}}},
+			call:     func(api supplierAPI) error { _, err := api.GetPublicStock(); return err },
+		},
+		{
+			name: "duplicate batch", path: "/api/public/stock",
+			response: map[string]any{"total": 2, "batches": []map[string]any{{"batch_id": "same", "available": 1}, {"batch_id": "same", "available": 1}}},
+			call:     func(api supplierAPI) error { _, err := api.GetPublicStock(); return err },
+		},
+		{
+			name: "invalid order id", path: "/api/public/purchase-orders",
+			response: []map[string]any{{"client_order_id": "not-hex", "requested": 1, "purchased": 1}},
+			call:     func(api supplierAPI) error { _, err := api.GetPublicPurchaseOrders(); return err },
+		},
+		{
+			name: "partial order", path: "/api/public/purchase-orders",
+			response: []map[string]any{{"client_order_id": "0123456789abcdef0123456789abcdef", "requested": 2, "purchased": 1}},
+			call:     func(api supplierAPI) error { _, err := api.GetPublicPurchaseOrders(); return err },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tt.path {
+					t.Fatalf("path=%s, want %s", r.URL.Path, tt.path)
+				}
+				json.NewEncoder(w).Encode(tt.response)
+			}))
+			defer server.Close()
+			api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeAWSMy})
+			if err := tt.call(api); err == nil {
+				t.Fatalf("malformed response was accepted: %#v", tt.response)
+			}
+		})
+	}
+}
+
 func TestAWSMyWebhookManagementRequiresPositiveConfirmation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1281,6 +1626,22 @@ func TestAWSMySupplierErrorCodeControlsRetrySafety(t *testing.T) {
 	}
 }
 
+func TestAWSPublicStockChangedCodeIsRecognizedWithDocumentedFieldCasing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"Code": "STOCK_CHANGED", "Message": "库存发生变化"})
+	}))
+	defer server.Close()
+	api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeAWSMy})
+	_, err := api.Purchase(supplierPurchaseRequest{
+		Count: 1, PurchaseSource: config.SupplierPurchaseSourcePublic, BatchID: "batch",
+		ClientOrderID: "0123456789abcdef0123456789abcdef",
+	})
+	if err == nil || !isSupplierPublicInventoryRaceError(err) || isRetryableSupplierError(err) || !strings.Contains(err.Error(), "STOCK_CHANGED") {
+		t.Fatalf("STOCK_CHANGED classification = %v", err)
+	}
+}
+
 func TestSupplierAPIErrorClassification(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -1307,5 +1668,43 @@ func TestSupplierConnectionCheckRequiresStockAndKeyAccess(t *testing.T) {
 	status := manager.store.providerStatuses()[provider.ID]
 	if !strings.Contains(status.LastError, "keys endpoint unavailable") {
 		t.Fatalf("connection status did not preserve key-access failure: %+v", status)
+	}
+}
+
+func TestPublicSupplierConnectionCheckCoversStockKeysAndOrderHistory(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		publicStock: supplierPublicStock{Total: 1, Batches: []supplierPublicBatch{{BatchID: "public-health", Available: 1}}},
+		keys:        supplierKeysPage{Total: 4},
+		publicOrders: []supplierPublicPurchaseOrder{{
+			ClientOrderID: "0123456789abcdef0123456789abcdef", Requested: 1, Purchased: 1,
+		}},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeAWSMy
+	provider.PurchaseSource = config.SupplierPurchaseSourcePublic
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+
+	stock, err := manager.refreshProviderStatus(updated, true)
+	if err != nil || stock.Stock != 1 || len(stock.Batches) != 1 {
+		t.Fatalf("public connection check = %+v, %v", stock, err)
+	}
+	status := manager.store.providerStatuses()[provider.ID]
+	if status.PurchaseSource != config.SupplierPurchaseSourcePublic || status.KeyCount != 4 || status.PublicOrderCount != 1 ||
+		len(status.PublicBatches) != 1 || status.PublicBatches[0].BatchID != "public-health" {
+		t.Fatalf("public connection status = %+v", status)
+	}
+
+	fake.mu.Lock()
+	fake.publicOrdersErr = errors.New("public order endpoint unavailable")
+	fake.mu.Unlock()
+	if _, err := manager.refreshProviderStatus(updated, true); err == nil || !strings.Contains(err.Error(), "public order endpoint unavailable") {
+		t.Fatalf("missing public order access was accepted: %v", err)
+	}
+	status = manager.store.providerStatuses()[provider.ID]
+	if !strings.Contains(status.LastError, "public order endpoint unavailable") {
+		t.Fatalf("public order error not visible in status: %+v", status)
 	}
 }

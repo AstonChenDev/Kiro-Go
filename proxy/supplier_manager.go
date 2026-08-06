@@ -243,6 +243,13 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 		outcome, err := m.startPurchase(provider, count, supplierPurchaseRegionUS, true, "auto")
 		if err != nil {
 			logger.Warnf("[Supplier] automatic purchase failed for %s: %v", provider.ID, err)
+			// Public inventory is shared with other merchants. A batch changing
+			// between the stock GET and atomic POST is expected contention, not a
+			// configuration failure; the next polling tick must query a fresh batch
+			// and use a new client order ID.
+			if isSupplierPublicInventoryRaceError(err) {
+				continue
+			}
 			if !outcome.Pending && !isRetryableSupplierError(err) {
 				if blockErr := m.blockAutomaticPurchases(provider.ID, outcome.Intent.ID, "purchase_rejected"); blockErr != nil {
 					logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
@@ -271,17 +278,40 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 
 func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider, includeKeyCount bool) (supplierStock, error) {
 	api := m.apiFactory(provider)
-	stock, err := api.GetStock()
-	var keyCountErr error
+	purchaseSource := config.EffectiveSupplierPurchaseSource(provider.PurchaseSource)
+	var stock supplierStock
+	var err error
+	if purchaseSource == config.SupplierPurchaseSourcePublic {
+		var publicStock supplierPublicStock
+		publicStock, err = api.GetPublicStock()
+		if err == nil {
+			stock = supplierStock{
+				Stock:   publicStock.Total,
+				StockUS: publicStock.Total,
+				Batches: append([]supplierPublicBatch(nil), publicStock.Batches...),
+			}
+		}
+	} else {
+		stock, err = api.GetStock()
+	}
+	var detailErrors []string
 	status := supplierProviderStatus{
-		ProviderID: provider.ID,
-		CheckedAt:  supplierNow().Unix(),
+		ProviderID:     provider.ID,
+		PurchaseSource: purchaseSource,
+		CheckedAt:      supplierNow().Unix(),
+	}
+	previous, hasPrevious := m.store.providerStatuses()[provider.ID]
+	sameSourceAsPrevious := hasPrevious && config.EffectiveSupplierPurchaseSource(previous.PurchaseSource) == purchaseSource
+	if sameSourceAsPrevious {
+		status.KeyCount = previous.KeyCount
+		status.PublicOrderCount = previous.PublicOrderCount
 	}
 	if err != nil {
-		if previous, ok := m.store.providerStatuses()[provider.ID]; ok {
+		if sameSourceAsPrevious {
 			status = previous
 			status.CheckedAt = supplierNow().Unix()
 		}
+		status.PurchaseSource = purchaseSource
 		status.LastError = err.Error()
 		_ = m.store.setProviderStatus(status)
 		return supplierStock{}, err
@@ -298,20 +328,32 @@ func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider
 		status.PriceMax = status.PriceMin
 	}
 	status.Balance = stock.Balance
+	status.PublicBatches = append([]supplierPublicBatch(nil), stock.Batches...)
+	status.LastError = ""
 	if includeKeyCount {
 		keys, keyErr := api.GetKeys(false, 1, 1)
 		if keyErr != nil {
-			keyCountErr = keyErr
-			status.LastError = "stock available; key count failed: " + keyErr.Error()
+			detailErrors = append(detailErrors, "key count failed: "+keyErr.Error())
 		} else {
 			status.KeyCount = keys.Total
 		}
+		if purchaseSource == config.SupplierPurchaseSourcePublic {
+			orders, orderErr := api.GetPublicPurchaseOrders()
+			if orderErr != nil {
+				detailErrors = append(detailErrors, "public order history failed: "+orderErr.Error())
+			} else {
+				status.PublicOrderCount = len(orders)
+			}
+		}
+	}
+	if len(detailErrors) > 0 {
+		status.LastError = "stock available; " + strings.Join(detailErrors, "; ")
 	}
 	if saveErr := m.store.setProviderStatus(status); saveErr != nil {
 		return supplierStock{}, fmt.Errorf("persist supplier status: %w", saveErr)
 	}
-	if keyCountErr != nil {
-		return stock, fmt.Errorf("read supplier keys: %w", keyCountErr)
+	if len(detailErrors) > 0 {
+		return stock, errors.New(strings.Join(detailErrors, "; "))
 	}
 	return stock, nil
 }
@@ -360,6 +402,10 @@ func isSupplier32HexID(value string) bool {
 }
 
 func (m *supplierManager) startPurchase(provider config.SupplierProvider, count int, region string, autoImport bool, trigger string) (supplierPurchaseOutcome, error) {
+	return m.startPurchaseFromBatch(provider, count, region, autoImport, trigger, "")
+}
+
+func (m *supplierManager) startPurchaseFromBatch(provider config.SupplierProvider, count int, region string, autoImport bool, trigger, requestedBatchID string) (supplierPurchaseOutcome, error) {
 	m.workflowMu.Lock()
 	defer m.workflowMu.Unlock()
 	if len(m.store.pendingIntents()) != 0 {
@@ -378,27 +424,99 @@ func (m *supplierManager) startPurchase(provider config.SupplierProvider, count 
 	if config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeAWSMy && region != supplierPurchaseRegionUS {
 		return supplierPurchaseOutcome{}, errors.New("this supplier exposes a regionless US-preferred key pool")
 	}
+	purchaseSource := config.EffectiveSupplierPurchaseSource(provider.PurchaseSource)
+	publicBatchID := ""
+	if purchaseSource == config.SupplierPurchaseSourcePublic {
+		if config.EffectiveSupplierAPIType(provider.APIType) != config.SupplierAPITypeAWSMy {
+			return supplierPurchaseOutcome{}, errors.New("public key pool requires the AWS merchant API protocol")
+		}
+		publicStock, stockErr := m.apiFactory(provider).GetPublicStock()
+		if stockErr != nil {
+			return supplierPurchaseOutcome{}, fmt.Errorf("read public supplier stock: %w", stockErr)
+		}
+		var selectionErr error
+		publicBatchID, count, selectionErr = selectSupplierPublicBatch(publicStock.Batches, requestedBatchID, count)
+		if selectionErr != nil {
+			return supplierPurchaseOutcome{}, selectionErr
+		}
+	}
 	clientOrderID, err := newSupplierClientOrderID()
 	if err != nil {
 		return supplierPurchaseOutcome{}, fmt.Errorf("generate client order id: %w", err)
 	}
 	now := supplierNow().Unix()
 	intent := supplierPurchaseIntent{
-		ID:            clientOrderID,
-		ProviderID:    provider.ID,
-		Region:        region,
-		Count:         count,
-		ClientOrderID: clientOrderID,
-		AutoImport:    autoImport,
-		Trigger:       trigger,
-		Status:        "pending",
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:             clientOrderID,
+		ProviderID:     provider.ID,
+		PurchaseSource: purchaseSource,
+		PublicBatchID:  publicBatchID,
+		Region:         region,
+		Count:          count,
+		ClientOrderID:  clientOrderID,
+		AutoImport:     autoImport,
+		Trigger:        trigger,
+		Status:         "pending",
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if err := m.store.createIntent(intent); err != nil {
 		return supplierPurchaseOutcome{}, fmt.Errorf("persist purchase intent: %w", err)
 	}
 	return m.executeIntent(intent)
+}
+
+func selectSupplierPublicBatch(batches []supplierPublicBatch, requestedBatchID string, count int) (string, int, error) {
+	requestedBatchID = strings.TrimSpace(requestedBatchID)
+	available := make([]supplierPublicBatch, 0, len(batches))
+	for _, batch := range batches {
+		if batch.Available > 0 {
+			available = append(available, batch)
+		}
+	}
+	if requestedBatchID != "" {
+		for _, batch := range batches {
+			if batch.BatchID != requestedBatchID {
+				continue
+			}
+			if batch.Available < count {
+				return "", 0, fmt.Errorf("public batch %s has %d key(s), fewer than the requested %d", requestedBatchID, batch.Available, count)
+			}
+			return batch.BatchID, count, nil
+		}
+		return "", 0, fmt.Errorf("public batch %s is no longer available", requestedBatchID)
+	}
+	if len(available) == 0 {
+		return "", 0, errors.New("public key pool has no available batches")
+	}
+	// Prefer the oldest batch that can satisfy the whole request. Stable API
+	// order is the tiebreaker; timestamp strings follow the documented sortable
+	// format. This avoids fragmenting shared batches while remaining predictable.
+	sort.SliceStable(available, func(i, j int) bool {
+		left := strings.TrimSpace(available[i].PublishedAt)
+		right := strings.TrimSpace(available[j].PublishedAt)
+		if left == "" {
+			return false
+		}
+		if right == "" {
+			return true
+		}
+		return left < right
+	})
+	for _, batch := range available {
+		if batch.Available >= count {
+			return batch.BatchID, count, nil
+		}
+	}
+	// A single request cannot span batches. If no batch can fulfill the desired
+	// amount, take the largest available batch rather than failing every polling
+	// cycle. The selected count is persisted before POST and remains idempotent.
+	best := available[0]
+	for _, batch := range available[1:] {
+		if batch.Available > best.Available {
+			best = batch
+		}
+	}
+	return best.BatchID, best.Available, nil
 }
 
 func (m *supplierManager) executeIntent(intent supplierPurchaseIntent) (supplierPurchaseOutcome, error) {
@@ -426,6 +544,8 @@ func (m *supplierManager) executeIntent(intent supplierPurchaseIntent) (supplier
 	response, err := m.apiFactory(*provider).Purchase(supplierPurchaseRequest{
 		Count:           intent.Count,
 		Region:          intent.Region,
+		PurchaseSource:  config.EffectiveSupplierPurchaseSource(intent.PurchaseSource),
+		BatchID:         intent.PublicBatchID,
 		ClientOrderID:   intent.ClientOrderID,
 		SupplierOrderID: intent.SupplierOrderID,
 	})
@@ -445,6 +565,8 @@ func (m *supplierManager) executeIntent(intent supplierPurchaseIntent) (supplier
 	batch := supplierBatch{
 		ID:              intent.ID,
 		ProviderID:      intent.ProviderID,
+		PurchaseSource:  config.EffectiveSupplierPurchaseSource(intent.PurchaseSource),
+		PublicBatchID:   intent.PublicBatchID,
 		SupplierOrderID: response.OrderID,
 		ClientOrderID:   intent.ClientOrderID,
 		Region:          intent.Region,
@@ -572,6 +694,7 @@ func newSupplierWebhookPurchaseIntent(provider config.SupplierProvider, event su
 	return supplierPurchaseIntent{
 		ID:              clientOrderID,
 		ProviderID:      provider.ID,
+		PurchaseSource:  config.SupplierPurchaseSourceOwn,
 		Region:          supplierPurchaseRegionUS,
 		Count:           event.NewKeys,
 		ClientOrderID:   clientOrderID,
