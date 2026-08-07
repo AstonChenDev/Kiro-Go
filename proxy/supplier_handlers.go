@@ -473,6 +473,28 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if kiroDropProtocol {
+		// Kiro Drop may send its read-only endpoint check before a signing secret
+		// has been exchanged. Recognize only the two documented/legacy test names
+		// before HMAC verification; all business events still require a signature.
+		r.Body = io.NopCloser(bytes.NewReader(payload))
+		var probe supplierWebhookEvent
+		probeErr := decodeSupplierJSON(r, &probe)
+		r.Body = io.NopCloser(bytes.NewReader(payload))
+		probe.Event = strings.TrimSpace(probe.Event)
+		probe.EventID = strings.TrimSpace(probe.EventID)
+		if probeErr == nil && (probe.Event == "test" || probe.Event == "webhook_test") {
+			if !isSupplier32HexID(probe.EventID) {
+				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
+				return
+			}
+			if !h.suppliers.allowWebhook(provider.ID + "#test") {
+				w.Header().Set("Retry-After", "60")
+				writeSupplierError(w, http.StatusTooManyRequests, errors.New("webhook test rate limit exceeded"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+			return
+		}
 		if err := verifyKiroDropWebhook(*provider, r.Header, payload); err != nil {
 			writeSupplierError(w, http.StatusUnauthorized, err)
 			return

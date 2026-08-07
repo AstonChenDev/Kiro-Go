@@ -1266,10 +1266,38 @@ func TestKiroDropWebhookVerifiesSignatureAndAcceptsSingleAndDualEvents(t *testin
 	path := "/api/supplier-webhooks/" + provider.ID
 
 	testBody := `{"event":"test","event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"Webhook test"}`
+	unsignedTestRec := httptest.NewRecorder()
+	h.ServeHTTP(unsignedTestRec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(testBody)))
+	if unsignedTestRec.Code != http.StatusOK || strings.TrimSpace(unsignedTestRec.Body.String()) != `{"ok":true}` {
+		t.Fatalf("unsigned test status=%d body=%s", unsignedTestRec.Code, unsignedTestRec.Body.String())
+	}
 	testRec := httptest.NewRecorder()
 	h.ServeHTTP(testRec, signedKiroDropWebhookRequest(path, testBody, secret, supplierNow().Unix()))
-	if testRec.Code != http.StatusOK || strings.TrimSpace(testRec.Body.String()) != `{"ok":"true"}` {
+	if testRec.Code != http.StatusOK || strings.TrimSpace(testRec.Body.String()) != `{"ok":true}` {
 		t.Fatalf("test status=%d body=%s", testRec.Code, testRec.Body.String())
+	}
+	legacyTestBody := `{"event":"webhook_test","event_id":"99999999999999999999999999999999","message":"Webhook test"}`
+	legacyTestRec := httptest.NewRecorder()
+	h.ServeHTTP(legacyTestRec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(legacyTestBody)))
+	if legacyTestRec.Code != http.StatusOK || strings.TrimSpace(legacyTestRec.Body.String()) != `{"ok":true}` {
+		t.Fatalf("legacy unsigned test status=%d body=%s", legacyTestRec.Code, legacyTestRec.Body.String())
+	}
+	if err := config.UpdateSupplierFeature(false, false); err != nil {
+		t.Fatalf("disable supplier feature: %v", err)
+	}
+	disabledTestBody := `{"event":"test","event_id":"88888888888888888888888888888888","message":"disabled test"}`
+	disabledTestRec := httptest.NewRecorder()
+	h.ServeHTTP(disabledTestRec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(disabledTestBody)))
+	if disabledTestRec.Code != http.StatusOK || strings.TrimSpace(disabledTestRec.Body.String()) != `{"ok":true}` {
+		t.Fatalf("disabled unsigned test status=%d body=%s", disabledTestRec.Code, disabledTestRec.Body.String())
+	}
+	if err := config.UpdateSupplierFeature(true, true); err != nil {
+		t.Fatalf("re-enable supplier feature: %v", err)
+	}
+	invalidTestRec := httptest.NewRecorder()
+	h.ServeHTTP(invalidTestRec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"event":"test","message":"missing id"}`)))
+	if invalidTestRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid unsigned test status=%d body=%s", invalidTestRec.Code, invalidTestRec.Body.String())
 	}
 	if len(manager.store.state.Events) != 0 || len(manager.wake) != 0 {
 		t.Fatalf("test event changed state: events=%d wake=%d", len(manager.store.state.Events), len(manager.wake))
