@@ -331,11 +331,15 @@ func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider
 	status.PublicBatches = append([]supplierPublicBatch(nil), stock.Batches...)
 	status.LastError = ""
 	if includeKeyCount {
-		keys, keyErr := api.GetKeys(false, 1, 1)
-		if keyErr != nil {
-			detailErrors = append(detailErrors, "key count failed: "+keyErr.Error())
+		if config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroDrop {
+			status.KeyCount = m.localProviderKeys(provider.ID, false, 1, 1).Total
 		} else {
-			status.KeyCount = keys.Total
+			keys, keyErr := api.GetKeys(false, 1, 1)
+			if keyErr != nil {
+				detailErrors = append(detailErrors, "key count failed: "+keyErr.Error())
+			} else {
+				status.KeyCount = keys.Total
+			}
 		}
 		if purchaseSource == config.SupplierPurchaseSourcePublic {
 			orders, orderErr := api.GetPublicPurchaseOrders()
@@ -356,6 +360,93 @@ func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider
 		return stock, errors.New(strings.Join(detailErrors, "; "))
 	}
 	return stock, nil
+}
+
+// localProviderKeys supplies the key-list experience for APIs such as Kiro
+// Drop that return keys at purchase time but intentionally expose no remote
+// key-history endpoint. The admin route remains authenticated and no plaintext
+// key is copied into supplier telemetry or logs.
+func (m *supplierManager) localProviderKeys(providerID string, history bool, page, pageSize int) supplierKeysPage {
+	itemsByValue := make(map[string]supplierKey)
+	batchCreatedAt := make(map[string]int64)
+	for _, batch := range m.store.batches() {
+		if batch.ProviderID != providerID {
+			continue
+		}
+		batchCreatedAt[batch.ID] = batch.CreatedAt
+		status := "active"
+		switch batch.Status {
+		case "dead":
+			status = "dead"
+		case "ended_manual":
+			status = "disabled"
+		case "not_imported":
+			status = "purchased"
+		}
+		purchasedAt := ""
+		if batch.CreatedAt > 0 {
+			purchasedAt = time.Unix(batch.CreatedAt, 0).UTC().Format(time.RFC3339)
+		}
+		region := "us-east-1"
+		if batch.Region == "eu" {
+			region = "eu-central-1"
+		}
+		for _, item := range m.store.purchasedKeys(providerID, batch.ID) {
+			key := item.Value()
+			if key == "" {
+				continue
+			}
+			item.Key = key
+			item.KeyValue = ""
+			item.Status = status
+			if item.Region == "" {
+				item.Region = region
+			}
+			if item.PurchasedAt == "" {
+				item.PurchasedAt = purchasedAt
+			}
+			itemsByValue[key] = item
+		}
+	}
+	for _, account := range config.GetAccounts() {
+		if account.SupplierID != providerID || !config.IsAPIKeyAccount(&account) {
+			continue
+		}
+		key := strings.TrimSpace(account.KiroApiKey)
+		if key == "" {
+			key = strings.TrimSpace(account.AccessToken)
+		}
+		if key == "" {
+			continue
+		}
+		status := "active"
+		if !account.Enabled {
+			status = "disabled"
+			if strings.TrimSpace(account.BanStatus) != "" {
+				status = strings.ToLower(strings.TrimSpace(account.BanStatus))
+			}
+		}
+		item := itemsByValue[key]
+		item.Key = key
+		item.KeyValue = ""
+		item.Status = status
+		item.Region = account.Region
+		if item.PurchasedAt == "" {
+			if timestamp := batchCreatedAt[account.SupplierBatchID]; timestamp > 0 {
+				item.PurchasedAt = time.Unix(timestamp, 0).UTC().Format(time.RFC3339)
+			}
+		}
+		itemsByValue[key] = item
+	}
+	items := make([]supplierKey, 0, len(itemsByValue))
+	for _, item := range itemsByValue {
+		if !history && item.Status != "active" && item.Status != "purchased" {
+			continue
+		}
+		items = append(items, item)
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].PurchasedAt > items[j].PurchasedAt })
+	return paginateSupplierKeys(items, page, pageSize)
 }
 
 func (m *supplierManager) refreshAllProviderStatuses() map[string]string {
@@ -602,8 +693,14 @@ func (m *supplierManager) executeIntent(intent supplierPurchaseIntent) (supplier
 			batch.Status = "active"
 		}
 	}
-	if err := m.store.upsertBatch(batch); err != nil {
-		return supplierPurchaseOutcome{Intent: intent, Response: response, Batch: batch, Pending: true}, fmt.Errorf("persist supplier batch: %w", err)
+	var persistErr error
+	if config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroDrop {
+		persistErr = m.store.upsertBatchWithKeys(batch, response.Keys, true)
+	} else {
+		persistErr = m.store.upsertBatch(batch)
+	}
+	if persistErr != nil {
+		return supplierPurchaseOutcome{Intent: intent, Response: response, Batch: batch, Pending: true}, fmt.Errorf("persist supplier batch: %w", persistErr)
 	}
 	intent.Status = "complete"
 	intent.MustResolve = false

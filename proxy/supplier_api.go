@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -115,6 +117,7 @@ type supplierKey struct {
 	Price       float64 `json:"price,omitempty"`
 	PurchasedAt string  `json:"purchased_at,omitempty"`
 	CreatedAt   string  `json:"created_at,omitempty"`
+	Region      string  `json:"region,omitempty"`
 }
 
 func (k supplierKey) Value() string {
@@ -137,10 +140,13 @@ type supplierPurchaseResponse struct {
 	ClientOrderID string        `json:"client_order_id,omitempty"`
 	Purchased     int           `json:"purchased"`
 	Requested     int           `json:"requested"`
-	Remaining     int           `json:"remaining"`
+	Remaining     any           `json:"remaining,omitempty"`
 	UnitPrice     float64       `json:"unit_price"`
 	TotalDebit    float64       `json:"total_debit"`
 	OrderID       string        `json:"order_id"`
+	Region        string        `json:"region,omitempty"`
+	Status        string        `json:"status,omitempty"`
+	RefundedCNY   any           `json:"refunded_amount_cny,omitempty"`
 	Keys          []supplierKey `json:"keys"`
 	Replayed      bool          `json:"replayed"`
 }
@@ -161,7 +167,7 @@ type supplierAPI interface {
 	GetProfile() (supplierProfile, error)
 	GetKeys(history bool, page, pageSize int) (supplierKeysPage, error)
 	Purchase(request supplierPurchaseRequest) (supplierPurchaseResponse, error)
-	SetWebhook(webhookURL string) error
+	SetWebhook(webhookURL string) (string, error)
 	TestWebhook() error
 }
 
@@ -199,7 +205,7 @@ func (c *httpSupplierAPI) do(method, path string, body any, target any) error {
 		return fmt.Errorf("build supplier request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	if c.apiType() == config.SupplierAPITypeAWSMy {
+	if c.apiType() == config.SupplierAPITypeAWSMy || c.apiType() == config.SupplierAPITypeKiroDrop {
 		req.Header.Set("X-API-Key", c.provider.APIToken)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+c.provider.APIToken)
@@ -258,6 +264,24 @@ func (c *httpSupplierAPI) do(method, path string, body any, target any) error {
 }
 
 func (c *httpSupplierAPI) GetStock() (supplierStock, error) {
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		us, err := c.getKiroDropRegionStock("us")
+		if err != nil {
+			return supplierStock{}, err
+		}
+		eu, err := c.getKiroDropRegionStock("eu")
+		if err != nil {
+			return supplierStock{}, err
+		}
+		priceMin, priceMax := us.Price, eu.Price
+		if priceMin > priceMax {
+			priceMin, priceMax = priceMax, priceMin
+		}
+		return supplierStock{
+			Stock: us.Stock + eu.Stock, StockUS: us.Stock, StockEU: eu.Stock,
+			PriceMin: priceMin, PriceMax: priceMax, Balance: us.Balance,
+		}, nil
+	}
 	if c.apiType() == config.SupplierAPITypeAWSMy {
 		var response struct {
 			Max int `json:"max"`
@@ -276,6 +300,50 @@ func (c *httpSupplierAPI) GetStock() (supplierStock, error) {
 	var out supplierStock
 	err := c.do(http.MethodGet, "/api/me/stock", nil, &out)
 	return out, err
+}
+
+type supplierDecimal float64
+
+func (d *supplierDecimal) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(string(data))
+	if value == "" || value == "null" {
+		*d = 0
+		return nil
+	}
+	value = strings.Trim(value, `"`)
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return fmt.Errorf("invalid decimal value %q", value)
+	}
+	*d = supplierDecimal(parsed)
+	return nil
+}
+
+type kiroDropRegionStock struct {
+	Region  string          `json:"region"`
+	Stock   int             `json:"stock"`
+	Price   supplierDecimal `json:"price"`
+	Balance supplierDecimal `json:"balance"`
+}
+
+func (c *httpSupplierAPI) getKiroDropRegionStock(region string) (supplierStock, error) {
+	query := url.Values{}
+	query.Set("region", region)
+	var response kiroDropRegionStock
+	if err := c.do(http.MethodGet, "/api/me/stock?"+query.Encode(), nil, &response); err != nil {
+		return supplierStock{}, err
+	}
+	expectedRegion := "us-east-1"
+	if region == "eu" {
+		expectedRegion = "eu-central-1"
+	}
+	if response.Region != expectedRegion {
+		return supplierStock{}, fmt.Errorf("supplier returned region %q for %s stock", response.Region, strings.ToUpper(region))
+	}
+	if response.Stock < 0 || response.Price < 0 || response.Balance < 0 {
+		return supplierStock{}, errors.New("supplier returned a negative stock, price, or balance value")
+	}
+	return supplierStock{Stock: response.Stock, Price: float64(response.Price), Balance: float64(response.Balance)}, nil
 }
 
 func (c *httpSupplierAPI) GetPublicStock() (supplierPublicStock, error) {
@@ -343,6 +411,22 @@ func (c *httpSupplierAPI) GetPublicPurchaseOrders() ([]supplierPublicPurchaseOrd
 }
 
 func (c *httpSupplierAPI) GetProfile() (supplierProfile, error) {
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		var response struct {
+			Name      string          `json:"name"`
+			Remaining supplierDecimal `json:"remaining"`
+		}
+		if err := c.do(http.MethodGet, "/api/my/profile", nil, &response); err != nil {
+			return supplierProfile{}, err
+		}
+		if response.Remaining < 0 {
+			return supplierProfile{}, errors.New("supplier returned a negative balance")
+		}
+		var out supplierProfile
+		out.User.Name = strings.TrimSpace(response.Name)
+		out.User.Balance = float64(response.Remaining)
+		return out, nil
+	}
 	if c.apiType() == config.SupplierAPITypeAWSMy {
 		var response struct {
 			Name string `json:"name"`
@@ -360,6 +444,9 @@ func (c *httpSupplierAPI) GetProfile() (supplierProfile, error) {
 }
 
 func (c *httpSupplierAPI) GetKeys(history bool, page, pageSize int) (supplierKeysPage, error) {
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		return supplierKeysPage{}, errSupplierOperationUnsupported
+	}
 	if page < 1 {
 		page = 1
 	}
@@ -433,6 +520,12 @@ func (c *httpSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 		} else {
 			path = "/api/my/purchase"
 		}
+	} else if c.apiType() == config.SupplierAPITypeKiroDrop {
+		path = "/api/my/purchase"
+		body["region"] = request.Region
+		if request.SupplierOrderID != "" {
+			body["order_id"] = request.SupplierOrderID
+		}
 	} else {
 		if request.Region != "" {
 			body["region"] = request.Region
@@ -445,7 +538,13 @@ func (c *httpSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 	if err != nil {
 		return out, err
 	}
-	if c.apiType() == config.SupplierAPITypeAWSMy {
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		status := strings.ToLower(strings.TrimSpace(out.Status))
+		if status == "refunded" || status == "partially_refunded" {
+			return out, &supplierAPIError{StatusCode: http.StatusConflict, Code: "PURCHASE_REFUNDED", Message: "the idempotent supplier order was refunded and its keys will not be imported"}
+		}
+	}
+	if c.apiType() == config.SupplierAPITypeAWSMy || c.apiType() == config.SupplierAPITypeKiroDrop {
 		if !strings.EqualFold(out.ClientOrderID, request.ClientOrderID) {
 			return out, errors.New("supplier purchase response returned a different client_order_id")
 		}
@@ -467,6 +566,27 @@ func (c *httpSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 			seen[key] = struct{}{}
 		}
 	}
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		status := strings.ToLower(strings.TrimSpace(out.Status))
+		if status != "completed" {
+			return out, fmt.Errorf("supplier purchase returned unsupported status %q", out.Status)
+		}
+		if strings.TrimSpace(out.OrderID) == "" {
+			return out, errors.New("supplier purchase response is missing order_id")
+		}
+		expectedRegion := "us-east-1"
+		if request.Region == "eu" {
+			expectedRegion = "eu-central-1"
+		}
+		if out.Region != expectedRegion {
+			return out, fmt.Errorf("supplier purchase returned region %q, want %q", out.Region, expectedRegion)
+		}
+		for _, item := range out.Keys {
+			if item.Region != expectedRegion {
+				return out, fmt.Errorf("supplier purchase returned a key for region %q, want %q", item.Region, expectedRegion)
+			}
+		}
+	}
 	if out.Requested == 0 {
 		out.Requested = request.Count
 	}
@@ -476,25 +596,47 @@ func (c *httpSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 	return out, nil
 }
 
-func (c *httpSupplierAPI) SetWebhook(webhookURL string) error {
-	if c.apiType() != config.SupplierAPITypeAWSMy {
-		return errSupplierOperationUnsupported
+func (c *httpSupplierAPI) SetWebhook(webhookURL string) (string, error) {
+	if c.apiType() != config.SupplierAPITypeAWSMy && c.apiType() != config.SupplierAPITypeKiroDrop {
+		return "", errSupplierOperationUnsupported
 	}
 	var response struct {
-		WebhookURL string `json:"webhook_url"`
+		OK            any    `json:"ok"`
+		WebhookURL    string `json:"webhook_url"`
+		WebhookSecret string `json:"webhook_secret"`
 	}
-	if err := c.do(http.MethodPost, "/api/my/webhook", map[string]string{"webhook_url": webhookURL}, &response); err != nil {
-		return err
+	method := http.MethodPost
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		method = http.MethodPut
+	}
+	if err := c.do(method, "/api/my/webhook", map[string]string{"webhook_url": webhookURL}, &response); err != nil {
+		return "", err
 	}
 	if response.WebhookURL != webhookURL {
-		return errors.New("supplier did not confirm the requested webhook URL")
+		return "", errors.New("supplier did not confirm the requested webhook URL")
 	}
-	return nil
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		if !supplierOK(response.OK) {
+			return "", errors.New("supplier webhook configuration did not return ok=true")
+		}
+		secret := strings.TrimSpace(response.WebhookSecret)
+		if len(secret) != 64 {
+			return "", errors.New("supplier returned an invalid webhook signing secret")
+		}
+		if _, err := hex.DecodeString(secret); err != nil {
+			return "", errors.New("supplier returned an invalid webhook signing secret")
+		}
+		return secret, nil
+	}
+	return "", nil
 }
 
 func (c *httpSupplierAPI) TestWebhook() error {
-	if c.apiType() != config.SupplierAPITypeAWSMy {
+	if c.apiType() != config.SupplierAPITypeAWSMy && c.apiType() != config.SupplierAPITypeKiroDrop {
 		return errSupplierOperationUnsupported
+	}
+	if c.apiType() == config.SupplierAPITypeKiroDrop {
+		return c.do(http.MethodPost, "/api/my/webhook/test", nil, nil)
 	}
 	var response struct {
 		OK any `json:"ok"`
@@ -502,17 +644,24 @@ func (c *httpSupplierAPI) TestWebhook() error {
 	if err := c.do(http.MethodPost, "/api/my/webhook/test", nil, &response); err != nil {
 		return err
 	}
-	switch value := response.OK.(type) {
+	if supplierOK(response.OK) {
+		return nil
+	}
+	return errors.New("supplier webhook test did not return ok=true")
+}
+
+func supplierOK(value any) bool {
+	switch value := value.(type) {
 	case bool:
 		if value {
-			return nil
+			return true
 		}
 	case string:
 		if strings.EqualFold(strings.TrimSpace(value), "true") {
-			return nil
+			return true
 		}
 	}
-	return errors.New("supplier webhook test did not return ok=true")
+	return false
 }
 
 // supplierNow is replaceable by tests that need deterministic state timestamps.

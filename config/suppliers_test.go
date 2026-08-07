@@ -147,6 +147,52 @@ func TestSupplierAPITypeIsValidatedAndPreservedForLegacyUpdates(t *testing.T) {
 	}
 }
 
+func TestKiroDropProviderPreservesWriteOnlyWebhookSecret(t *testing.T) {
+	initSupplierTestConfig(t)
+	created, err := AddSupplierProvider(SupplierProvider{
+		ID: "kiro-drop", Name: "Kiro Drop", BaseURL: "https://drop.kiro.ss", APIToken: "usr-secret",
+		APIType: SupplierAPITypeKiroDrop, PurchaseSource: SupplierPurchaseSourceOwn, Enabled: true, AutoPurchaseCount: 5,
+	})
+	if err != nil {
+		t.Fatalf("AddSupplierProvider: %v", err)
+	}
+	if created.APIType != SupplierAPITypeKiroDrop {
+		t.Fatalf("created API type = %q", created.APIType)
+	}
+	secret := "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+	if err := UpdateSupplierWebhookSecret(created.ID, secret); err != nil {
+		t.Fatalf("UpdateSupplierWebhookSecret: %v", err)
+	}
+	updated, err := UpdateSupplierProvider(created.ID, SupplierProvider{
+		Name: "Kiro Drop Renamed", BaseURL: created.BaseURL, Enabled: true, Priority: 1, AutoPurchaseCount: 6,
+	})
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	if updated.APIType != SupplierAPITypeKiroDrop || updated.WebhookSecret != secret || updated.APIToken != "usr-secret" {
+		t.Fatalf("write-only Kiro Drop settings were not preserved: %+v", updated)
+	}
+	changedConnection, err := UpdateSupplierProvider(created.ID, SupplierProvider{
+		Name: updated.Name, BaseURL: "https://new-drop.example", APIType: SupplierAPITypeKiroDrop,
+		Enabled: true, Priority: 1, AutoPurchaseCount: 6,
+	})
+	if err != nil {
+		t.Fatalf("change Kiro Drop connection: %v", err)
+	}
+	if changedConnection.WebhookSecret != "" {
+		t.Fatalf("connection change retained a stale webhook secret: %+v", changedConnection)
+	}
+	if _, err := AddSupplierProvider(SupplierProvider{
+		ID: "drop-public", Name: "Invalid", BaseURL: "https://drop.example", APIToken: "usr-secret",
+		APIType: SupplierAPITypeKiroDrop, PurchaseSource: SupplierPurchaseSourcePublic, AutoPurchaseCount: 1,
+	}); err == nil {
+		t.Fatal("public source was accepted for Kiro Drop")
+	}
+	if err := UpdateSupplierWebhookSecret(created.ID, "not-hex"); err == nil {
+		t.Fatal("invalid webhook secret was accepted")
+	}
+}
+
 func TestSupplierPollIntervalDefaultsValidatesAndPersists(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

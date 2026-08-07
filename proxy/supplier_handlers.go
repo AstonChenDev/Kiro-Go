@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const supplierWebhookBodyLimit int64 = 64 << 10
@@ -27,12 +31,15 @@ func maskSupplierToken(token string) string {
 }
 
 func supplierProviderCapabilities(provider config.SupplierProvider) map[string]bool {
-	kiroApp := config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroApp
+	apiType := config.EffectiveSupplierAPIType(provider.APIType)
 	return map[string]bool{
-		"balance":           kiroApp,
-		"regions":           kiroApp,
-		"publicPool":        !kiroApp,
-		"webhookManagement": !kiroApp,
+		"balance":           apiType != config.SupplierAPITypeAWSMy,
+		"regions":           apiType != config.SupplierAPITypeAWSMy,
+		"publicPool":        apiType == config.SupplierAPITypeAWSMy,
+		"webhookManagement": apiType != config.SupplierAPITypeKiroApp,
+		"remoteKeys":        apiType != config.SupplierAPITypeKiroDrop,
+		"signedWebhook":     apiType == config.SupplierAPITypeKiroDrop,
+		"purchaseRemaining": apiType == config.SupplierAPITypeKiroDrop,
 	}
 }
 
@@ -82,6 +89,7 @@ func (h *Handler) apiGetSupplierOverview(w http.ResponseWriter, _ *http.Request)
 			"priority":            provider.Priority,
 			"autoPurchaseCount":   provider.AutoPurchaseCount,
 			"hasToken":            strings.TrimSpace(provider.APIToken) != "",
+			"hasWebhookSecret":    strings.TrimSpace(provider.WebhookSecret) != "",
 			"tokenMasked":         maskSupplierToken(provider.APIToken),
 			"webhookPath":         "/api/supplier-webhooks/" + provider.ID,
 			"createdAt":           provider.CreatedAt,
@@ -267,7 +275,8 @@ func (h *Handler) apiSetupSupplierWebhook(w http.ResponseWriter, r *http.Request
 		writeSupplierError(w, http.StatusNotFound, config.ErrSupplierNotFound)
 		return
 	}
-	if config.EffectiveSupplierAPIType(provider.APIType) != config.SupplierAPITypeAWSMy {
+	apiType := config.EffectiveSupplierAPIType(provider.APIType)
+	if apiType != config.SupplierAPITypeAWSMy && apiType != config.SupplierAPITypeKiroDrop {
 		writeSupplierError(w, http.StatusBadRequest, errSupplierOperationUnsupported)
 		return
 	}
@@ -287,9 +296,16 @@ func (h *Handler) apiSetupSupplierWebhook(w http.ResponseWriter, r *http.Request
 		return
 	}
 	api := h.suppliers.apiFactory(*provider)
-	if err := api.SetWebhook(body.WebhookURL); err != nil {
+	secret, err := api.SetWebhook(body.WebhookURL)
+	if err != nil {
 		writeSupplierError(w, http.StatusBadGateway, fmt.Errorf("save supplier webhook: %w", err))
 		return
+	}
+	if apiType == config.SupplierAPITypeKiroDrop {
+		if err := config.UpdateSupplierWebhookSecret(provider.ID, secret); err != nil {
+			writeSupplierError(w, http.StatusInternalServerError, fmt.Errorf("persist supplier webhook signing secret: %w", err))
+			return
+		}
 	}
 	if err := api.TestWebhook(); err != nil {
 		writeSupplierError(w, http.StatusBadGateway, fmt.Errorf("webhook was saved but its connection test failed: %w", err))
@@ -330,10 +346,16 @@ func (h *Handler) apiGetSupplierKeys(w http.ResponseWriter, r *http.Request, id 
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
 	history := r.URL.Query().Get("history") == "1"
-	keys, err := h.suppliers.apiFactory(*provider).GetKeys(history, page, pageSize)
-	if err != nil {
-		writeSupplierError(w, http.StatusBadGateway, err)
-		return
+	var keys supplierKeysPage
+	if config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroDrop {
+		keys = h.suppliers.localProviderKeys(provider.ID, history, page, pageSize)
+	} else {
+		var err error
+		keys, err = h.suppliers.apiFactory(*provider).GetKeys(history, page, pageSize)
+		if err != nil {
+			writeSupplierError(w, http.StatusBadGateway, err)
+			return
+		}
 	}
 	for i := range keys.Items {
 		if keys.Items[i].Key == "" {
@@ -427,8 +449,10 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusNotFound, config.ErrSupplierNotFound)
 		return
 	}
-	awsMyProtocol := config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeAWSMy
-	if !h.suppliers.allowWebhook(provider.ID) {
+	apiType := config.EffectiveSupplierAPIType(provider.APIType)
+	awsMyProtocol := apiType == config.SupplierAPITypeAWSMy
+	kiroDropProtocol := apiType == config.SupplierAPITypeKiroDrop
+	if !kiroDropProtocol && !h.suppliers.allowWebhook(provider.ID) {
 		w.Header().Set("Retry-After", "60")
 		writeSupplierError(w, http.StatusTooManyRequests, errors.New("webhook rate limit exceeded"))
 		return
@@ -448,6 +472,17 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
 		return
 	}
+	if kiroDropProtocol {
+		if err := verifyKiroDropWebhook(*provider, r.Header, payload); err != nil {
+			writeSupplierError(w, http.StatusUnauthorized, err)
+			return
+		}
+		if !h.suppliers.allowWebhook(provider.ID) {
+			w.Header().Set("Retry-After", "60")
+			writeSupplierError(w, http.StatusTooManyRequests, errors.New("webhook rate limit exceeded"))
+			return
+		}
+	}
 
 	integration := config.GetSupplierIntegration()
 	r.Body = io.NopCloser(bytes.NewReader(payload))
@@ -459,12 +494,12 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		// Providers use this event to verify a configured callback URL. It must
 		// remain a read-only health check even while the integration or provider
 		// is disabled, and must never enter the durable event/purchase workflow.
-		if event.Event == "webhook_test" {
+		if event.Event == "webhook_test" || (kiroDropProtocol && event.Event == "test") {
 			if event.EventID == "" {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id is required"))
 				return
 			}
-			if awsMyProtocol && !isSupplier32HexID(event.EventID) {
+			if (awsMyProtocol || kiroDropProtocol) && !isSupplier32HexID(event.EventID) {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
 				return
 			}
@@ -505,15 +540,14 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusBadRequest, errors.New("event or event_id is too long"))
 		return
 	}
-	if awsMyProtocol {
+	if awsMyProtocol || kiroDropProtocol {
 		if !isSupplier32HexID(event.EventID) {
 			writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
 			return
 		}
-		// The merchant API key authenticates only Kiro-Go's outbound API calls.
-		// The documented supplier callback intentionally carries no API key, so
-		// inbound authenticity is bounded by the provider-specific fixed URL,
-		// strict event IDs, durable idempotency, size limits, and rate limiting.
+		// The merchant API key authenticates only outbound API calls. AWS My uses
+		// the fixed provider URL plus strict validation and idempotency; Kiro Drop
+		// additionally reaches this point only after HMAC verification above.
 		if len(strings.TrimSpace(event.BatchID)) > 256 {
 			writeSupplierError(w, http.StatusBadRequest, errors.New("batch_id is too long"))
 			return
@@ -525,6 +559,14 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 	inventoryWake := false
 	switch event.Event {
 	case "new_keys_available":
+		if kiroDropProtocol {
+			if err := validateKiroDropNewKeysEvent(event); err != nil {
+				writeSupplierError(w, http.StatusBadRequest, err)
+				return
+			}
+			inventoryWake = true
+			break
+		}
 		if awsMyProtocol && config.EffectiveSupplierPurchaseSource(provider.PurchaseSource) == config.SupplierPurchaseSourceOwn {
 			value, intentErr := newSupplierWebhookPurchaseIntent(*provider, event)
 			if intentErr != nil {
@@ -540,12 +582,20 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 			inventoryWake = true
 		}
 	case "all_keys_dead":
-		if awsMyProtocol {
+		if awsMyProtocol || kiroDropProtocol {
 			if event.Dead < 1 {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("dead must be greater than zero"))
 				return
 			}
-			pendingEvent = true
+			if awsMyProtocol {
+				pendingEvent = true
+			} else {
+				if err := validateKiroDropAllKeysDeadEvent(event); err != nil {
+					writeSupplierError(w, http.StatusBadRequest, err)
+					return
+				}
+				inventoryWake = true
+			}
 		}
 	}
 
@@ -564,6 +614,116 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		"duplicate": !added,
 		"queued":    queued,
 	})
+}
+
+func verifyKiroDropWebhook(provider config.SupplierProvider, header http.Header, payload []byte) error {
+	secret := strings.TrimSpace(provider.WebhookSecret)
+	if secret == "" {
+		return errors.New("webhook signing secret is not configured; configure the webhook from Kiro-Go first")
+	}
+	eventID := strings.TrimSpace(header.Get("X-Kiro-Event-Id"))
+	if !isSupplier32HexID(eventID) {
+		return errors.New("invalid X-Kiro-Event-Id header")
+	}
+	timestampText := strings.TrimSpace(header.Get("X-Kiro-Timestamp"))
+	timestamp, err := strconv.ParseInt(timestampText, 10, 64)
+	if err != nil || timestamp <= 0 {
+		return errors.New("invalid X-Kiro-Timestamp header")
+	}
+	delta := supplierNow().Unix() - timestamp
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > int64((5*time.Minute)/time.Second) {
+		return errors.New("webhook timestamp is outside the allowed five-minute window")
+	}
+	signatureText := strings.TrimSpace(header.Get("X-Kiro-Signature"))
+	if !strings.HasPrefix(signatureText, "v1=") {
+		return errors.New("invalid X-Kiro-Signature header")
+	}
+	provided, err := hex.DecodeString(strings.TrimPrefix(signatureText, "v1="))
+	if err != nil || len(provided) != sha256.Size {
+		return errors.New("invalid X-Kiro-Signature header")
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(timestampText))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write(payload)
+	if !hmac.Equal(provided, mac.Sum(nil)) {
+		return errors.New("webhook signature verification failed")
+	}
+	var envelope struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return errors.New("invalid webhook JSON")
+	}
+	if strings.TrimSpace(envelope.EventID) != eventID {
+		return errors.New("X-Kiro-Event-Id does not match the request body")
+	}
+	return nil
+}
+
+func validateKiroDropNewKeysEvent(event supplierWebhookEvent) error {
+	if event.NewKeys < 1 {
+		return errors.New("new_keys must be greater than zero")
+	}
+	region := strings.ToLower(strings.TrimSpace(event.Region))
+	if region == "dual" {
+		if strings.TrimSpace(event.DispatchID) == "" || len(strings.TrimSpace(event.DispatchID)) > 256 {
+			return errors.New("dispatch_id is required and must not exceed 256 characters for a dual-region event")
+		}
+		usCount := event.NewKeysByRegion["us-east-1"]
+		euCount := event.NewKeysByRegion["eu-central-1"]
+		if usCount < 0 || euCount < 0 || usCount+euCount != event.NewKeys || usCount+euCount == 0 {
+			return errors.New("new_keys_by_region must contain non-negative US/EU counts that sum to new_keys")
+		}
+		for key, count := range map[string]int{"us-east-1": usCount, "eu-central-1": euCount} {
+			if count > 0 && !isSupplier32HexID(strings.TrimSpace(event.PurchaseOrderIDsByRegion[key])) {
+				return fmt.Errorf("purchase_order_ids_by_region.%s must be a 32-character hexadecimal string", key)
+			}
+			for _, batchID := range event.BatchIDsByRegion[key] {
+				if strings.TrimSpace(batchID) == "" || len(strings.TrimSpace(batchID)) > 256 {
+					return fmt.Errorf("batch_ids_by_region.%s contains an invalid batch ID", key)
+				}
+			}
+		}
+		if len(event.Regions) > 0 {
+			seen := make(map[string]bool, len(event.Regions))
+			for _, item := range event.Regions {
+				normalized := strings.ToLower(strings.TrimSpace(item))
+				if normalized != "us-east-1" && normalized != "eu-central-1" {
+					return errors.New("regions contains an unsupported region")
+				}
+				seen[normalized] = true
+			}
+			if (usCount > 0) != seen["us-east-1"] || (euCount > 0) != seen["eu-central-1"] || len(seen) != len(event.Regions) {
+				return errors.New("regions must exactly match the positive entries in new_keys_by_region")
+			}
+		}
+		return nil
+	}
+	if region != "us-east-1" && region != "eu-central-1" {
+		return errors.New("region must be us-east-1, eu-central-1, or dual")
+	}
+	if !isSupplier32HexID(strings.TrimSpace(event.PurchaseOrderID)) {
+		return errors.New("purchase_order_id must be a 32-character hexadecimal string")
+	}
+	if strings.TrimSpace(event.OrderID) == "" || len(strings.TrimSpace(event.OrderID)) > 256 {
+		return errors.New("order_id is required and must not exceed 256 characters")
+	}
+	return nil
+}
+
+func validateKiroDropAllKeysDeadEvent(event supplierWebhookEvent) error {
+	region := strings.ToLower(strings.TrimSpace(event.Region))
+	if region != "us-east-1" && region != "eu-central-1" {
+		return errors.New("region must be us-east-1 or eu-central-1")
+	}
+	if strings.TrimSpace(event.OrderID) == "" || len(strings.TrimSpace(event.OrderID)) > 256 {
+		return errors.New("order_id is required and must not exceed 256 characters")
+	}
+	return nil
 }
 
 func decodeSupplierJSON(r *http.Request, target any) error {

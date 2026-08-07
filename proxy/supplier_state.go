@@ -20,22 +20,29 @@ const (
 )
 
 type supplierWebhookEvent struct {
-	Event           string  `json:"event"`
-	EventID         string  `json:"event_id"`
-	BatchID         string  `json:"batch_id,omitempty"`
-	Visibility      string  `json:"visibility,omitempty"`
-	NewKeys         int     `json:"new_keys,omitempty"`
-	SuppliedCount   int     `json:"supplied_count,omitempty"`
-	OrderID         string  `json:"order_id,omitempty"`
-	PurchaseOrderID string  `json:"purchase_order_id,omitempty"`
-	MotherID        string  `json:"mother_id,omitempty"`
-	Message         string  `json:"message,omitempty"`
-	FinishedAt      string  `json:"finished_at,omitempty"`
-	StockUS         int     `json:"stock_us,omitempty"`
-	StockEU         int     `json:"stock_eu,omitempty"`
-	PriceUS         float64 `json:"price_us,omitempty"`
-	PriceEU         float64 `json:"price_eu,omitempty"`
-	Dead            int     `json:"dead,omitempty"`
+	Event                    string              `json:"event"`
+	EventID                  string              `json:"event_id"`
+	DispatchID               string              `json:"dispatch_id,omitempty"`
+	BatchID                  string              `json:"batch_id,omitempty"`
+	Visibility               string              `json:"visibility,omitempty"`
+	NewKeys                  int                 `json:"new_keys,omitempty"`
+	SuppliedCount            int                 `json:"supplied_count,omitempty"`
+	OrderID                  string              `json:"order_id,omitempty"`
+	PurchaseOrderID          string              `json:"purchase_order_id,omitempty"`
+	Region                   string              `json:"region,omitempty"`
+	Regions                  []string            `json:"regions,omitempty"`
+	NewKeysByRegion          map[string]int      `json:"new_keys_by_region,omitempty"`
+	BatchIDsByRegion         map[string][]string `json:"batch_ids_by_region,omitempty"`
+	PurchaseOrderIDsByRegion map[string]string   `json:"purchase_order_ids_by_region,omitempty"`
+	CreatedAt                string              `json:"created_at,omitempty"`
+	MotherID                 string              `json:"mother_id,omitempty"`
+	Message                  string              `json:"message,omitempty"`
+	FinishedAt               string              `json:"finished_at,omitempty"`
+	StockUS                  int                 `json:"stock_us,omitempty"`
+	StockEU                  int                 `json:"stock_eu,omitempty"`
+	PriceUS                  float64             `json:"price_us,omitempty"`
+	PriceEU                  float64             `json:"price_eu,omitempty"`
+	Dead                     int                 `json:"dead,omitempty"`
 }
 
 type supplierEventRecord struct {
@@ -127,7 +134,11 @@ type supplierPersistentState struct {
 	ProviderStatus  map[string]supplierProviderStatus `json:"providerStatus,omitempty"`
 	PurchaseIntents map[string]supplierPurchaseIntent `json:"purchaseIntents,omitempty"`
 	AutoBlocks      map[string]supplierAutoBlock      `json:"autoBlocks,omitempty"`
-	Batches         []supplierBatch                   `json:"batches,omitempty"`
+	// PurchasedKeys is intentionally excluded from every overview response. It
+	// retains Kiro Drop purchase results because that API has no key-history
+	// endpoint, including manual purchases where automatic import was disabled.
+	PurchasedKeys map[string][]supplierKey `json:"purchasedKeys,omitempty"`
+	Batches       []supplierBatch          `json:"batches,omitempty"`
 }
 
 type supplierStateStore struct {
@@ -155,18 +166,19 @@ func newSupplierStateStore(dir string) (*supplierStateStore, error) {
 
 func newSupplierPersistentState() supplierPersistentState {
 	return supplierPersistentState{
-		Version:         3,
+		Version:         4,
 		Events:          make(map[string]supplierEventRecord),
 		ProviderStatus:  make(map[string]supplierProviderStatus),
 		PurchaseIntents: make(map[string]supplierPurchaseIntent),
 		AutoBlocks:      make(map[string]supplierAutoBlock),
+		PurchasedKeys:   make(map[string][]supplierKey),
 		Batches:         []supplierBatch{},
 	}
 }
 
 func (s *supplierStateStore) ensureMapsLocked() {
-	if s.state.Version < 3 {
-		s.state.Version = 3
+	if s.state.Version < 4 {
+		s.state.Version = 4
 	}
 	if s.state.Events == nil {
 		s.state.Events = make(map[string]supplierEventRecord)
@@ -179,6 +191,9 @@ func (s *supplierStateStore) ensureMapsLocked() {
 	}
 	if s.state.AutoBlocks == nil {
 		s.state.AutoBlocks = make(map[string]supplierAutoBlock)
+	}
+	if s.state.PurchasedKeys == nil {
+		s.state.PurchasedKeys = make(map[string][]supplierKey)
 	}
 	if s.state.Batches == nil {
 		s.state.Batches = []supplierBatch{}
@@ -200,6 +215,9 @@ func cloneSupplierState(in supplierPersistentState) supplierPersistentState {
 	}
 	for k, v := range in.AutoBlocks {
 		out.AutoBlocks[k] = v
+	}
+	for k, v := range in.PurchasedKeys {
+		out.PurchasedKeys[k] = append([]supplierKey(nil), v...)
 	}
 	out.Batches = make([]supplierBatch, len(in.Batches))
 	for i := range in.Batches {
@@ -542,7 +560,19 @@ func (s *supplierStateStore) clearAutoBlock(providerID string) error {
 }
 
 func (s *supplierStateStore) upsertBatch(batch supplierBatch) error {
+	return s.upsertBatchWithKeys(batch, nil, false)
+}
+
+func (s *supplierStateStore) upsertBatchWithKeys(batch supplierBatch, keys []supplierKey, replaceKeys bool) error {
 	return s.mutate(func(candidate *supplierPersistentState) error {
+		storageKey := supplierIntentKey(batch.ProviderID, batch.ID)
+		if replaceKeys {
+			if len(keys) == 0 {
+				delete(candidate.PurchasedKeys, storageKey)
+			} else {
+				candidate.PurchasedKeys[storageKey] = append([]supplierKey(nil), keys...)
+			}
+		}
 		for i := range candidate.Batches {
 			if candidate.Batches[i].ID == batch.ID {
 				candidate.Batches[i] = batch
@@ -552,9 +582,24 @@ func (s *supplierStateStore) upsertBatch(batch supplierBatch) error {
 		candidate.Batches = append(candidate.Batches, batch)
 		if len(candidate.Batches) > maxSupplierBatches {
 			candidate.Batches = append([]supplierBatch(nil), candidate.Batches[len(candidate.Batches)-maxSupplierBatches:]...)
+			retained := make(map[string]struct{}, len(candidate.Batches))
+			for _, retainedBatch := range candidate.Batches {
+				retained[supplierIntentKey(retainedBatch.ProviderID, retainedBatch.ID)] = struct{}{}
+			}
+			for key := range candidate.PurchasedKeys {
+				if _, ok := retained[key]; !ok {
+					delete(candidate.PurchasedKeys, key)
+				}
+			}
 		}
 		return nil
 	})
+}
+
+func (s *supplierStateStore) purchasedKeys(providerID, batchID string) []supplierKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]supplierKey(nil), s.state.PurchasedKeys[supplierIntentKey(providerID, batchID)]...)
 }
 
 func (s *supplierStateStore) reconcileBatches(accounts []config.Account) error {

@@ -3398,10 +3398,12 @@
   }
 
   function supplierAPITypeLabel(provider) {
+    if (provider && provider.apiType === 'kiro_drop') return t('suppliers.apiTypeKiroDrop');
     return t(provider && provider.apiType === 'aws_my' ? 'suppliers.apiTypeAWSMy' : 'suppliers.apiTypeKiroApp');
   }
 
   function supplierPurchaseSourceLabel(provider) {
+    if (provider && provider.apiType === 'kiro_drop') return t('suppliers.sourceKiroDrop');
     return t(provider && provider.purchaseSource === 'public' ? 'suppliers.sourcePublic' : 'suppliers.sourceOwn');
   }
 
@@ -3549,6 +3551,7 @@
         (hasError ? '<div class="supplier-card-error">' + escapeHtml(autoBlocked ? t(autoBlockReason === 'no_importable_keys' ? 'suppliers.autoPausedHint' : 'suppliers.autoRejectedHint') : status.lastError) + '</div>' : '') +
         '<div class="supplier-webhook-box" title="' + escapeAttr(webhook) + '"><i class="fa-solid fa-link"></i><code>' + escapeHtml(webhook) + '</code>' +
         '<button class="btn btn-outline btn-xs" type="button" aria-label="' + escapeAttr(t('suppliers.copyWebhook')) + '" data-supplier-action="copy-webhook" data-id="' + escapeAttr(provider.id) + '"><i class="fa-regular fa-copy"></i></button></div>' +
+        (capabilities.signedWebhook ? '<div class="supplier-provider-id mb-2"><i class="fa-solid fa-shield-halved"></i> ' + escapeHtml(t(provider.hasWebhookSecret ? 'suppliers.webhookSignatureReady' : 'suppliers.webhookSignatureMissing')) + '</div>' : '') +
         '<div class="supplier-provider-actions">' +
         (capabilities.webhookManagement ? '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="setup-webhook" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.setupWebhook')) + '</button>' : '') +
         '<button class="btn btn-outline btn-xs" type="button" data-supplier-action="test" data-id="' + escapeAttr(provider.id) + '">' + escapeHtml(t('suppliers.test')) + '</button>' +
@@ -3630,8 +3633,9 @@
       '<div class="form-group"><label for="supplierFormName">' + escapeHtml(t('suppliers.formName')) + '</label>' +
       '<input id="supplierFormName" type="text" maxlength="100" placeholder="' + escapeAttr(t('suppliers.formNamePlaceholder')) + '" value="' + escapeAttr(provider ? provider.name : '') + '" /></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormAPIType">' + escapeHtml(t('suppliers.formAPIType')) + '</label>' +
-      '<select id="supplierFormAPIType"><option value="kiroapp"' + (!provider || provider.apiType !== 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroApp')) + '</option>' +
-      '<option value="aws_my"' + (provider && provider.apiType === 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeAWSMy')) + '</option></select>' +
+      '<select id="supplierFormAPIType"><option value="kiroapp"' + (!provider || (provider.apiType !== 'aws_my' && provider.apiType !== 'kiro_drop') ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroApp')) + '</option>' +
+      '<option value="aws_my"' + (provider && provider.apiType === 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeAWSMy')) + '</option>' +
+      '<option value="kiro_drop"' + (provider && provider.apiType === 'kiro_drop' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroDrop')) + '</option></select>' +
       '<small>' + escapeHtml(t('suppliers.formAPITypeHint')) + '</small></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormPurchaseSource">' + escapeHtml(t('suppliers.formPurchaseSource')) + '</label>' +
       '<select id="supplierFormPurchaseSource"><option value="own"' + (!provider || provider.purchaseSource !== 'public' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.sourceOwn')) + '</option>' +
@@ -3667,7 +3671,8 @@
     const publicSupported = apiType.value === 'aws_my';
     if (!publicSupported) source.value = 'own';
     source.disabled = !publicSupported;
-    hint.textContent = t(source.value === 'public' ? 'suppliers.formPurchaseSourcePublicHint' : 'suppliers.formPurchaseSourceOwnHint');
+    hint.textContent = t(apiType.value === 'kiro_drop' ? 'suppliers.formPurchaseSourceKiroDropHint' :
+      (source.value === 'public' ? 'suppliers.formPurchaseSourcePublicHint' : 'suppliers.formPurchaseSourceOwnHint'));
     syncCustomSelect(source);
   }
 
@@ -3839,9 +3844,12 @@
       const purchase = data.purchase || {};
       const batch = data.batch || {};
       const provider = supplierProviderById(id);
-      const purchaseSummary = supplierCapabilities(provider).balance
-        ? t('suppliers.purchaseSummary', supplierFormatNumber(purchase.total_debit), batch.imported || 0)
-        : t('suppliers.purchaseSummaryNoBalance', batch.imported || 0);
+      const purchaseCapabilities = supplierCapabilities(provider);
+      const purchaseSummary = purchaseCapabilities.purchaseRemaining
+        ? t('suppliers.purchaseSummaryRemaining', supplierFormatNumber(purchase.remaining), batch.imported || 0)
+        : purchaseCapabilities.balance
+          ? t('suppliers.purchaseSummary', supplierFormatNumber(purchase.total_debit), batch.imported || 0)
+          : t('suppliers.purchaseSummaryNoBalance', batch.imported || 0);
       supplierLastPurchaseKeys = Array.isArray(purchase.keys) ? purchase.keys.map(k => k.key || k.key_value || '').filter(Boolean) : [];
       $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-result">' +
         '<div class="supplier-purchase-result-head"><i class="fa-solid fa-circle-check"></i> <strong>' + escapeHtml(t('suppliers.purchaseSuccess', purchase.purchased || 0)) + '</strong><br><span>' + escapeHtml(purchaseSummary) + '</span></div>' +

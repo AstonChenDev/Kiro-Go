@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -18,6 +19,7 @@ const (
 	MaxSupplierPollIntervalSeconds     = 300
 	SupplierAPITypeKiroApp             = "kiroapp"
 	SupplierAPITypeAWSMy               = "aws_my"
+	SupplierAPITypeKiroDrop            = "kiro_drop"
 	SupplierPurchaseSourceOwn          = "own"
 	SupplierPurchaseSourcePublic       = "public"
 )
@@ -44,6 +46,7 @@ type SupplierProvider struct {
 	Name              string `json:"name"`
 	BaseURL           string `json:"baseUrl"`
 	APIToken          string `json:"apiToken"`
+	WebhookSecret     string `json:"webhookSecret,omitempty"`
 	APIType           string `json:"apiType,omitempty"`
 	PurchaseSource    string `json:"purchaseSource,omitempty"`
 	Enabled           bool   `json:"enabled"`
@@ -87,10 +90,10 @@ func validateSupplierPurchaseSource(apiType, source string) error {
 
 func validateSupplierAPIType(apiType string) error {
 	switch EffectiveSupplierAPIType(apiType) {
-	case SupplierAPITypeKiroApp, SupplierAPITypeAWSMy:
+	case SupplierAPITypeKiroApp, SupplierAPITypeAWSMy, SupplierAPITypeKiroDrop:
 		return nil
 	default:
-		return errors.New("apiType must be kiroapp or aws_my")
+		return errors.New("apiType must be kiroapp, aws_my, or kiro_drop")
 	}
 }
 
@@ -142,6 +145,15 @@ func normalizeSupplierProvider(provider *SupplierProvider, creating bool) error 
 		return err
 	}
 	provider.APIToken = strings.TrimSpace(provider.APIToken)
+	provider.WebhookSecret = strings.TrimSpace(provider.WebhookSecret)
+	if provider.WebhookSecret != "" {
+		if len(provider.WebhookSecret) != 64 {
+			return errors.New("webhookSecret must be a 64-character hexadecimal string")
+		}
+		if _, err := hex.DecodeString(provider.WebhookSecret); err != nil {
+			return errors.New("webhookSecret must be a 64-character hexadecimal string")
+		}
+	}
 	provider.APIType = EffectiveSupplierAPIType(provider.APIType)
 	if err := validateSupplierAPIType(provider.APIType); err != nil {
 		return err
@@ -282,6 +294,7 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 	update.ID = normalizedID
 	apiTypeProvided := strings.TrimSpace(update.APIType) != ""
 	purchaseSourceProvided := strings.TrimSpace(update.PurchaseSource) != ""
+	apiTokenProvided := strings.TrimSpace(update.APIToken) != ""
 	if err := normalizeSupplierProvider(&update, false); err != nil {
 		return SupplierProvider{}, err
 	}
@@ -308,8 +321,13 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 		if err := validateSupplierPurchaseSource(update.APIType, update.PurchaseSource); err != nil {
 			return SupplierProvider{}, err
 		}
+		connectionChanged := update.APIType != EffectiveSupplierAPIType(previous.APIType) ||
+			update.BaseURL != previous.BaseURL || (apiTokenProvided && update.APIToken != previous.APIToken)
 		if update.APIToken == "" {
 			update.APIToken = previous.APIToken
+		}
+		if update.WebhookSecret == "" && !connectionChanged {
+			update.WebhookSecret = previous.WebhookSecret
 		}
 		if update.APIToken == "" {
 			return SupplierProvider{}, errors.New("apiToken is required")
@@ -322,6 +340,39 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 		return update, nil
 	}
 	return SupplierProvider{}, ErrSupplierNotFound
+}
+
+// UpdateSupplierWebhookSecret persists the signing secret returned by a
+// supplier's webhook configuration endpoint without exposing it through the
+// admin API or rewriting unrelated provider settings.
+func UpdateSupplierWebhookSecret(id, secret string) error {
+	normalizedID, err := NormalizeSupplierID(id)
+	if err != nil {
+		return err
+	}
+	secret = strings.TrimSpace(secret)
+	if len(secret) != 64 {
+		return errors.New("webhook secret must be a 64-character hexadecimal string")
+	}
+	if _, err := hex.DecodeString(secret); err != nil {
+		return errors.New("webhook secret must be a 64-character hexadecimal string")
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.SupplierIntegration.Providers {
+		if cfg.SupplierIntegration.Providers[i].ID != normalizedID {
+			continue
+		}
+		previous := cfg.SupplierIntegration.Providers[i]
+		cfg.SupplierIntegration.Providers[i].WebhookSecret = secret
+		cfg.SupplierIntegration.Providers[i].UpdatedAt = time.Now().Unix()
+		if err := saveLocked(); err != nil {
+			cfg.SupplierIntegration.Providers[i] = previous
+			return err
+		}
+		return nil
+	}
+	return ErrSupplierNotFound
 }
 
 func SortedEnabledSupplierProviders(preferredID string) []SupplierProvider {

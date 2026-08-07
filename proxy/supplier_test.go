@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,9 +41,124 @@ type fakeSupplierAPI struct {
 	purchaseBatches []string
 	stockCallCh     chan struct{}
 	setWebhookURL   string
+	webhookSecret   string
 	setWebhookErr   error
 	webhookTestErr  error
 	webhookTests    int
+}
+
+func TestKiroDropSupplierAPIContract(t *testing.T) {
+	const webhookSecret = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+	var purchaseBody map[string]any
+	var webhookMethod string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "usr-contract" {
+			t.Errorf("X-API-Key = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("unexpected Authorization = %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/my/profile":
+			json.NewEncoder(w).Encode(map[string]any{
+				"name": "drop@example.com", "quota": "2000.000000", "remaining": "884.400000", "used_quota": "1115.600000",
+			})
+		case "/api/me/stock":
+			switch r.URL.Query().Get("region") {
+			case "us":
+				json.NewEncoder(w).Encode(map[string]any{"region": "us-east-1", "stock": 12, "price": "30.00", "balance": "884.40"})
+			case "eu":
+				json.NewEncoder(w).Encode(map[string]any{"region": "eu-central-1", "stock": 3, "price": "25.00", "balance": "884.40"})
+			default:
+				t.Errorf("unexpected stock region %q", r.URL.Query().Get("region"))
+			}
+		case "/api/my/purchase":
+			if err := json.NewDecoder(r.Body).Decode(&purchaseBody); err != nil {
+				t.Errorf("decode purchase: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"client_order_id": "0123456789abcdef0123456789abcdef", "order_id": "store_order_1",
+				"region": "us-east-1", "purchased": 2, "remaining": "824.400000", "status": "completed",
+				"refunded_amount_cny": "0.000000", "keys": []map[string]any{
+					{"key": "ksk_drop_one", "region": "us-east-1"}, {"key": "ksk_drop_two", "region": "us-east-1"},
+				},
+			})
+		case "/api/my/webhook":
+			webhookMethod = r.Method
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode webhook body: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"ok": "true", "webhook_url": body["webhook_url"], "webhook_secret": webhookSecret,
+			})
+		case "/api/my/webhook/test":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, fmt.Sprintf("unexpected path %s", r.URL.Path), http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	api := newHTTPSupplierAPI(config.SupplierProvider{
+		BaseURL: server.URL, APIToken: "usr-contract", APIType: config.SupplierAPITypeKiroDrop,
+	})
+	profile, err := api.GetProfile()
+	if err != nil || profile.User.Name != "drop@example.com" || profile.User.Balance != 884.4 {
+		t.Fatalf("GetProfile = %+v, %v", profile, err)
+	}
+	stock, err := api.GetStock()
+	if err != nil || stock.Stock != 15 || stock.StockUS != 12 || stock.StockEU != 3 || stock.Balance != 884.4 || stock.PriceMin != 25 || stock.PriceMax != 30 {
+		t.Fatalf("GetStock = %+v, %v", stock, err)
+	}
+	if _, err := api.GetKeys(false, 1, 50); !errors.Is(err, errSupplierOperationUnsupported) {
+		t.Fatalf("GetKeys error = %v", err)
+	}
+	purchase, err := api.Purchase(supplierPurchaseRequest{
+		Count: 2, Region: "us", ClientOrderID: "0123456789abcdef0123456789abcdef", SupplierOrderID: "batch_us_1",
+	})
+	if err != nil || purchase.Purchased != 2 || purchase.OrderID != "store_order_1" || purchase.Remaining != "824.400000" {
+		t.Fatalf("Purchase = %+v, %v", purchase, err)
+	}
+	if purchaseBody["count"] != float64(2) || purchaseBody["region"] != "us" || purchaseBody["order_id"] != "batch_us_1" ||
+		purchaseBody["client_order_id"] != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("purchase body = %#v", purchaseBody)
+	}
+	secret, err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/kiro-drop")
+	if err != nil || secret != webhookSecret || webhookMethod != http.MethodPut {
+		t.Fatalf("SetWebhook secret=%q method=%q err=%v", secret, webhookMethod, err)
+	}
+	if err := api.TestWebhook(); err != nil {
+		t.Fatalf("TestWebhook: %v", err)
+	}
+}
+
+func TestKiroDropPurchaseRejectsWrongRegionAndRefundedReplay(t *testing.T) {
+	request := supplierPurchaseRequest{Count: 1, Region: "us", ClientOrderID: "0123456789abcdef0123456789abcdef"}
+	tests := []struct {
+		name          string
+		response      map[string]any
+		wantRetryable bool
+	}{
+		{name: "wrong response region", wantRetryable: true, response: map[string]any{
+			"client_order_id": request.ClientOrderID, "order_id": "store_1", "region": "eu-central-1", "status": "completed", "purchased": 1,
+			"keys": []map[string]any{{"key": "ksk_wrong_region", "region": "eu-central-1"}},
+		}},
+		{name: "refunded replay", response: map[string]any{
+			"client_order_id": request.ClientOrderID, "order_id": "store_2", "region": "us-east-1", "status": "refunded", "purchased": 1,
+			"keys": []map[string]any{{"key": "ksk_refunded", "region": "us-east-1"}},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(tt.response) }))
+			defer server.Close()
+			api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "usr-secret", APIType: config.SupplierAPITypeKiroDrop})
+			if _, err := api.Purchase(request); err == nil || isRetryableSupplierError(err) != tt.wantRetryable {
+				t.Fatalf("unsafe response error=%v retryable=%v, want %v", err, isRetryableSupplierError(err), tt.wantRetryable)
+			}
+		})
+	}
 }
 
 func (f *fakeSupplierAPI) GetStock() (supplierStock, error) {
@@ -98,11 +216,11 @@ func (f *fakeSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 	return f.purchase, f.purchaseErr
 }
 
-func (f *fakeSupplierAPI) SetWebhook(webhookURL string) error {
+func (f *fakeSupplierAPI) SetWebhook(webhookURL string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setWebhookURL = webhookURL
-	return f.setWebhookErr
+	return f.webhookSecret, f.setWebhookErr
 }
 
 func (f *fakeSupplierAPI) TestWebhook() error {
@@ -403,6 +521,32 @@ func TestAutomaticPurchaseRequiresZeroLiveKeysAndUsesUS(t *testing.T) {
 	}
 	if len(fake.purchaseRegions) != 1 || fake.purchaseRegions[0] != "us" {
 		t.Fatalf("purchase regions = %#v", fake.purchaseRegions)
+	}
+}
+
+func TestKiroDropManualPurchaseSupportsEUAndImportsRegionalKey(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "drop-eu-order", Region: "eu-central-1", Status: "completed", Remaining: "70.00",
+		Keys: []supplierKey{{Key: "ksk_drop_eu", Region: "eu-central-1"}},
+	}}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroDrop
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	outcome, err := manager.startPurchase(updated, 1, "eu", true, "manual")
+	if err != nil {
+		t.Fatalf("Kiro Drop EU purchase: %v", err)
+	}
+	accounts := config.GetAccounts()
+	if outcome.Batch.Region != "eu" || len(accounts) != 1 || accounts[0].Region != "eu-central-1" {
+		t.Fatalf("outcome=%+v accounts=%+v", outcome.Batch, accounts)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.purchaseRegions) != 1 || fake.purchaseRegions[0] != "eu" {
+		t.Fatalf("purchase regions=%#v", fake.purchaseRegions)
 	}
 }
 
@@ -901,6 +1045,163 @@ func TestAWSMyWebhookSetupUsesOnlyThePermanentProviderPath(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.setWebhookURL != webhookURL || fake.webhookTests != 1 {
 		t.Fatalf("webhook setup url=%q tests=%d", fake.setWebhookURL, fake.webhookTests)
+	}
+}
+
+func TestKiroDropWebhookSetupPersistsSigningSecretBeforeTesting(t *testing.T) {
+	const secret = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+	fake := &fakeSupplierAPI{webhookSecret: secret}
+	h, _, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroDrop
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	webhookURL := "https://kiro.example/api/supplier-webhooks/" + updated.ID
+	rec := httptest.NewRecorder()
+	h.apiSetupSupplierWebhook(rec, httptest.NewRequest(http.MethodPost, "/admin/api/suppliers/vendor-a/webhook/setup", strings.NewReader(`{"webhookUrl":"`+webhookURL+`"}`)), updated.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("setup status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	stored := config.GetSupplierProvider(updated.ID)
+	if stored == nil || stored.WebhookSecret != secret {
+		t.Fatalf("stored provider = %+v", stored)
+	}
+	overview := httptest.NewRecorder()
+	h.apiGetSupplierOverview(overview, httptest.NewRequest(http.MethodGet, "/admin/api/suppliers/overview", nil))
+	if strings.Contains(overview.Body.String(), secret) || !strings.Contains(overview.Body.String(), `"hasWebhookSecret":true`) {
+		t.Fatalf("overview leaked or omitted signing-secret state: %s", overview.Body.String())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.setWebhookURL != webhookURL || fake.webhookTests != 1 {
+		t.Fatalf("webhook url=%q tests=%d", fake.setWebhookURL, fake.webhookTests)
+	}
+}
+
+func signedKiroDropWebhookRequest(path, body, secret string, timestamp int64) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	var envelope struct {
+		EventID string `json:"event_id"`
+	}
+	_ = json.Unmarshal([]byte(body), &envelope)
+	timestampText := fmt.Sprintf("%d", timestamp)
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(timestampText + "." + body))
+	req.Header.Set("X-Kiro-Event-Id", envelope.EventID)
+	req.Header.Set("X-Kiro-Timestamp", timestampText)
+	req.Header.Set("X-Kiro-Signature", "v1="+hex.EncodeToString(mac.Sum(nil)))
+	return req
+}
+
+func TestKiroDropWebhookVerifiesSignatureAndAcceptsSingleAndDualEvents(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	fake := &fakeSupplierAPI{}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroDrop
+	provider.WebhookSecret = secret
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	originalNow := supplierNow
+	defer func() { supplierNow = originalNow }()
+	supplierNow = func() time.Time { return time.Unix(1_800_000_000, 0) }
+	path := "/api/supplier-webhooks/" + provider.ID
+
+	testBody := `{"event":"test","event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","message":"Webhook test"}`
+	testRec := httptest.NewRecorder()
+	h.ServeHTTP(testRec, signedKiroDropWebhookRequest(path, testBody, secret, supplierNow().Unix()))
+	if testRec.Code != http.StatusOK || strings.TrimSpace(testRec.Body.String()) != `{"ok":"true"}` {
+		t.Fatalf("test status=%d body=%s", testRec.Code, testRec.Body.String())
+	}
+	if len(manager.store.state.Events) != 0 || len(manager.wake) != 0 {
+		t.Fatalf("test event changed state: events=%d wake=%d", len(manager.store.state.Events), len(manager.wake))
+	}
+
+	single := `{"event":"new_keys_available","event_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","purchase_order_id":"11111111111111111111111111111111","order_id":"batch_us_1","region":"us-east-1","new_keys":10}`
+	singleRec := httptest.NewRecorder()
+	h.ServeHTTP(singleRec, signedKiroDropWebhookRequest(path, single, secret, supplierNow().Unix()))
+	if singleRec.Code != http.StatusOK || !strings.Contains(singleRec.Body.String(), `"queued":true`) {
+		t.Fatalf("single status=%d body=%s", singleRec.Code, singleRec.Body.String())
+	}
+
+	dual := `{"event":"new_keys_available","event_id":"cccccccccccccccccccccccccccccccc","dispatch_id":"monitor_auto_1","region":"dual","regions":["us-east-1","eu-central-1"],"new_keys":22,"new_keys_by_region":{"us-east-1":10,"eu-central-1":12},"batch_ids_by_region":{"us-east-1":["batch_us_1"],"eu-central-1":["batch_eu_1"]},"purchase_order_ids_by_region":{"us-east-1":"22222222222222222222222222222222","eu-central-1":"33333333333333333333333333333333"}}`
+	dualRec := httptest.NewRecorder()
+	h.ServeHTTP(dualRec, signedKiroDropWebhookRequest(path, dual, secret, supplierNow().Unix()))
+	if dualRec.Code != http.StatusOK || !strings.Contains(dualRec.Body.String(), `"accepted":true`) {
+		t.Fatalf("dual status=%d body=%s", dualRec.Code, dualRec.Body.String())
+	}
+	if len(manager.store.state.Events) != 2 {
+		t.Fatalf("stored events=%d, want 2", len(manager.store.state.Events))
+	}
+
+	unsigned := httptest.NewRecorder()
+	h.ServeHTTP(unsigned, httptest.NewRequest(http.MethodPost, path, strings.NewReader(single)))
+	if unsigned.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned status=%d body=%s", unsigned.Code, unsigned.Body.String())
+	}
+	staleBody := strings.Replace(single, strings.Repeat("b", 32), strings.Repeat("d", 32), 1)
+	stale := httptest.NewRecorder()
+	h.ServeHTTP(stale, signedKiroDropWebhookRequest(path, staleBody, secret, supplierNow().Unix()-301))
+	if stale.Code != http.StatusUnauthorized {
+		t.Fatalf("stale status=%d body=%s", stale.Code, stale.Body.String())
+	}
+	tamperedBody := strings.Replace(single, strings.Repeat("b", 32), strings.Repeat("e", 32), 1)
+	tampered := signedKiroDropWebhookRequest(path, tamperedBody, secret, supplierNow().Unix())
+	tampered.Header.Set("X-Kiro-Event-Id", strings.Repeat("f", 32))
+	tamperedRec := httptest.NewRecorder()
+	h.ServeHTTP(tamperedRec, tampered)
+	if tamperedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("mismatched event ID status=%d body=%s", tamperedRec.Code, tamperedRec.Body.String())
+	}
+}
+
+func TestKiroDropUsesLocalImportedKeysWithoutRemoteHistoryAPI(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		stock:   supplierStock{Stock: 2, StockUS: 2, Balance: 100},
+		keysErr: errSupplierOperationUnsupported,
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "drop-order", Region: "us-east-1", Status: "completed", Remaining: "70.00",
+			Keys: []supplierKey{{Key: "ksk_drop_local", Region: "us-east-1"}},
+		},
+	}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroDrop
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	if _, err := manager.startPurchase(provider, 1, "us", true, "manual"); err != nil {
+		t.Fatalf("startPurchase: %v", err)
+	}
+	fake.mu.Lock()
+	fake.purchase = supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "drop-order-copy", Region: "us-east-1", Status: "completed", Remaining: "40.00",
+		Keys: []supplierKey{{Key: "ksk_drop_copy_only", Region: "us-east-1"}},
+	}
+	fake.mu.Unlock()
+	if _, err := manager.startPurchase(provider, 1, "us", false, "manual"); err != nil {
+		t.Fatalf("copy-only startPurchase: %v", err)
+	}
+	if _, err := manager.refreshProviderStatus(provider, true); err != nil {
+		t.Fatalf("refreshProviderStatus: %v", err)
+	}
+	status := manager.store.providerStatuses()[provider.ID]
+	if status.KeyCount != 2 {
+		t.Fatalf("local key count=%d", status.KeyCount)
+	}
+	rec := httptest.NewRecorder()
+	h.apiGetSupplierKeys(rec, httptest.NewRequest(http.MethodGet, "/admin/api/suppliers/vendor-a/keys?page=1&page_size=50", nil), provider.ID)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ksk_drop_local") || !strings.Contains(rec.Body.String(), "ksk_drop_copy_only") {
+		t.Fatalf("local keys status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	overview := httptest.NewRecorder()
+	h.apiGetSupplierOverview(overview, httptest.NewRequest(http.MethodGet, "/admin/api/suppliers/overview", nil))
+	if overview.Code != http.StatusOK || strings.Contains(overview.Body.String(), "ksk_drop_local") || strings.Contains(overview.Body.String(), "ksk_drop_copy_only") {
+		t.Fatalf("overview exposed persisted purchase keys: %s", overview.Body.String())
 	}
 }
 
@@ -1493,7 +1794,7 @@ func TestAWSMySupplierAPIContract(t *testing.T) {
 		publicPurchaseBody["client_order_id"] != "fedcba9876543210fedcba9876543210" {
 		t.Fatalf("public purchase body = %#v", publicPurchaseBody)
 	}
-	if err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/aws-vendor"); err != nil {
+	if _, err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/aws-vendor"); err != nil {
 		t.Fatalf("SetWebhook: %v", err)
 	}
 	if err := api.TestWebhook(); err != nil {
@@ -1605,7 +1906,7 @@ func TestAWSMyWebhookManagementRequiresPositiveConfirmation(t *testing.T) {
 	}))
 	defer server.Close()
 	api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeAWSMy})
-	if err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/vendor"); err == nil {
+	if _, err := api.SetWebhook("https://kiro.example/api/supplier-webhooks/vendor"); err == nil {
 		t.Fatal("mismatched webhook confirmation was accepted")
 	}
 	if err := api.TestWebhook(); err == nil {
