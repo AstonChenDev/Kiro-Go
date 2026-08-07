@@ -21,6 +21,11 @@ const (
 	supplierPurchaseRegionUS = "us"
 )
 
+var (
+	errSupplierPurchaseInFlight      = errors.New("another supplier purchase is awaiting an idempotent retry")
+	errSupplierAutoPurchaseNotNeeded = errors.New("automatic supplier purchase is no longer needed")
+)
+
 type supplierWake struct {
 	ProviderID string
 }
@@ -204,9 +209,26 @@ func liveAPIKeyCount() int {
 	return count
 }
 
+// liveSupplierAPIKeyCount is the automatic-replenishment authority. A key only
+// keeps its own supplier supplied: manual keys and keys imported from another
+// supplier must not prevent an empty supplier from replenishing its local pool.
+func liveSupplierAPIKeyCount(providerID string) int {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return 0
+	}
+	count := 0
+	for _, account := range config.GetAccounts() {
+		if account.SupplierID == providerID && account.Enabled && config.IsAPIKeyAccount(&account) {
+			count++
+		}
+	}
+	return count
+}
+
 func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 	integration := config.GetSupplierIntegration()
-	if !integration.Enabled || !integration.AutoPurchaseEnabled || liveAPIKeyCount() != 0 {
+	if !integration.Enabled || !integration.AutoPurchaseEnabled {
 		return
 	}
 	if len(m.store.pendingIntents()) != 0 {
@@ -214,6 +236,9 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 	}
 	providers := config.SortedEnabledSupplierProviders(preferredProviderID)
 	for _, provider := range providers {
+		if liveSupplierAPIKeyCount(provider.ID) != 0 {
+			continue
+		}
 		if m.autoPurchaseBlocked(provider.ID) {
 			continue
 		}
@@ -227,8 +252,11 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 			}
 			continue
 		}
-		if liveAPIKeyCount() != 0 {
-			return
+		// A webhook, a manual import, or another automatic check may have added
+		// a key while the stock request was in flight. Re-check this supplier,
+		// rather than the global account pool, before any purchase is created.
+		if liveSupplierAPIKeyCount(provider.ID) != 0 {
+			continue
 		}
 		if stock.StockUS <= 0 {
 			continue
@@ -242,6 +270,12 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 		}
 		outcome, err := m.startPurchase(provider, count, supplierPurchaseRegionUS, true, "auto")
 		if err != nil {
+			if errors.Is(err, errSupplierAutoPurchaseNotNeeded) {
+				continue
+			}
+			if errors.Is(err, errSupplierPurchaseInFlight) {
+				return
+			}
 			logger.Warnf("[Supplier] automatic purchase failed for %s: %v", provider.ID, err)
 			// Public inventory is shared with other merchants. A batch changing
 			// between the stock GET and atomic POST is expected contention, not a
@@ -271,7 +305,8 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 				continue
 			}
 			logger.Infof("[Supplier] automatically purchased %d US key(s) from %s and imported %d", outcome.Response.Purchased, provider.ID, outcome.Batch.Imported)
-			return
+			// Each supplier owns an independent local pool. Continue so another
+			// enabled supplier that is also empty can replenish in this same pass.
 		}
 	}
 }
@@ -500,7 +535,15 @@ func (m *supplierManager) startPurchaseFromBatch(provider config.SupplierProvide
 	m.workflowMu.Lock()
 	defer m.workflowMu.Unlock()
 	if len(m.store.pendingIntents()) != 0 {
-		return supplierPurchaseOutcome{}, errors.New("another supplier purchase is awaiting an idempotent retry")
+		return supplierPurchaseOutcome{}, errSupplierPurchaseInFlight
+	}
+	if trigger == "auto" {
+		integration := config.GetSupplierIntegration()
+		currentProvider := config.GetSupplierProvider(provider.ID)
+		if !integration.Enabled || !integration.AutoPurchaseEnabled || currentProvider == nil || !currentProvider.Enabled ||
+			*currentProvider != provider || liveSupplierAPIKeyCount(provider.ID) != 0 {
+			return supplierPurchaseOutcome{}, errSupplierAutoPurchaseNotNeeded
+		}
 	}
 	if count < 1 || count > config.MaxSupplierPurchaseCount {
 		return supplierPurchaseOutcome{}, fmt.Errorf("count must be between 1 and %d", config.MaxSupplierPurchaseCount)

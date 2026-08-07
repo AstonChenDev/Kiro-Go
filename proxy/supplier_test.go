@@ -742,6 +742,161 @@ func TestOAuthAccountDoesNotPreventAutomaticAPIKeyReplenishment(t *testing.T) {
 	}
 }
 
+func TestAutomaticPurchaseUsesEachSupplierLocalLiveCount(t *testing.T) {
+	primary := &fakeSupplierAPI{
+		stock: supplierStock{StockUS: 5, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "primary-should-not-run",
+			Keys: []supplierKey{{Key: "ksk_primary_should_not_run"}},
+		},
+	}
+	secondary := &fakeSupplierAPI{
+		stock: supplierStock{StockUS: 1, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "secondary-local-replenishment",
+			Keys: []supplierKey{{Key: "ksk_secondary_local_replenishment"}},
+		},
+	}
+	_, manager, primaryProvider := newSupplierTestManager(t, primary)
+	secondaryProvider, err := config.AddSupplierProvider(config.SupplierProvider{
+		ID: "vendor-b", Name: "Vendor B", BaseURL: "https://vendor-b.example", APIToken: "km_b",
+		Enabled: true, Priority: 2, AutoPurchaseCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("AddSupplierProvider vendor-b: %v", err)
+	}
+	if added, skipped, err := config.AddAccounts([]config.Account{
+		{ID: "primary-live", AuthMethod: "api_key", KiroApiKey: "ksk_primary_live", SupplierID: primaryProvider.ID, Enabled: true},
+		{ID: "secondary-dead", AuthMethod: "api_key", KiroApiKey: "ksk_secondary_dead", SupplierID: secondaryProvider.ID, Enabled: false},
+		{ID: "manual-live", AuthMethod: "api_key", KiroApiKey: "ksk_manual_live", Enabled: true},
+	}); err != nil || added != 3 || skipped != 0 {
+		t.Fatalf("AddAccounts added=%d skipped=%d err=%v", added, skipped, err)
+	}
+	manager.handler.pool.Reload()
+	manager.apiFactory = func(provider config.SupplierProvider) supplierAPI {
+		if provider.ID == secondaryProvider.ID {
+			return secondary
+		}
+		return primary
+	}
+
+	if liveAPIKeyCount() != 2 || liveSupplierAPIKeyCount(primaryProvider.ID) != 1 || liveSupplierAPIKeyCount(secondaryProvider.ID) != 0 {
+		t.Fatalf("unexpected initial liveness: global=%d primary=%d secondary=%d",
+			liveAPIKeyCount(), liveSupplierAPIKeyCount(primaryProvider.ID), liveSupplierAPIKeyCount(secondaryProvider.ID))
+	}
+	manager.maybeAutoPurchase(secondaryProvider.ID)
+
+	primary.mu.Lock()
+	primaryCalls := primary.purchaseCalls
+	primary.mu.Unlock()
+	secondary.mu.Lock()
+	secondaryCalls := secondary.purchaseCalls
+	secondary.mu.Unlock()
+	if primaryCalls != 0 || secondaryCalls != 1 {
+		t.Fatalf("supplier-scoped purchase calls: primary=%d secondary=%d", primaryCalls, secondaryCalls)
+	}
+	if liveSupplierAPIKeyCount(primaryProvider.ID) != 1 || liveSupplierAPIKeyCount(secondaryProvider.ID) != 1 || liveAPIKeyCount() != 3 {
+		t.Fatalf("unexpected replenished liveness: global=%d primary=%d secondary=%d",
+			liveAPIKeyCount(), liveSupplierAPIKeyCount(primaryProvider.ID), liveSupplierAPIKeyCount(secondaryProvider.ID))
+	}
+
+	// The final in-lock guard must also refuse a stale automatic decision if a
+	// caller already has a provider snapshot but that supplier now has a key.
+	if _, err := manager.startPurchase(primaryProvider, 1, supplierPurchaseRegionUS, true, "auto"); !errors.Is(err, errSupplierAutoPurchaseNotNeeded) {
+		t.Fatalf("stale automatic purchase error = %v, want not-needed guard", err)
+	}
+}
+
+func TestAutomaticPurchaseReplenishesAllEmptySuppliersInOnePass(t *testing.T) {
+	primary := &fakeSupplierAPI{
+		stock: supplierStock{StockUS: 1, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "primary-independent-order",
+			Keys: []supplierKey{{Key: "ksk_primary_independent"}},
+		},
+	}
+	secondary := &fakeSupplierAPI{
+		stock: supplierStock{StockUS: 1, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "secondary-independent-order",
+			Keys: []supplierKey{{Key: "ksk_secondary_independent"}},
+		},
+	}
+	_, manager, primaryProvider := newSupplierTestManager(t, primary)
+	secondaryProvider, err := config.AddSupplierProvider(config.SupplierProvider{
+		ID: "vendor-b", Name: "Vendor B", BaseURL: "https://vendor-b.example", APIToken: "km_b",
+		Enabled: true, Priority: 2, AutoPurchaseCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("AddSupplierProvider vendor-b: %v", err)
+	}
+	manager.apiFactory = func(provider config.SupplierProvider) supplierAPI {
+		if provider.ID == secondaryProvider.ID {
+			return secondary
+		}
+		return primary
+	}
+
+	manager.maybeAutoPurchase(secondaryProvider.ID)
+	manager.maybeAutoPurchase("")
+
+	primary.mu.Lock()
+	primaryCalls, primaryRegion := primary.purchaseCalls, append([]string(nil), primary.purchaseRegions...)
+	primary.mu.Unlock()
+	secondary.mu.Lock()
+	secondaryCalls, secondaryRegion := secondary.purchaseCalls, append([]string(nil), secondary.purchaseRegions...)
+	secondary.mu.Unlock()
+	if primaryCalls != 1 || secondaryCalls != 1 {
+		t.Fatalf("independent purchase calls: primary=%d secondary=%d", primaryCalls, secondaryCalls)
+	}
+	if len(primaryRegion) != 1 || primaryRegion[0] != supplierPurchaseRegionUS || len(secondaryRegion) != 1 || secondaryRegion[0] != supplierPurchaseRegionUS {
+		t.Fatalf("automatic regions: primary=%#v secondary=%#v", primaryRegion, secondaryRegion)
+	}
+	if liveSupplierAPIKeyCount(primaryProvider.ID) != 1 || liveSupplierAPIKeyCount(secondaryProvider.ID) != 1 {
+		t.Fatalf("independent live counts: primary=%d secondary=%d",
+			liveSupplierAPIKeyCount(primaryProvider.ID), liveSupplierAPIKeyCount(secondaryProvider.ID))
+	}
+}
+
+func TestAmbiguousAutomaticPurchaseStopsOtherSuppliersUntilResolved(t *testing.T) {
+	primary := &fakeSupplierAPI{
+		stock:       supplierStock{StockUS: 1, Balance: 100},
+		purchaseErr: errors.New("connection reset after request write"),
+	}
+	secondary := &fakeSupplierAPI{
+		stock: supplierStock{StockUS: 1, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "must-wait-for-primary",
+			Keys: []supplierKey{{Key: "ksk_must_wait_for_primary"}},
+		},
+	}
+	_, manager, _ := newSupplierTestManager(t, primary)
+	secondaryProvider, err := config.AddSupplierProvider(config.SupplierProvider{
+		ID: "vendor-b", Name: "Vendor B", BaseURL: "https://vendor-b.example", APIToken: "km_b",
+		Enabled: true, Priority: 2, AutoPurchaseCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("AddSupplierProvider vendor-b: %v", err)
+	}
+	manager.apiFactory = func(provider config.SupplierProvider) supplierAPI {
+		if provider.ID == secondaryProvider.ID {
+			return secondary
+		}
+		return primary
+	}
+
+	manager.maybeAutoPurchase("vendor-a")
+	primary.mu.Lock()
+	primaryCalls := primary.purchaseCalls
+	primary.mu.Unlock()
+	secondary.mu.Lock()
+	secondaryCalls := secondary.purchaseCalls
+	secondary.mu.Unlock()
+	if primaryCalls != 1 || secondaryCalls != 0 || len(manager.store.pendingIntents()) != 1 {
+		t.Fatalf("ambiguous purchase safety: primary=%d secondary=%d pending=%d", primaryCalls, secondaryCalls, len(manager.store.pendingIntents()))
+	}
+}
+
 func TestAutomaticPurchaseFallsThroughCompatibleSuppliers(t *testing.T) {
 	primary := &fakeSupplierAPI{stock: supplierStock{StockUS: 0, Balance: 100}}
 	secondary := &fakeSupplierAPI{
