@@ -378,6 +378,10 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		Enabled:     true,
 		AccessToken: "token-test",
 		ProfileArn:  "arn:aws:codewhisperer:profile/test",
+		// This helper is reused by many request-level tests in the same process.
+		// Keep its synthetic account from tripping the production default RPM
+		// limiter and making later tests order-dependent.
+		MaxRPM: 1000,
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}

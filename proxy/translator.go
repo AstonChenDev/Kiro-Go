@@ -38,10 +38,6 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
-// Thinking 模式提示
-const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
-
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -1075,13 +1071,14 @@ func mapOpenAIFinishReason(reason string, toolCount int) string {
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []OpenAIMessage `json:"messages"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	TopP            float64         `json:"top_p,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	Tools           []OpenAITool    `json:"tools,omitempty"`
+	ReasoningEffort *string         `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1181,6 +1178,10 @@ type OpenAIUsage struct {
 // ==================== OpenAI -> Kiro 转换 ====================
 
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+	return openAIToKiroWithThinkingMode(req, defaultOpenAIThinkingMode(thinking))
+}
+
+func openAIToKiroWithThinkingMode(req *OpenAIRequest, mode openAIThinkingMode) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -1199,8 +1200,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+	if mode.Enabled {
+		systemPrompt = thinkingModePrompt(mode.MaxThinkingLength) + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息

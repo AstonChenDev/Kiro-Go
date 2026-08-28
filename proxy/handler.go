@@ -1901,17 +1901,21 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinkingMode, err := resolveOpenAIThinkingMode(req.Model, req.ReasoningEffort, "reasoning_effort", thinkingCfg.Suffix)
+	if err != nil {
+		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
+		return
+	}
 	req.Model = actualModel
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	estimatedInputTokens := estimateOpenAIRequestInputTokensWithThinking(&req, thinkingMode)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	kiroPayload := openAIToKiroWithThinkingMode(&req, thinkingMode)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinkingMode.Enabled, estimatedInputTokens, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinkingMode.Enabled, estimatedInputTokens, apiKeyID)
 	}
 }
 

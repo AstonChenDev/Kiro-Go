@@ -115,6 +115,32 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
 
+The OpenAI-compatible endpoints also accept the standard parameters, without changing the model name:
+
+`POST /v1/chat/completions`:
+
+```json
+{
+  "model": "claude-sonnet-4.5",
+  "reasoning_effort": "high",
+  "messages": [{"role": "user", "content": "Solve this problem"}]
+}
+```
+
+`POST /v1/responses`:
+
+```json
+{
+  "model": "claude-sonnet-4.5",
+  "reasoning": {"effort": "high", "summary": "auto"},
+  "input": "Solve this problem"
+}
+```
+
+Supported effort values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. The proxy currently maps them to Kiro soft thinking budgets: `none` disables thinking; the remaining levels map to `256`, `1024`, `4096`, `16384`, `65536`, and `200000`. This value is sent through `<max_thinking_length>` as an upstream prompt-protocol hint; it is not guaranteed to be an exact token or character limit.
+
+An explicit OpenAI parameter takes precedence over the `-thinking` suffix, so `reasoning_effort: "none"` or `reasoning.effort: "none"` disables thinking even for a suffixed model. Omitting the standard parameter preserves the legacy suffix behavior. A Responses `reasoning` object without `effort` currently defaults to `medium`; `summary` accepts `auto`, `concise`, or `detailed` (the deprecated `generate_summary` field is also accepted).
+
 ## Outbound Proxy
 
 For users in restricted network regions, configure an outbound proxy in the admin panel under **Settings - Outbound Proxy Settings**. Supports SOCKS5 and HTTP proxies.

@@ -111,21 +111,25 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinkingMode, err := resolveResponsesThinkingMode(req.Model, req.Reasoning, thinkingCfg.Suffix)
+	if err != nil {
+		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
+		return
+	}
 	openaiReq.Model = actualModel
 
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	estimatedInputTokens := estimateOpenAIRequestInputTokensWithThinking(openaiReq, thinkingMode)
+	kiroPayload := openAIToKiroWithThinkingMode(openaiReq, thinkingMode)
 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinkingMode.Enabled, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinkingMode.Enabled, estimatedInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse)
 }
 
@@ -225,8 +229,10 @@ func (h *Handler) handleResponsesNonStream(
 			continue
 		}
 
-		finalContent, _ := extractThinkingFromContent(content)
-		if !thinking {
+		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		if thinking && reasoningContent == "" && extractedReasoning != "" {
+			reasoningContent = extractedReasoning
+		} else if !thinking {
 			reasoningContent = ""
 		}
 
@@ -242,7 +248,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
+		respObj := buildResponsesObject(respID, model, finalContent, reasoningContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 		respObj.OwnerKeyID = apiKeyID
@@ -278,10 +284,26 @@ func mapResponsesCompletion(reason string) (status, incompleteReason string) {
 }
 
 func buildResponsesObject(
-	id, model, content string, toolUses []KiroToolUse,
+	id, model, content, reasoningContent string, toolUses []KiroToolUse,
 	inputTokens, outputTokens int, req *ResponsesRequest, upstreamStopReason string,
 ) *ResponsesObject {
-	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
+	output := make([]ResponseOutputItem, 0, 2+len(toolUses))
+
+	if strings.TrimSpace(reasoningContent) != "" {
+		item := ResponseOutputItem{
+			ID:     generateOutputItemID("rs"),
+			Type:   "reasoning",
+			Status: "completed",
+		}
+		partType := "reasoning_text"
+		if responsesReasoningSummaryMode(req.Reasoning) != "" {
+			partType = "summary_text"
+			item.Summary = []ResponseContentPart{{Type: partType, Text: reasoningContent}}
+		} else {
+			item.Content = []ResponseContentPart{{Type: partType, Text: reasoningContent}}
+		}
+		output = append(output, item)
+	}
 
 	if strings.TrimSpace(content) != "" {
 		output = append(output, ResponseOutputItem{
@@ -337,6 +359,7 @@ func buildResponsesObject(
 		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+		Reasoning:          req.Reasoning,
 		IncompleteDetails:  incompleteDetails,
 	}
 }
@@ -376,6 +399,7 @@ func (h *Handler) handleResponsesStream(
 		Usage:              ResponsesUsage{},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+		Reasoning:          req.Reasoning,
 	}
 	send("response.created", map[string]interface{}{
 		"type":     "response.created",
@@ -418,8 +442,12 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText           strings.Builder
-			reasoningText      strings.Builder
+			rawContent         strings.Builder
+			rawEventReasoning  strings.Builder
+			finalText          strings.Builder
+			finalReasoning     strings.Builder
+			currentMessageText strings.Builder
+			currentReasoning   strings.Builder
 			toolUses           []KiroToolUse
 			inputTokens        int
 			outputTokens       int
@@ -428,19 +456,129 @@ func (h *Handler) handleResponsesStream(
 			upstreamStopReason string
 		)
 
-		messageItemID := generateOutputItemID("msg")
+		messageItemID := ""
+		messageItemIndex := -1
 		messageStarted := false
+		reasoningItemID := ""
+		reasoningItemIndex := -1
+		reasoningStarted := false
 		outputIndex := 0
 		contentIndex := 0
+		summaryMode := responsesReasoningSummaryMode(req.Reasoning)
+
+		closeReasoning := func() {
+			if !reasoningStarted {
+				return
+			}
+			text := currentReasoning.String()
+			if summaryMode != "" {
+				send("response.reasoning_summary_text.done", map[string]interface{}{
+					"type":          "response.reasoning_summary_text.done",
+					"item_id":       reasoningItemID,
+					"output_index":  reasoningItemIndex,
+					"summary_index": 0,
+					"text":          text,
+				})
+				send("response.reasoning_summary_part.done", map[string]interface{}{
+					"type":          "response.reasoning_summary_part.done",
+					"item_id":       reasoningItemID,
+					"output_index":  reasoningItemIndex,
+					"summary_index": 0,
+					"part": map[string]string{
+						"type": "summary_text",
+						"text": text,
+					},
+				})
+				send("response.output_item.done", map[string]interface{}{
+					"type":         "response.output_item.done",
+					"output_index": reasoningItemIndex,
+					"item": map[string]interface{}{
+						"id":      reasoningItemID,
+						"type":    "reasoning",
+						"status":  "completed",
+						"summary": []map[string]string{{"type": "summary_text", "text": text}},
+					},
+				})
+			} else {
+				send("response.reasoning_text.done", map[string]interface{}{
+					"type":          "response.reasoning_text.done",
+					"item_id":       reasoningItemID,
+					"output_index":  reasoningItemIndex,
+					"content_index": 0,
+					"text":          text,
+				})
+				send("response.output_item.done", map[string]interface{}{
+					"type":         "response.output_item.done",
+					"output_index": reasoningItemIndex,
+					"item": map[string]interface{}{
+						"id":      reasoningItemID,
+						"type":    "reasoning",
+						"status":  "completed",
+						"content": []map[string]string{{"type": "reasoning_text", "text": text}},
+					},
+				})
+			}
+			reasoningStarted = false
+			reasoningItemID = ""
+			reasoningItemIndex = -1
+			currentReasoning.Reset()
+			outputIndex++
+		}
+
+		closeMessage := func() {
+			if !messageStarted {
+				return
+			}
+			text := currentMessageText.String()
+			send("response.output_text.done", map[string]interface{}{
+				"type":          "response.output_text.done",
+				"item_id":       messageItemID,
+				"output_index":  messageItemIndex,
+				"content_index": contentIndex,
+				"text":          text,
+			})
+			send("response.content_part.done", map[string]interface{}{
+				"type":          "response.content_part.done",
+				"item_id":       messageItemID,
+				"output_index":  messageItemIndex,
+				"content_index": contentIndex,
+				"part": map[string]interface{}{
+					"type": "output_text",
+					"text": text,
+				},
+			})
+			send("response.output_item.done", map[string]interface{}{
+				"type":         "response.output_item.done",
+				"output_index": messageItemIndex,
+				"item": map[string]interface{}{
+					"id":     messageItemID,
+					"type":   "message",
+					"role":   "assistant",
+					"status": "completed",
+					"content": []map[string]interface{}{{
+						"type": "output_text",
+						"text": text,
+					}},
+				},
+			})
+			messageStarted = false
+			messageItemID = ""
+			messageItemIndex = -1
+			currentMessageText.Reset()
+			outputIndex++
+		}
 
 		ensureMessageStarted := func() {
 			if messageStarted {
 				return
 			}
+			closeReasoning()
 			messageStarted = true
+			messageItemID = generateOutputItemID("msg")
+			messageItemIndex = outputIndex
 			send("response.output_item.added", map[string]interface{}{
 				"type":         "response.output_item.added",
-				"output_index": outputIndex,
+				"output_index": messageItemIndex,
 				"item": map[string]interface{}{
 					"id":      messageItemID,
 					"type":    "message",
@@ -452,14 +590,101 @@ func (h *Handler) handleResponsesStream(
 			send("response.content_part.added", map[string]interface{}{
 				"type":          "response.content_part.added",
 				"item_id":       messageItemID,
-				"output_index":  outputIndex,
+				"output_index":  messageItemIndex,
 				"content_index": contentIndex,
 				"part": map[string]interface{}{
 					"type": "output_text",
 					"text": "",
 				},
 			})
+			responseStarted = true
 		}
+
+		ensureReasoningStarted := func() {
+			if reasoningStarted {
+				return
+			}
+			closeMessage()
+			reasoningStarted = true
+			reasoningItemID = generateOutputItemID("rs")
+			reasoningItemIndex = outputIndex
+			item := map[string]interface{}{
+				"id":     reasoningItemID,
+				"type":   "reasoning",
+				"status": "in_progress",
+			}
+			if summaryMode != "" {
+				item["summary"] = []map[string]interface{}{}
+			} else {
+				item["content"] = []map[string]interface{}{}
+			}
+			send("response.output_item.added", map[string]interface{}{
+				"type":         "response.output_item.added",
+				"output_index": reasoningItemIndex,
+				"item":         item,
+			})
+			if summaryMode != "" {
+				send("response.reasoning_summary_part.added", map[string]interface{}{
+					"type":          "response.reasoning_summary_part.added",
+					"item_id":       reasoningItemID,
+					"output_index":  reasoningItemIndex,
+					"summary_index": 0,
+					"part": map[string]string{
+						"type": "summary_text",
+						"text": "",
+					},
+				})
+			}
+			responseStarted = true
+		}
+
+		emitSegment := func(text string, state int) {
+			if state == thinkingSegmentText {
+				if text == "" {
+					return
+				}
+				ensureMessageStarted()
+				finalText.WriteString(text)
+				currentMessageText.WriteString(text)
+				send("response.output_text.delta", map[string]interface{}{
+					"type":          "response.output_text.delta",
+					"item_id":       messageItemID,
+					"output_index":  messageItemIndex,
+					"content_index": contentIndex,
+					"delta":         text,
+				})
+				responseStarted = true
+				return
+			}
+			if !thinking {
+				return
+			}
+			ensureReasoningStarted()
+			if text != "" {
+				finalReasoning.WriteString(text)
+				currentReasoning.WriteString(text)
+				eventName := "response.reasoning_text.delta"
+				payload := map[string]interface{}{
+					"type":          eventName,
+					"item_id":       reasoningItemID,
+					"output_index":  reasoningItemIndex,
+					"content_index": 0,
+					"delta":         text,
+				}
+				if summaryMode != "" {
+					eventName = "response.reasoning_summary_text.delta"
+					payload["type"] = eventName
+					delete(payload, "content_index")
+					payload["summary_index"] = 0
+				}
+				send(eventName, payload)
+			}
+			if state == thinkingSegmentEnd {
+				closeReasoning()
+			}
+		}
+
+		streamParser := newThinkingStreamParser(thinking, emitSegment)
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -467,49 +692,16 @@ func (h *Handler) handleResponsesStream(
 					return
 				}
 				if isThinking {
-					reasoningText.WriteString(text)
-					return
+					rawEventReasoning.WriteString(text)
+				} else {
+					rawContent.WriteString(text)
 				}
-				fullText.WriteString(text)
-				ensureMessageStarted()
-				send("response.output_text.delta", map[string]interface{}{
-					"type":          "response.output_text.delta",
-					"item_id":       messageItemID,
-					"output_index":  outputIndex,
-					"content_index": contentIndex,
-					"delta":         text,
-				})
-				responseStarted = true
+				streamParser.Push(text, isThinking)
 			},
 			OnToolUse: func(tu KiroToolUse) {
-				if messageStarted {
-					send("response.content_part.done", map[string]interface{}{
-						"type":          "response.content_part.done",
-						"item_id":       messageItemID,
-						"output_index":  outputIndex,
-						"content_index": contentIndex,
-						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": fullText.String(),
-						},
-					})
-					send("response.output_item.done", map[string]interface{}{
-						"type":         "response.output_item.done",
-						"output_index": outputIndex,
-						"item": map[string]interface{}{
-							"id":     messageItemID,
-							"type":   "message",
-							"role":   "assistant",
-							"status": "completed",
-							"content": []map[string]interface{}{{
-								"type": "output_text",
-								"text": fullText.String(),
-							}},
-						},
-					})
-					messageStarted = false
-					outputIndex++
-				}
+				streamParser.Flush()
+				closeReasoning()
+				closeMessage()
 
 				toolUses = append(toolUses, tu)
 				args, _ := json.Marshal(tu.Input)
@@ -557,7 +749,7 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 		measure := func() (int, int, string, bool) {
-			return fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0
+			return rawContent.Len(), len(toolUses), upstreamStopReason, rawEventReasoning.Len() > 0
 		}
 
 		// Retries only run while responseStarted is false, i.e. before any
@@ -565,14 +757,26 @@ func (h *Handler) handleResponsesStream(
 		// content_index cursors are still untouched. Only the accumulators need
 		// clearing.
 		reset := func() {
-			fullText.Reset()
-			reasoningText.Reset()
+			rawContent.Reset()
+			rawEventReasoning.Reset()
+			finalText.Reset()
+			finalReasoning.Reset()
+			currentMessageText.Reset()
+			currentReasoning.Reset()
 			toolUses = nil
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
 			realInputTokens = 0
 			upstreamStopReason = ""
+			messageItemID = ""
+			messageItemIndex = -1
+			messageStarted = false
+			reasoningItemID = ""
+			reasoningItemIndex = -1
+			reasoningStarted = false
+			outputIndex = 0
+			streamParser.Reset()
 		}
 
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
@@ -612,37 +816,13 @@ func (h *Handler) handleResponsesStream(
 			return
 		}
 
-		finalContent, _ := extractThinkingFromContent(fullText.String())
-		reasoning := reasoningText.String()
+		streamParser.Flush()
+		closeReasoning()
+		closeMessage()
+		finalContent := finalText.String()
+		reasoning := finalReasoning.String()
 		if !thinking {
 			reasoning = ""
-		}
-
-		if messageStarted {
-			send("response.content_part.done", map[string]interface{}{
-				"type":          "response.content_part.done",
-				"item_id":       messageItemID,
-				"output_index":  outputIndex,
-				"content_index": contentIndex,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": finalContent,
-				},
-			})
-			send("response.output_item.done", map[string]interface{}{
-				"type":         "response.output_item.done",
-				"output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id":     messageItemID,
-					"type":   "message",
-					"role":   "assistant",
-					"status": "completed",
-					"content": []map[string]interface{}{{
-						"type": "output_text",
-						"text": finalContent,
-					}},
-				},
-			})
 		}
 
 		if realInputTokens > 0 {
@@ -657,7 +837,7 @@ func (h *Handler) handleResponsesStream(
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
+		respObj := buildResponsesObject(respID, model, finalContent, reasoning, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

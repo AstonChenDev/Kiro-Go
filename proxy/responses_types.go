@@ -3,17 +3,24 @@ package proxy
 import "encoding/json"
 
 type ResponsesRequest struct {
-	Model              string            `json:"model"`
-	Input              json.RawMessage   `json:"input"`
-	Instructions       string            `json:"instructions,omitempty"`
-	Stream             bool              `json:"stream,omitempty"`
-	Tools              []OpenAITool      `json:"tools,omitempty"`
-	ToolChoice         json.RawMessage   `json:"tool_choice,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty"`
-	Store              *bool             `json:"store,omitempty"`
-	Temperature        *float64          `json:"temperature,omitempty"`
-	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
-	Metadata           map[string]string `json:"metadata,omitempty"`
+	Model              string                    `json:"model"`
+	Input              json.RawMessage           `json:"input"`
+	Instructions       string                    `json:"instructions,omitempty"`
+	Stream             bool                      `json:"stream,omitempty"`
+	Tools              []OpenAITool              `json:"tools,omitempty"`
+	ToolChoice         json.RawMessage           `json:"tool_choice,omitempty"`
+	PreviousResponseID string                    `json:"previous_response_id,omitempty"`
+	Store              *bool                     `json:"store,omitempty"`
+	Temperature        *float64                  `json:"temperature,omitempty"`
+	MaxOutputTokens    *int                      `json:"max_output_tokens,omitempty"`
+	Metadata           map[string]string         `json:"metadata,omitempty"`
+	Reasoning          *ResponsesReasoningConfig `json:"reasoning,omitempty"`
+}
+
+type ResponsesReasoningConfig struct {
+	Effort          *string `json:"effort,omitempty"`
+	Summary         *string `json:"summary,omitempty"`
+	GenerateSummary *string `json:"generate_summary,omitempty"`
 }
 
 type ResponsesObject struct {
@@ -29,6 +36,7 @@ type ResponsesObject struct {
 	Error              *ResponsesError             `json:"error,omitempty"`
 	IncompleteDetails  *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
 	Instructions       string                      `json:"instructions,omitempty"`
+	Reasoning          *ResponsesReasoningConfig   `json:"reasoning,omitempty"`
 	StoredInput        json.RawMessage             `json:"-"`
 	StoredInstr        string                      `json:"-"`
 	OwnerKeyID         string                      `json:"-"` // API key that created this response (not exposed in API)
@@ -41,6 +49,7 @@ type ResponseOutputItem struct {
 	Role      string                `json:"role,omitempty"`
 	Status    string                `json:"status,omitempty"`
 	Content   []ResponseContentPart `json:"content,omitempty"`
+	Summary   []ResponseContentPart `json:"summary,omitempty"`
 	CallID    string                `json:"call_id,omitempty"`
 	Name      string                `json:"name,omitempty"`
 	Arguments string                `json:"arguments,omitempty"`

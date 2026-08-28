@@ -4,11 +4,11 @@ services:
   kiro-go:
     build: .
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
       # redirects the browser to localhost:3128. Uncomment this AND set
       # KIRO_SSO_CALLBACK_BIND=0.0.0.0 below to complete that login from a
       # browser on the host while the proxy runs in this container.
-      - "3128:3128"
+      - "127.0.0.1:3128:3128"
     volumes:
       - ./data:/app/data
     environment:

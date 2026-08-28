@@ -115,6 +115,32 @@ API Key 账号会走 Kiro CLI runtime（`https://runtime.{region}.kiro.dev/`）�
 
 在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
 
+OpenAI 兼容接口也支持标准参数，无需修改模型名：
+
+`POST /v1/chat/completions`：
+
+```json
+{
+  "model": "claude-sonnet-4.5",
+  "reasoning_effort": "high",
+  "messages": [{"role": "user", "content": "请解决这个问题"}]
+}
+```
+
+`POST /v1/responses`：
+
+```json
+{
+  "model": "claude-sonnet-4.5",
+  "reasoning": {"effort": "high", "summary": "auto"},
+  "input": "请解决这个问题"
+}
+```
+
+支持的 effort 为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。代理暂时将它们映射为 Kiro 的软思考预算：`none` 关闭，其他档位依次为 `256`、`1024`、`4096`、`16384`、`65536`、`200000`。该值会写入 `<max_thinking_length>`，是上游提示协议的软预算，不承诺精确的 token 或字符上限。
+
+显式 OpenAI 参数的优先级高于 `-thinking` 后缀，因此 `reasoning_effort: "none"` 或 `reasoning.effort: "none"` 可以关闭带后缀模型的思考。没有传标准参数时，旧后缀行为保持不变。Responses 的 `reasoning` 对象省略 `effort` 时暂按 `medium` 处理；`summary` 支持 `auto`、`concise`、`detailed`（也兼容已弃用的 `generate_summary` 字段）。
+
 ## 出站代理
 
 可在管理面板「设置 - 出站代理设置」中配置代理。支持 SOCKS5 和 HTTP 代理。
