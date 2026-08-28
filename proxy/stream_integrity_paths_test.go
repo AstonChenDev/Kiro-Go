@@ -61,6 +61,167 @@ func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 	}))
 }
 
+// oauthCompletedWithoutStopUpstream mirrors the live GitHub/social wire shape:
+// answer text followed by validated context/metering trailers, but no optional
+// metadataEvent.stopReason.
+func oauthCompletedWithoutStopUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits != nil {
+			hits.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(oauthCompletionFrames(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "complete OAuth answer",
+		}))
+	}))
+}
+
+func TestClaudeStreamAcceptsOAuthTerminalMetadataWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := oauthCompletedWithoutStopUpstream(t, &hits)
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "complete OAuth answer") || !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("expected completed Claude stream, got %s", body)
+	}
+	if strings.Contains(body, `"type":"error"`) || !strings.Contains(body, `"type":"message_stop"`) {
+		t.Fatalf("OAuth completion ended incorrectly: %s", body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth stream was retried %d times", hits.Load())
+	}
+}
+
+func TestClaudeNonStreamAcceptsOAuthTerminalMetadataWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := oauthCompletedWithoutStopUpstream(t, &hits)
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "complete OAuth answer") ||
+		!strings.Contains(rec.Body.String(), `"stop_reason":"end_turn"`) {
+		t.Fatalf("expected completed Claude response, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth response was retried %d times", hits.Load())
+	}
+}
+
+func TestOpenAIStreamAcceptsOAuthTerminalMetadataWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := oauthCompletedWithoutStopUpstream(t, &hits)
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "complete OAuth answer") || !strings.Contains(body, `"finish_reason":"stop"`) ||
+		!strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected completed OpenAI stream, got %s", body)
+	}
+	if strings.Contains(body, `"error"`) {
+		t.Fatalf("valid OAuth stream emitted an error: %s", body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth stream was retried %d times", hits.Load())
+	}
+}
+
+func TestOpenAINonStreamAcceptsOAuthTerminalMetadataWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := oauthCompletedWithoutStopUpstream(t, &hits)
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "complete OAuth answer") ||
+		!strings.Contains(rec.Body.String(), `"finish_reason":"stop"`) {
+		t.Fatalf("expected completed OpenAI response, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth response was retried %d times", hits.Load())
+	}
+}
+
+func TestResponsesStreamAcceptsOAuthTerminalMetadataWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := oauthCompletedWithoutStopUpstream(t, &hits)
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"hello",
+		"stream":true,
+		"store":false
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "complete OAuth answer") || !strings.Contains(body, "response.completed") ||
+		!strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected completed Responses stream, got %s", body)
+	}
+	if strings.Contains(body, "response.failed") {
+		t.Fatalf("valid OAuth stream was marked failed: %s", body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth stream was retried %d times", hits.Load())
+	}
+}
+
+func TestResponsesNonStreamAcceptsOAuthTerminalMetadataWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := oauthCompletedWithoutStopUpstream(t, &hits)
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"hello",
+		"store":false
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "complete OAuth answer") ||
+		!strings.Contains(body, `"status":"completed"`) {
+		t.Fatalf("expected completed Responses response, status=%d body=%s", rec.Code, body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth response was retried %d times", hits.Load())
+	}
+}
+
 // A truncated stream whose content already reached the client must end with an
 // SSE error, never with a forged end_turn that tells the client it is done.
 func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {

@@ -17,6 +17,7 @@ const tokenRefreshSkewSeconds int64 = 120
 // at errorCooldownMax, plus ±errorCooldownJitterFraction jitter so co-failing
 // accounts recover at staggered times instead of stampeding upstream together.
 const (
+	quotaErrorCooldown          = 1 * time.Minute
 	errorCooldownBase           = 1 * time.Minute
 	errorCooldownMax            = 8 * time.Minute
 	errorCooldownThreshold      = 3
@@ -53,11 +54,11 @@ type AccountPool struct {
 	accounts      []config.Account
 	totalAccounts int
 	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
-	activeSSE     map[string]int             // accountID → active SSE stream count
-	reqTimestamps map[string][]time.Time     // accountID → sliding window of request timestamps
+	cooldowns     map[string]time.Time            // 账号冷却时间
+	errorCounts   map[string]int                  // 连续错误计数
+	modelLists    map[string]map[string]bool      // accountID → set of modelIDs (from ListAvailableModels)
+	activeSSE     map[string]int                  // accountID → active SSE stream count
+	reqTimestamps map[string][]time.Time          // accountID → sliding window of request timestamps
 	runtimeStats  map[string]*accountRuntimeStats // accountID → dispatch health/load signals (health-scoring)
 }
 
@@ -208,8 +209,8 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
+		// 配额错误，短暂冷却后重试，以兼容上游将临时限流也返回为 429 的情况。
+		p.cooldowns[id] = time.Now().Add(quotaErrorCooldown)
 	} else if p.errorCounts[id] >= errorCooldownThreshold {
 		// 连续错误达阈值：指数退避（1m→2m→4m→…封顶 8m）+ ±10% 抖动。
 		// 越错越久给上游喘息；抖动错开各账号解禁时刻，避免被罚账号一窝蜂同时

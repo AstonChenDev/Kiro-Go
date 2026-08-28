@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"kiro-go/config"
@@ -11,6 +12,185 @@ import (
 	"testing"
 	"time"
 )
+
+func oauthCompletionFrames(t *testing.T, outputEvent string, output map[string]interface{}) []byte {
+	t.Helper()
+	return bytes.Join([][]byte{
+		awsEventStreamFrame(t, outputEvent, output),
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 0.5}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1}),
+	}, nil)
+}
+
+// OAuth/social responses observed from all three supported upstream endpoints
+// finish with accounting metadata but may omit metadataEvent.stopReason. That
+// is a complete turn, not a truncation; synthesize end_turn exactly once.
+func TestOAuthStreamSynthesizesEndTurnAfterTerminalAccounting(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(oauthCompletionFrames(t, "assistantResponseEvent", map[string]interface{}{"content": "complete"}))
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var content string
+	var reasons []string
+	var callbackOrder []string
+	err := CallKiroAPIContext(context.Background(), integrityTestAccount(), integrityTestPayload(), &KiroStreamCallback{
+		OnText: func(text string, _ bool) { content += text },
+		OnStopReason: func(reason string) {
+			reasons = append(reasons, reason)
+			callbackOrder = append(callbackOrder, "stop")
+		},
+		OnComplete: func(int, int) { callbackOrder = append(callbackOrder, "complete") },
+	})
+	if err != nil {
+		t.Fatalf("CallKiroAPIContext: %v", err)
+	}
+	if content != "complete" {
+		t.Fatalf("content=%q, want complete", content)
+	}
+	if len(reasons) != 1 || reasons[0] != "end_turn" {
+		t.Fatalf("stop reasons=%v, want [end_turn]", reasons)
+	}
+	if len(callbackOrder) != 2 || callbackOrder[0] != "stop" || callbackOrder[1] != "complete" {
+		t.Fatalf("callback order=%v, want [stop complete]", callbackOrder)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("valid OAuth completion was retried %d times", hits.Load())
+	}
+}
+
+// Even valid-looking terminal accounting cannot hide a malformed trailing
+// frame. onCleanEOF is never reached, so no synthetic reason may escape.
+func TestOAuthStreamDoesNotSynthesizeAfterTrailingMalformedFrame(t *testing.T) {
+	stream := append(oauthCompletionFrames(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"}), 0x00, 0x01)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(stream)
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var stopReason string
+	err := CallKiroAPIContext(context.Background(), integrityTestAccount(), integrityTestPayload(), &KiroStreamCallback{
+		OnText:       func(string, bool) {},
+		OnStopReason: func(reason string) { stopReason = reason },
+	})
+	if err == nil {
+		t.Fatal("malformed trailing frame was accepted")
+	}
+	if stopReason != "" {
+		t.Fatalf("malformed stream synthesized stop reason %q", stopReason)
+	}
+}
+
+func TestOAuthStreamPreservesRealStopReasonExactlyOnce(t *testing.T) {
+	stream := bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "complete"}),
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "max_tokens"}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1}),
+	}, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(stream)
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var reasons []string
+	err := CallKiroAPIContext(context.Background(), integrityTestAccount(), integrityTestPayload(), &KiroStreamCallback{
+		OnStopReason: func(reason string) { reasons = append(reasons, reason) },
+	})
+	if err != nil {
+		t.Fatalf("CallKiroAPIContext: %v", err)
+	}
+	if len(reasons) != 1 || reasons[0] != "max_tokens" {
+		t.Fatalf("stop reasons=%v, want upstream max_tokens exactly once", reasons)
+	}
+}
+
+// A terminal-looking frame before later output cannot certify that later
+// output. The existing strict classifier must still see the missing reason.
+func TestOAuthStreamDoesNotTrustTerminalMetadataBeforeFinalOutput(t *testing.T) {
+	stream := bytes.Join([][]byte{
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 0.5}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "possibly truncated"}),
+	}, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(stream)
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var stopReason string
+	err := CallKiroAPIContext(context.Background(), integrityTestAccount(), integrityTestPayload(), &KiroStreamCallback{
+		OnText:       func(string, bool) {},
+		OnStopReason: func(reason string) { stopReason = reason },
+	})
+	if err != nil {
+		t.Fatalf("transport parser should return cleanly, got %v", err)
+	}
+	if stopReason != "" {
+		t.Fatalf("stale terminal metadata synthesized stop reason %q", stopReason)
+	}
+}
+
+// Thinking without an answer remains incomplete even if accounting metadata
+// follows. This preserves the protection against thinking-only failed turns.
+func TestOAuthStreamDoesNotCompleteReasoningOnlyOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(oauthCompletionFrames(t, "reasoningContentEvent", map[string]interface{}{"text": "thinking"}))
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var stopReason string
+	err := CallKiroAPIContext(context.Background(), integrityTestAccount(), integrityTestPayload(), &KiroStreamCallback{
+		OnText:       func(string, bool) {},
+		OnStopReason: func(reason string) { stopReason = reason },
+	})
+	if err != nil {
+		t.Fatalf("transport parser should return cleanly, got %v", err)
+	}
+	if stopReason != "" {
+		t.Fatalf("reasoning-only stream synthesized stop reason %q", stopReason)
+	}
+}
+
+func TestOAuthStreamSynthesizesToolUseForCompleteTool(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_1",
+			"name":      "lookup",
+			"input":     `{"query":"ok"}`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var reasons []string
+	var tools []KiroToolUse
+	err := CallKiroAPIContext(context.Background(), integrityTestAccount(), integrityTestPayload(), &KiroStreamCallback{
+		OnToolUse:    func(tool KiroToolUse) { tools = append(tools, tool) },
+		OnStopReason: func(reason string) { reasons = append(reasons, reason) },
+	})
+	if err != nil {
+		t.Fatalf("CallKiroAPIContext: %v", err)
+	}
+	if len(tools) != 1 || tools[0].Name != "lookup" {
+		t.Fatalf("tools=%+v, want one lookup", tools)
+	}
+	if len(reasons) != 1 || reasons[0] != "tool_use" {
+		t.Fatalf("stop reasons=%v, want [tool_use]", reasons)
+	}
+}
 
 // classifyStreamIntegrity is the completeness rule: a stream that returned no
 // transport error is still incomplete when it carries no terminal signal.

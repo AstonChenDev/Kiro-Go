@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	supplierPendingRetryBase = 5 * time.Second
-	supplierImportedMaxSSE   = 300
-	supplierImportedMaxRPM   = 200
-	supplierPurchaseRegionUS = "us"
+	supplierPendingRetryBase      = 5 * time.Second
+	supplierPurchaseRegionUS      = "us"
+	supplierStockErrorLogInterval = 30 * time.Second
+	supplierMaintenanceInterval   = time.Second
 )
 
 var (
@@ -43,40 +43,101 @@ type supplierPurchaseOutcome struct {
 }
 
 type supplierManager struct {
-	handler      *Handler
-	store        *supplierStateStore
-	apiFactory   func(config.SupplierProvider) supplierAPI
-	wake         chan supplierWake
-	stop         <-chan struct{}
-	workflowMu   sync.Mutex
-	purchaseMu   sync.Mutex
-	webhookMu    sync.Mutex
-	webhooks     map[string]supplierWebhookWindow
-	autoBlockMu  sync.RWMutex
-	autoBlocks   map[string]supplierAutoBlock
-	pollInterval func() time.Duration
+	handler            *Handler
+	store              *supplierStateStore
+	apiFactory         func(config.SupplierProvider) supplierAPI
+	wake               chan supplierWake
+	stop               <-chan struct{}
+	workflowMu         sync.Mutex
+	purchaseMu         sync.Mutex
+	webhookMu          sync.Mutex
+	webhooks           map[string]supplierWebhookWindow
+	autoBlockMu        sync.RWMutex
+	autoBlocks         map[string]supplierAutoBlock
+	autoCheckMu        sync.Mutex
+	autoCheckLastStart map[string]time.Time
+	autoCheckInFlight  map[string]bool
+	autoCheckWG        sync.WaitGroup
+	stockErrorLogMu    sync.Mutex
+	stockErrorLogs     map[string]supplierStockErrorLog
+	pollInterval       func() time.Duration
+}
+
+type supplierStockErrorLog struct {
+	Message  string
+	LoggedAt time.Time
 }
 
 func newSupplierManager(handler *Handler, stop <-chan struct{}) (*supplierManager, error) {
+	if migrated, migrationErr := config.MigrateLegacySupplierImportLimits(); migrationErr != nil {
+		logger.Warnf("[Supplier] legacy import-limit migration failed: %v", migrationErr)
+	} else if migrated > 0 {
+		if handler != nil && handler.pool != nil {
+			handler.pool.Reload()
+		}
+		logger.Infof("[Supplier] migrated %d supplier account(s) from legacy import limits to provider settings", migrated)
+	}
 	store, err := newSupplierStateStore(config.GetConfigDir())
 	if err != nil {
 		return nil, err
 	}
-	return &supplierManager{
-		handler:      handler,
-		store:        store,
-		apiFactory:   newHTTPSupplierAPI,
-		wake:         make(chan supplierWake, 1),
-		stop:         stop,
-		webhooks:     make(map[string]supplierWebhookWindow),
-		autoBlocks:   store.autoBlocks(),
-		pollInterval: currentSupplierPollInterval,
-	}, nil
+	manager := &supplierManager{
+		handler:            handler,
+		store:              store,
+		apiFactory:         newHTTPSupplierAPI,
+		wake:               make(chan supplierWake, 1),
+		stop:               stop,
+		webhooks:           make(map[string]supplierWebhookWindow),
+		autoBlocks:         store.autoBlocks(),
+		autoCheckLastStart: make(map[string]time.Time),
+		autoCheckInFlight:  make(map[string]bool),
+		stockErrorLogs:     make(map[string]supplierStockErrorLog),
+		pollInterval:       currentSupplierPollInterval,
+	}
+	manager.clearLegacyConnectionBlocks()
+	return manager, nil
 }
 
 func currentSupplierPollInterval() time.Duration {
-	seconds := config.GetSupplierIntegration().PollIntervalSeconds
-	return time.Duration(seconds) * time.Second
+	integration := config.GetSupplierIntegration()
+	fallback := time.Duration(integration.PollIntervalSeconds) * time.Second
+	if !integration.Enabled || !integration.AutoPurchaseEnabled {
+		return capSupplierManagerTick(fallback)
+	}
+	shortest := fallback
+	found := false
+	for _, provider := range integration.Providers {
+		if !provider.Enabled || strings.TrimSpace(provider.APIToken) == "" {
+			continue
+		}
+		interval := supplierProviderPollDuration(provider, integration.PollIntervalSeconds)
+		if !found || interval < shortest {
+			shortest = interval
+			found = true
+		}
+	}
+	return capSupplierManagerTick(shortest)
+}
+
+func capSupplierManagerTick(interval time.Duration) time.Duration {
+	// Pending idempotent orders, webhook events and batch lifetimes share this
+	// loop. Keep their maintenance latency bounded even when every supplier has
+	// selected a very slow stock interval; beginAutomaticCheck still enforces the
+	// exact per-supplier cadence.
+	if interval > supplierMaintenanceInterval {
+		return supplierMaintenanceInterval
+	}
+	return interval
+}
+
+func supplierProviderPollDuration(provider config.SupplierProvider, fallbackSeconds int) time.Duration {
+	seconds := config.EffectiveSupplierProviderPollIntervalSeconds(provider, fallbackSeconds)
+	interval := time.Duration(seconds * float64(time.Second))
+	minimum := time.Duration(config.MinSupplierProviderPollIntervalSeconds * float64(time.Second))
+	if interval < minimum {
+		return minimum
+	}
+	return interval
 }
 
 func (m *supplierManager) currentPollInterval() time.Duration {
@@ -110,14 +171,42 @@ func (m *supplierManager) automaticPurchaseBlocks() map[string]supplierAutoBlock
 	defer m.autoBlockMu.RUnlock()
 	blocks := make(map[string]supplierAutoBlock, len(m.autoBlocks))
 	for providerID, block := range m.autoBlocks {
+		if block.Reason == "connection_rejected" {
+			continue
+		}
 		blocks[providerID] = block
 	}
 	return blocks
 }
 
 func (m *supplierManager) autoPurchaseBlocked(providerID string) bool {
-	_, blocked := m.automaticPurchaseBlock(providerID)
-	return blocked
+	block, blocked := m.automaticPurchaseBlock(providerID)
+	return blocked && block.Reason != "connection_rejected"
+}
+
+// Connection failures used to create a durable circuit breaker. That is
+// harmful for scarce-inventory polling because a recovered supplier would
+// never be queried again. Remove those legacy blocks on startup; financial
+// safety blocks created after a purchase attempt remain untouched.
+func (m *supplierManager) clearLegacyConnectionBlocks() {
+	for providerID, block := range m.automaticPurchaseBlocksIncludingLegacy() {
+		if block.Reason != "connection_rejected" {
+			continue
+		}
+		if err := m.clearAutomaticPurchaseBlock(providerID); err != nil {
+			logger.Warnf("[Supplier] could not remove legacy connection block for %s: %v", providerID, err)
+		}
+	}
+}
+
+func (m *supplierManager) automaticPurchaseBlocksIncludingLegacy() map[string]supplierAutoBlock {
+	m.autoBlockMu.RLock()
+	defer m.autoBlockMu.RUnlock()
+	blocks := make(map[string]supplierAutoBlock, len(m.autoBlocks))
+	for providerID, block := range m.autoBlocks {
+		blocks[providerID] = block
+	}
+	return blocks
 }
 
 func (m *supplierManager) blockAutomaticPurchases(providerID, batchID, reason string) error {
@@ -166,7 +255,11 @@ func (m *supplierManager) allowWebhook(providerID string) bool {
 
 func (m *supplierManager) run() {
 	timer := time.NewTimer(m.currentPollInterval())
-	defer timer.Stop()
+	lastMaintenance := supplierNow()
+	defer func() {
+		timer.Stop()
+		m.autoCheckWG.Wait()
+	}()
 	// Resolve any response lost after an idempotent purchase before creating a
 	// new purchase. This is safe even when automatic purchasing is disabled.
 	m.processPendingWebhookEvents()
@@ -176,18 +269,76 @@ func (m *supplierManager) run() {
 		case wake := <-m.wake:
 			m.processPendingWebhookEvents()
 			m.processPendingIntents()
-			m.maybeAutoPurchase(wake.ProviderID)
+			m.dispatchAutomaticChecks(wake.ProviderID, true)
 			resetSupplierPollTimer(timer, m.currentPollInterval())
 		case <-timer.C:
-			m.processPendingWebhookEvents()
-			m.processPendingIntents()
-			m.reconcileBatches()
-			m.maybeAutoPurchase("")
+			now := supplierNow()
+			if now.Sub(lastMaintenance) >= supplierMaintenanceInterval || now.Before(lastMaintenance) {
+				m.processPendingWebhookEvents()
+				m.processPendingIntents()
+				m.reconcileBatches()
+				lastMaintenance = now
+			}
+			m.dispatchAutomaticChecks("", false)
 			timer.Reset(m.currentPollInterval())
 		case <-m.stop:
 			return
 		}
 	}
+}
+
+// dispatchAutomaticChecks gives every supplier an independent schedule while
+// keeping at most one stock request in flight per supplier. Slow or broken
+// suppliers therefore cannot delay faster competitors, and a 100 ms interval
+// cannot accumulate an unbounded goroutine/request backlog.
+func (m *supplierManager) dispatchAutomaticChecks(preferredProviderID string, force bool) {
+	integration := config.GetSupplierIntegration()
+	if !integration.Enabled || !integration.AutoPurchaseEnabled || len(m.store.pendingIntents()) != 0 {
+		return
+	}
+	for _, provider := range config.SortedEnabledSupplierProviders(preferredProviderID) {
+		if liveSupplierAPIKeyCount(provider.ID) != 0 || m.autoPurchaseBlocked(provider.ID) {
+			continue
+		}
+		forceProvider := force && (preferredProviderID == "" || preferredProviderID == provider.ID)
+		if !m.beginAutomaticCheck(provider, integration.PollIntervalSeconds, forceProvider) {
+			continue
+		}
+		m.autoCheckWG.Add(1)
+		go func(provider config.SupplierProvider) {
+			defer m.autoCheckWG.Done()
+			defer m.finishAutomaticCheck(provider.ID)
+			m.maybeAutoPurchaseProvider(provider)
+		}(provider)
+	}
+}
+
+func (m *supplierManager) beginAutomaticCheck(provider config.SupplierProvider, fallbackSeconds int, force bool) bool {
+	now := supplierNow()
+	interval := supplierProviderPollDuration(provider, fallbackSeconds)
+	m.autoCheckMu.Lock()
+	defer m.autoCheckMu.Unlock()
+	if m.autoCheckLastStart == nil {
+		m.autoCheckLastStart = make(map[string]time.Time)
+	}
+	if m.autoCheckInFlight == nil {
+		m.autoCheckInFlight = make(map[string]bool)
+	}
+	if m.autoCheckInFlight[provider.ID] {
+		return false
+	}
+	if last := m.autoCheckLastStart[provider.ID]; !force && !last.IsZero() && now.Sub(last) < interval {
+		return false
+	}
+	m.autoCheckLastStart[provider.ID] = now
+	m.autoCheckInFlight[provider.ID] = true
+	return true
+}
+
+func (m *supplierManager) finishAutomaticCheck(providerID string) {
+	m.autoCheckMu.Lock()
+	delete(m.autoCheckInFlight, providerID)
+	m.autoCheckMu.Unlock()
 }
 
 func (m *supplierManager) signal(providerID string) {
@@ -231,84 +382,111 @@ func (m *supplierManager) maybeAutoPurchase(preferredProviderID string) {
 	if !integration.Enabled || !integration.AutoPurchaseEnabled {
 		return
 	}
-	if len(m.store.pendingIntents()) != 0 {
+	for _, provider := range config.SortedEnabledSupplierProviders(preferredProviderID) {
+		m.maybeAutoPurchaseProvider(provider)
+	}
+}
+
+func (m *supplierManager) maybeAutoPurchaseProvider(provider config.SupplierProvider) {
+	integration := config.GetSupplierIntegration()
+	current := config.GetSupplierProvider(provider.ID)
+	if !integration.Enabled || !integration.AutoPurchaseEnabled || current == nil || !current.Enabled ||
+		liveSupplierAPIKeyCount(provider.ID) != 0 || m.autoPurchaseBlocked(provider.ID) || len(m.store.pendingIntents()) != 0 {
 		return
 	}
-	providers := config.SortedEnabledSupplierProviders(preferredProviderID)
-	for _, provider := range providers {
-		if liveSupplierAPIKeyCount(provider.ID) != 0 {
-			continue
-		}
-		if m.autoPurchaseBlocked(provider.ID) {
-			continue
-		}
-		stock, err := m.refreshProviderStatus(provider, false)
-		if err != nil {
-			logger.Warnf("[Supplier] stock check failed for %s: %v", provider.ID, err)
-			if !isRetryableSupplierError(err) {
-				if blockErr := m.blockAutomaticPurchases(provider.ID, "", "connection_rejected"); blockErr != nil {
-					logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
-				}
-			}
-			continue
-		}
-		// A webhook, a manual import, or another automatic check may have added
-		// a key while the stock request was in flight. Re-check this supplier,
-		// rather than the global account pool, before any purchase is created.
-		if liveSupplierAPIKeyCount(provider.ID) != 0 {
-			continue
-		}
-		if stock.StockUS <= 0 {
-			continue
-		}
-		count := provider.AutoPurchaseCount
-		if count < 1 {
-			count = config.DefaultSupplierPurchaseCount
-		}
-		if count > stock.StockUS {
-			count = stock.StockUS
-		}
-		outcome, err := m.startPurchase(provider, count, supplierPurchaseRegionUS, true, "auto")
-		if err != nil {
-			if errors.Is(err, errSupplierAutoPurchaseNotNeeded) {
-				continue
-			}
-			if errors.Is(err, errSupplierPurchaseInFlight) {
-				return
-			}
-			logger.Warnf("[Supplier] automatic purchase failed for %s: %v", provider.ID, err)
-			// Public inventory is shared with other merchants. A batch changing
-			// between the stock GET and atomic POST is expected contention, not a
-			// configuration failure; the next polling tick must query a fresh batch
-			// and use a new client order ID.
-			if isSupplierPublicInventoryRaceError(err) {
-				continue
-			}
-			if !outcome.Pending && !isRetryableSupplierError(err) {
-				if blockErr := m.blockAutomaticPurchases(provider.ID, outcome.Intent.ID, "purchase_rejected"); blockErr != nil {
-					logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
-				}
-				continue
-			}
-			return
-		}
-		if outcome.Pending {
-			logger.Warnf("[Supplier] automatic purchase for %s is pending idempotent retry", provider.ID)
-			return
-		}
-		if outcome.Response.Purchased > 0 {
-			if outcome.Batch.Imported == 0 {
-				if blockErr := m.blockAutomaticPurchases(provider.ID, outcome.Batch.ID, "no_importable_keys"); blockErr != nil {
-					logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
-				}
-				logger.Warnf("[Supplier] automatic purchases paused for %s: purchase returned no new importable keys", provider.ID)
-				continue
-			}
-			logger.Infof("[Supplier] automatically purchased %d US key(s) from %s and imported %d", outcome.Response.Purchased, provider.ID, outcome.Batch.Imported)
-			// Each supplier owns an independent local pool. Continue so another
-			// enabled supplier that is also empty can replenish in this same pass.
-		}
+	provider = *current
+	stock, err := m.refreshProviderStatus(provider, false)
+	if err != nil {
+		m.logAutomaticStockCheckFailure(provider.ID, err)
+		return
 	}
+	m.clearAutomaticStockCheckFailure(provider.ID)
+	// A webhook, manual import, or another supplier worker may have added a key
+	// while the stock request was in flight. Re-check before creating any order.
+	if liveSupplierAPIKeyCount(provider.ID) != 0 {
+		return
+	}
+	region := supplierPurchaseRegionUS
+	available := stock.StockUS
+	if available <= 0 && provider.AllowEUFallback && config.SupplierSupportsEUFallback(provider) {
+		region = "eu"
+		available = stock.StockEU
+	}
+	if available <= 0 {
+		return
+	}
+	count := provider.AutoPurchaseCount
+	if count < 1 {
+		count = config.DefaultSupplierPurchaseCount
+	}
+	if stock.MinPurchase > 0 && count < stock.MinPurchase {
+		logger.Warnf("[Supplier] automatic purchases paused for %s: configured count %d is below supplier minimum %d", provider.ID, count, stock.MinPurchase)
+		if blockErr := m.blockAutomaticPurchases(provider.ID, "", "invalid_auto_purchase_count"); blockErr != nil {
+			logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
+		}
+		return
+	}
+	if stock.MaxPurchase > 0 && count > stock.MaxPurchase {
+		count = stock.MaxPurchase
+	}
+	if count > available {
+		count = available
+	}
+	outcome, err := m.startPurchase(provider, count, region, true, "auto")
+	if err != nil {
+		if errors.Is(err, errSupplierAutoPurchaseNotNeeded) || errors.Is(err, errSupplierPurchaseInFlight) {
+			return
+		}
+		logger.Warnf("[Supplier] automatic purchase failed for %s: %v", provider.ID, err)
+		if isSupplierPublicInventoryRaceError(err) {
+			return
+		}
+		if !outcome.Pending && !isRetryableSupplierError(err) {
+			if blockErr := m.blockAutomaticPurchases(provider.ID, outcome.Intent.ID, "purchase_rejected"); blockErr != nil {
+				logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
+			}
+		}
+		return
+	}
+	if outcome.Pending {
+		logger.Warnf("[Supplier] automatic purchase for %s is pending idempotent retry", provider.ID)
+		return
+	}
+	if outcome.Response.Purchased <= 0 {
+		return
+	}
+	if outcome.Batch.Imported == 0 {
+		if blockErr := m.blockAutomaticPurchases(provider.ID, outcome.Batch.ID, "no_importable_keys"); blockErr != nil {
+			logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
+		}
+		logger.Warnf("[Supplier] automatic purchases paused for %s: purchase returned no new importable keys", provider.ID)
+		return
+	}
+	logger.Infof("[Supplier] automatically purchased %d %s key(s) from %s and imported %d", outcome.Response.Purchased, strings.ToUpper(region), provider.ID, outcome.Batch.Imported)
+}
+
+func (m *supplierManager) logAutomaticStockCheckFailure(providerID string, err error) {
+	now := supplierNow()
+	message := err.Error()
+	m.stockErrorLogMu.Lock()
+	previous := m.stockErrorLogs[providerID]
+	shouldLog := previous.Message != message || previous.LoggedAt.IsZero() || now.Sub(previous.LoggedAt) >= supplierStockErrorLogInterval
+	if shouldLog {
+		if m.stockErrorLogs == nil {
+			m.stockErrorLogs = make(map[string]supplierStockErrorLog)
+		}
+		m.stockErrorLogs[providerID] = supplierStockErrorLog{Message: message, LoggedAt: now}
+	}
+	m.stockErrorLogMu.Unlock()
+	if shouldLog {
+		logger.Warnf("[Supplier] stock check failed for %s; polling will continue: %v", providerID, err)
+	}
+}
+
+func (m *supplierManager) clearAutomaticStockCheckFailure(providerID string) {
+	m.stockErrorLogMu.Lock()
+	delete(m.stockErrorLogs, providerID)
+	m.stockErrorLogMu.Unlock()
 }
 
 func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider, includeKeyCount bool) (supplierStock, error) {
@@ -328,6 +506,15 @@ func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider
 		}
 	} else {
 		stock, err = api.GetStock()
+		if err == nil && config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroCEO {
+			var profile supplierProfile
+			profile, err = api.GetProfile()
+			if err == nil {
+				stock.Balance = profile.User.Balance
+				stock.MinPurchase = profile.User.MinPurchase
+				stock.MaxPurchase = profile.User.MaxPurchase
+			}
+		}
 	}
 	var detailErrors []string
 	status := supplierProviderStatus{
@@ -363,6 +550,8 @@ func (m *supplierManager) refreshProviderStatus(provider config.SupplierProvider
 		status.PriceMax = status.PriceMin
 	}
 	status.Balance = stock.Balance
+	status.MinPurchase = stock.MinPurchase
+	status.MaxPurchase = stock.MaxPurchase
 	status.PublicBatches = append([]supplierPublicBatch(nil), stock.Batches...)
 	status.LastError = ""
 	if includeKeyCount {
@@ -682,16 +871,24 @@ func (m *supplierManager) executeIntent(intent supplierPurchaseIntent) (supplier
 		BatchID:         intent.PublicBatchID,
 		ClientOrderID:   intent.ClientOrderID,
 		SupplierOrderID: intent.SupplierOrderID,
+		Trigger:         intent.Trigger,
 	})
 	if err != nil {
 		intent.LastError = err.Error()
-		intent.MustResolve = isRetryableSupplierError(err)
+		retryable := isRetryableSupplierError(err)
+		intent.MustResolve = retryable
 		intent.UpdatedAt = supplierNow().Unix()
-		if !isRetryableSupplierError(err) && intent.Trigger != "webhook" {
+		kiroCEOWebhook := intent.Trigger == "webhook" && config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroCEO
+		if !retryable && (intent.Trigger != "webhook" || kiroCEOWebhook) {
 			intent.Status = "failed"
 		}
 		if persistErr := m.store.updateIntent(intent); persistErr != nil {
 			return supplierPurchaseOutcome{Intent: intent, Pending: intent.Status == "pending"}, fmt.Errorf("%v; persist failure: %w", err, persistErr)
+		}
+		if !retryable && kiroCEOWebhook {
+			if blockErr := m.blockAutomaticPurchases(provider.ID, intent.ID, "purchase_rejected"); blockErr != nil {
+				logger.Warnf("[Supplier] automatic purchase safety block for %s could not be persisted: %v", provider.ID, blockErr)
+			}
 		}
 		return supplierPurchaseOutcome{Intent: intent, Pending: intent.Status == "pending"}, err
 	}
@@ -767,6 +964,7 @@ func (m *supplierManager) importKeys(provider config.SupplierProvider, intent su
 	if intent.Region == "eu" {
 		region = "eu-central-1"
 	}
+	importMaxSSE, importMaxRPM := config.SupplierImportLimitsForRegion(provider, region)
 	accounts := make([]config.Account, 0, len(keys))
 	for _, item := range keys {
 		key := item.Value()
@@ -784,8 +982,8 @@ func (m *supplierManager) importKeys(provider config.SupplierProvider, intent su
 			SupplierBatchID: intent.ID,
 			Region:          region,
 			Enabled:         true,
-			MaxSSE:          supplierImportedMaxSSE,
-			MaxRPM:          supplierImportedMaxRPM,
+			MaxSSE:          importMaxSSE,
+			MaxRPM:          importMaxRPM,
 		})
 	}
 	if len(accounts) == 0 {
@@ -823,6 +1021,16 @@ func newSupplierWebhookPurchaseIntent(provider config.SupplierProvider, event su
 	if event.NewKeys < 1 {
 		return supplierPurchaseIntent{}, errors.New("new_keys must be greater than zero")
 	}
+	// new_keys is an availability announcement, not permission to override the
+	// operator's configured per-purchase quantity. Webhook-triggered automatic
+	// purchases follow the same cap as polling-triggered automatic purchases.
+	count := provider.AutoPurchaseCount
+	if count < 1 {
+		count = config.DefaultSupplierPurchaseCount
+	}
+	if count > event.NewKeys {
+		count = event.NewKeys
+	}
 	supplierOrderID := strings.TrimSpace(event.OrderID)
 	if len(supplierOrderID) > 256 {
 		return supplierPurchaseIntent{}, errors.New("order_id is too long")
@@ -831,12 +1039,19 @@ func newSupplierWebhookPurchaseIntent(provider config.SupplierProvider, event su
 		return supplierPurchaseIntent{}, errors.New("order_id is required for KiroApp webhook purchases")
 	}
 	now := supplierNow().Unix()
+	region := supplierPurchaseRegionUS
+	if config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroCEO {
+		region = strings.ToLower(strings.TrimSpace(event.Zone))
+		if region != "us" && region != "eu" {
+			return supplierPurchaseIntent{}, errors.New("zone must be us or eu")
+		}
+	}
 	return supplierPurchaseIntent{
 		ID:              clientOrderID,
 		ProviderID:      provider.ID,
 		PurchaseSource:  config.SupplierPurchaseSourceOwn,
-		Region:          supplierPurchaseRegionUS,
-		Count:           event.NewKeys,
+		Region:          region,
+		Count:           count,
 		ClientOrderID:   clientOrderID,
 		SupplierOrderID: supplierOrderID,
 		AutoImport:      true,
@@ -967,6 +1182,22 @@ func (m *supplierManager) processPendingIntents() {
 			continue
 		}
 		provider := config.GetSupplierProvider(intent.ProviderID)
+		if intent.Trigger == "webhook" && intent.Attempts == 0 && provider != nil &&
+			config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroCEO &&
+			(!integration.AutoPurchaseEnabled || liveSupplierAPIKeyCount(provider.ID) != 0 || m.autoPurchaseBlocked(provider.ID) ||
+				(intent.Region == "eu" && !provider.AllowEUFallback)) {
+			// The CEO callback announces inventory; it is not proof of an existing
+			// merchant charge. Re-check the financial guard immediately before the
+			// first POST so a concurrent import cannot cause over-purchasing.
+			intent.Status = "failed"
+			intent.MustResolve = false
+			intent.LastError = "automatic webhook purchase is no longer needed"
+			intent.UpdatedAt = supplierNow().Unix()
+			if err := m.store.updateIntent(intent); err != nil {
+				logger.Warnf("[Supplier] cancel unnecessary webhook purchase %s: %v", intent.ID, err)
+			}
+			continue
+		}
 		if !intent.MustResolve && (!integration.Enabled || provider == nil || !provider.Enabled) {
 			continue
 		}

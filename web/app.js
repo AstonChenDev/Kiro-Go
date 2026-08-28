@@ -3399,17 +3399,30 @@
 
   function supplierAPITypeLabel(provider) {
     if (provider && provider.apiType === 'kiro_drop') return t('suppliers.apiTypeKiroDrop');
+    if (provider && provider.apiType === 'kiro_ceo') return t('suppliers.apiTypeKiroCEO');
     return t(provider && provider.apiType === 'aws_my' ? 'suppliers.apiTypeAWSMy' : 'suppliers.apiTypeKiroApp');
   }
 
   function supplierPurchaseSourceLabel(provider) {
     if (provider && provider.apiType === 'kiro_drop') return t('suppliers.sourceKiroDrop');
+    if (provider && provider.apiType === 'kiro_ceo') return t('suppliers.sourceKiroCEO');
     return t(provider && provider.purchaseSource === 'public' ? 'suppliers.sourcePublic' : 'suppliers.sourceOwn');
   }
 
   function supplierFormatNumber(value) {
     const number = Number(value || 0);
     return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/\.00$/, '');
+  }
+
+  function supplierImportLimitsForRegion(provider, region) {
+    const defaults = supplierOverview && supplierOverview.importDefaults ? supplierOverview.importDefaults : {};
+    const isEU = region === 'eu';
+    const legacySSE = Number(provider && provider.importMaxSSE || defaults.maxSSE || 500);
+    const legacyRPM = Number(provider && provider.importMaxRPM || defaults.maxRPM || 300);
+    return {
+      maxSSE: Number(provider && provider[isEU ? 'importEUMaxSSE' : 'importUSMaxSSE'] || legacySSE),
+      maxRPM: Number(provider && provider[isEU ? 'importEUMaxRPM' : 'importUSMaxRPM'] || legacyRPM)
+    };
   }
 
   function supplierFormatTime(value) {
@@ -3465,7 +3478,7 @@
     }
     if ($('supplierLiveKeyCount')) $('supplierLiveKeyCount').textContent = supplierOverview.liveApiKeyCount || 0;
     if ($('supplierPendingCount')) $('supplierPendingCount').textContent = supplierOverview.pendingPurchases || 0;
-    if ($('supplierPollingHint')) $('supplierPollingHint').textContent = t('suppliers.pollingHint', supplierOverview.pollIntervalSeconds || 5);
+    if ($('supplierPollingHint')) $('supplierPollingHint').textContent = t('suppliers.pollingHint');
     if ($('supplierPollInterval')) $('supplierPollInterval').value = supplierOverview.pollIntervalSeconds || 5;
     if ($('supplierRefreshBtn')) $('supplierRefreshBtn').disabled = !supplierOverview.enabled;
     if (!supplierOverview.enabled && supplierKeysData) {
@@ -3540,7 +3553,7 @@
         '<div class="supplier-provider-top">' +
         '<div class="supplier-provider-identity"><span class="supplier-provider-icon"><i class="fa-solid fa-server"></i></span><div class="min-w-0">' +
         '<p class="supplier-provider-name">' + escapeHtml(provider.name) + '</p>' +
-        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(supplierAPITypeLabel(provider)) + ' · ' + escapeHtml(supplierPurchaseSourceLabel(provider)) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + '</span>' +
+        '<span class="supplier-provider-id">' + escapeHtml(provider.id) + ' · ' + escapeHtml(supplierAPITypeLabel(provider)) + ' · ' + escapeHtml(supplierPurchaseSourceLabel(provider)) + ' · ' + escapeHtml(t('suppliers.priority', provider.priority || 0)) + ' · ' + escapeHtml(t('suppliers.providerPollInterval', supplierFormatNumber(provider.pollIntervalSeconds))) + ' · ' + escapeHtml(t('suppliers.importLimits', provider.importUSMaxSSE, provider.importUSMaxRPM, provider.importEUMaxSSE, provider.importEUMaxRPM)) + (capabilities.euFallback ? ' · ' + escapeHtml(t(provider.allowEUFallback ? 'suppliers.euFallbackEnabled' : 'suppliers.euFallbackDisabled')) : '') + '</span>' +
         '</div></div>' +
         '<span class="supplier-status-pill ' + statusClass + '"><i class="fa-solid ' + (hasError ? 'fa-circle-exclamation' : (checked ? 'fa-circle-check' : 'fa-clock')) + '"></i>' + escapeHtml(statusText) + '</span>' +
         '</div>' +
@@ -3625,6 +3638,12 @@
   function showSupplierModal(id) {
     supplierEditingId = id || '';
     const provider = id ? supplierProviderById(id) : null;
+    const importDefaults = supplierOverview && supplierOverview.importDefaults ? supplierOverview.importDefaults : {};
+    const importUSMaxSSE = provider && Number(provider.importUSMaxSSE) > 0 ? Number(provider.importUSMaxSSE) : Number(importDefaults.usMaxSSE || importDefaults.maxSSE || 500);
+    const importUSMaxRPM = provider && Number(provider.importUSMaxRPM) > 0 ? Number(provider.importUSMaxRPM) : Number(importDefaults.usMaxRPM || importDefaults.maxRPM || 300);
+    const importEUMaxSSE = provider && Number(provider.importEUMaxSSE) > 0 ? Number(provider.importEUMaxSSE) : Number(importDefaults.euMaxSSE || importDefaults.maxSSE || 500);
+    const importEUMaxRPM = provider && Number(provider.importEUMaxRPM) > 0 ? Number(provider.importEUMaxRPM) : Number(importDefaults.euMaxRPM || importDefaults.maxRPM || 300);
+    const pollIntervalSeconds = provider && Number(provider.pollIntervalSeconds) > 0 ? Number(provider.pollIntervalSeconds) : Number(supplierOverview && supplierOverview.pollIntervalSeconds || 5);
     $('supplierModalTitle').textContent = provider ? t('suppliers.editTitle') : t('suppliers.addTitle');
     $('supplierModalBody').innerHTML = '<div class="supplier-form-grid">' +
       '<div class="form-group"><label for="supplierFormId">' + escapeHtml(t('suppliers.formId')) + '</label>' +
@@ -3633,9 +3652,10 @@
       '<div class="form-group"><label for="supplierFormName">' + escapeHtml(t('suppliers.formName')) + '</label>' +
       '<input id="supplierFormName" type="text" maxlength="100" placeholder="' + escapeAttr(t('suppliers.formNamePlaceholder')) + '" value="' + escapeAttr(provider ? provider.name : '') + '" /></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormAPIType">' + escapeHtml(t('suppliers.formAPIType')) + '</label>' +
-      '<select id="supplierFormAPIType"><option value="kiroapp"' + (!provider || (provider.apiType !== 'aws_my' && provider.apiType !== 'kiro_drop') ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroApp')) + '</option>' +
+      '<select id="supplierFormAPIType"><option value="kiroapp"' + (!provider || (provider.apiType !== 'aws_my' && provider.apiType !== 'kiro_drop' && provider.apiType !== 'kiro_ceo') ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroApp')) + '</option>' +
       '<option value="aws_my"' + (provider && provider.apiType === 'aws_my' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeAWSMy')) + '</option>' +
-      '<option value="kiro_drop"' + (provider && provider.apiType === 'kiro_drop' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroDrop')) + '</option></select>' +
+      '<option value="kiro_drop"' + (provider && provider.apiType === 'kiro_drop' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroDrop')) + '</option>' +
+      '<option value="kiro_ceo"' + (provider && provider.apiType === 'kiro_ceo' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.apiTypeKiroCEO')) + '</option></select>' +
       '<small>' + escapeHtml(t('suppliers.formAPITypeHint')) + '</small></div>' +
       '<div class="form-group supplier-form-full"><label for="supplierFormPurchaseSource">' + escapeHtml(t('suppliers.formPurchaseSource')) + '</label>' +
       '<select id="supplierFormPurchaseSource"><option value="own"' + (!provider || provider.purchaseSource !== 'public' ? ' selected' : '') + '>' + escapeHtml(t('suppliers.sourceOwn')) + '</option>' +
@@ -3652,6 +3672,20 @@
       '<div class="form-group"><label for="supplierFormAutoCount">' + escapeHtml(t('suppliers.formAutoCount')) + '</label>' +
       '<input id="supplierFormAutoCount" type="number" min="1" max="500" value="' + escapeAttr(provider ? provider.autoPurchaseCount : 1) + '" />' +
       '<small>' + escapeHtml(t('suppliers.formAutoCountHint')) + '</small></div>' +
+      '<div class="form-group supplier-form-full"><label for="supplierFormPollInterval">' + escapeHtml(t('suppliers.formPollInterval')) + '</label>' +
+      '<input id="supplierFormPollInterval" type="number" min="0.1" max="300" step="0.1" inputmode="decimal" value="' + escapeAttr(pollIntervalSeconds) + '" />' +
+      '<small id="supplierFormPollIntervalHint">' + escapeHtml(t('suppliers.formPollIntervalHint')) + '</small></div>' +
+      '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierFormAllowEUFallback" type="checkbox"' + (provider && provider.allowEUFallback ? ' checked' : '') + ' /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.formAllowEUFallback')) + '</span></label>' +
+      '<small id="supplierEUFallbackHint">' + escapeHtml(t('suppliers.formAllowEUFallbackHint')) + '</small></div>' +
+      '<div class="form-group supplier-form-full"><strong>' + escapeHtml(t('suppliers.formRegionalLimits')) + '</strong><small>' + escapeHtml(t('suppliers.formRegionalLimitsHint')) + '</small></div>' +
+      '<div class="form-group"><label for="supplierFormImportUSMaxSSE">' + escapeHtml(t('suppliers.formImportUSMaxSSE')) + '</label>' +
+      '<input id="supplierFormImportUSMaxSSE" type="number" min="1" step="1" value="' + escapeAttr(importUSMaxSSE) + '" /></div>' +
+      '<div class="form-group"><label for="supplierFormImportUSMaxRPM">' + escapeHtml(t('suppliers.formImportUSMaxRPM')) + '</label>' +
+      '<input id="supplierFormImportUSMaxRPM" type="number" min="1" step="1" value="' + escapeAttr(importUSMaxRPM) + '" /></div>' +
+      '<div class="form-group"><label for="supplierFormImportEUMaxSSE">' + escapeHtml(t('suppliers.formImportEUMaxSSE')) + '</label>' +
+      '<input id="supplierFormImportEUMaxSSE" type="number" min="1" step="1" value="' + escapeAttr(importEUMaxSSE) + '" /></div>' +
+      '<div class="form-group"><label for="supplierFormImportEUMaxRPM">' + escapeHtml(t('suppliers.formImportEUMaxRPM')) + '</label>' +
+      '<input id="supplierFormImportEUMaxRPM" type="number" min="1" step="1" value="' + escapeAttr(importEUMaxRPM) + '" /></div>' +
       '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierFormEnabled" type="checkbox"' + (!provider || provider.enabled ? ' checked' : '') + ' /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.formEnabled')) + '</span></label></div>' +
       '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierFormCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="supplierFormSave" type="button">' + escapeHtml(t('suppliers.save')) + '</button></div>';
@@ -3672,7 +3706,22 @@
     if (!publicSupported) source.value = 'own';
     source.disabled = !publicSupported;
     hint.textContent = t(apiType.value === 'kiro_drop' ? 'suppliers.formPurchaseSourceKiroDropHint' :
+      apiType.value === 'kiro_ceo' ? 'suppliers.formPurchaseSourceKiroCEOHint' :
       (source.value === 'public' ? 'suppliers.formPurchaseSourcePublicHint' : 'suppliers.formPurchaseSourceOwnHint'));
+    const euFallback = $('supplierFormAllowEUFallback');
+    const euFallbackHint = $('supplierEUFallbackHint');
+    const euSupported = source.value === 'own' && apiType.value !== 'aws_my';
+    const pollInterval = $('supplierFormPollInterval');
+    const pollIntervalHint = $('supplierFormPollIntervalHint');
+    if (pollInterval) {
+      pollInterval.min = '0.1';
+    }
+    if (pollIntervalHint) pollIntervalHint.textContent = t('suppliers.formPollIntervalHint');
+    if (euFallback) {
+      if (!euSupported) euFallback.checked = false;
+      euFallback.disabled = !euSupported;
+    }
+    if (euFallbackHint) euFallbackHint.textContent = t(euSupported ? 'suppliers.formAllowEUFallbackHint' : 'suppliers.formAllowEUFallbackUnsupported');
     syncCustomSelect(source);
   }
 
@@ -3692,10 +3741,24 @@
       purchaseSource: $('supplierFormPurchaseSource').value,
       priority: parseInt($('supplierFormPriority').value || '0', 10),
       autoPurchaseCount: parseInt($('supplierFormAutoCount').value || '0', 10),
+      pollIntervalSeconds: Number($('supplierFormPollInterval').value),
+      allowEUFallback: $('supplierFormAllowEUFallback').checked,
+      importUSMaxSSE: parseInt($('supplierFormImportUSMaxSSE').value || '0', 10),
+      importUSMaxRPM: parseInt($('supplierFormImportUSMaxRPM').value || '0', 10),
+      importEUMaxSSE: parseInt($('supplierFormImportEUMaxSSE').value || '0', 10),
+      importEUMaxRPM: parseInt($('supplierFormImportEUMaxRPM').value || '0', 10),
       enabled: $('supplierFormEnabled').checked
     };
     if (!id || !body.name || !body.baseUrl || (!supplierEditingId && !body.apiToken)) {
       toastWarning(t('common.required'));
+      return;
+    }
+    if (![body.importUSMaxSSE, body.importUSMaxRPM, body.importEUMaxSSE, body.importEUMaxRPM].every(value => Number.isInteger(value) && value > 0)) {
+      toastWarning(t('suppliers.formImportLimitsInvalid'));
+      return;
+    }
+    if (!Number.isFinite(body.pollIntervalSeconds) || body.pollIntervalSeconds < 0.1 || body.pollIntervalSeconds > 300) {
+      toastWarning(t('suppliers.formPollIntervalInvalid'));
       return;
     }
     const btn = $('supplierFormSave');
@@ -3780,16 +3843,18 @@
           '</select><small>' + escapeHtml(t('suppliers.publicBatchHint')) + '</small></div>'
         : '<div class="supplier-card-error supplier-form-full">' + escapeHtml(t('suppliers.publicBatchEmpty')) + '</div>')
       : '';
-    const initialMax = usesPublicPool && publicBatches.length ? Math.min(500, Number(publicBatches[0].available || 0)) : 500;
-    const initialCount = Math.max(1, Math.min(Number(provider.autoPurchaseCount || 1), initialMax || 1));
+    const supplierMin = Math.max(1, Number(status.minPurchase || 1));
+    const supplierMax = Number(status.maxPurchase || 0) > 0 ? Math.min(500, Number(status.maxPurchase)) : 500;
+    const initialMax = usesPublicPool && publicBatches.length ? Math.min(supplierMax, Number(publicBatches[0].available || 0)) : supplierMax;
+    const initialCount = Math.max(supplierMin, Math.min(Number(provider.autoPurchaseCount || supplierMin), initialMax || supplierMin));
     $('supplierPurchaseTitle').textContent = t('suppliers.purchaseTitle') + ' · ' + provider.name;
     $('supplierPurchaseBody').innerHTML = '<div class="supplier-purchase-summary">' +
       summary + '</div>' +
       '<div class="supplier-form-grid mt-4">' +
       regionField +
-      '<div class="form-group"><label for="supplierPurchaseCount">' + escapeHtml(t('suppliers.purchaseCount')) + '</label><input id="supplierPurchaseCount" type="number" min="1" max="' + escapeAttr(initialMax) + '" value="' + escapeAttr(initialCount) + '" /></div>' +
+      '<div class="form-group"><label for="supplierPurchaseCount">' + escapeHtml(t('suppliers.purchaseCount')) + '</label><input id="supplierPurchaseCount" type="number" min="' + escapeAttr(supplierMin) + '" max="' + escapeAttr(initialMax) + '" value="' + escapeAttr(initialCount) + '" /></div>' +
       batchField +
-      '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierPurchaseAutoImport" type="checkbox" checked /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.purchaseAutoImport')) + '</span></label><small class="field-hint-offset">' + escapeHtml(t('suppliers.purchaseImportHint')) + '</small></div>' +
+      '<div class="form-group supplier-form-full"><label class="flex items-center gap-2"><span class="switch"><input id="supplierPurchaseAutoImport" type="checkbox" checked /><span class="slider"></span></span><span>' + escapeHtml(t('suppliers.purchaseAutoImport')) + '</span></label><small id="supplierPurchaseImportHint" class="field-hint-offset"></small></div>' +
       '</div><div class="modal-footer"><button class="btn btn-secondary" id="supplierPurchaseCancel" type="button">' + escapeHtml(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="supplierPurchaseSubmit" type="button" data-id="' + escapeAttr(provider.id) + '"' + (usesPublicPool && !publicBatches.length ? ' disabled' : '') + '>' + escapeHtml(t('suppliers.purchaseSubmit')) + '</button></div>';
     openDialog('supplierPurchaseModal');
@@ -3798,6 +3863,15 @@
       $('supplierPurchaseBatch').addEventListener('change', syncSupplierPublicPurchaseCount);
       syncSupplierPublicPurchaseCount();
     }
+    const syncImportHint = () => {
+      const regionSelect = $('supplierPurchaseRegion');
+      const region = regionSelect ? regionSelect.value : 'us';
+      const limits = supplierImportLimitsForRegion(provider, region);
+      const hint = $('supplierPurchaseImportHint');
+      if (hint) hint.textContent = t('suppliers.purchaseImportHint', region.toUpperCase(), limits.maxSSE, limits.maxRPM);
+    };
+    if ($('supplierPurchaseRegion')) $('supplierPurchaseRegion').addEventListener('change', syncImportHint);
+    syncImportHint();
   }
 
   function syncSupplierPublicPurchaseCount() {
@@ -3824,8 +3898,9 @@
     const batchElement = $('supplierPurchaseBatch');
     const batchId = batchElement ? batchElement.value : '';
     const autoImport = $('supplierPurchaseAutoImport').checked;
+    const minCount = Math.max(1, Number($('supplierPurchaseCount').min || 1));
     const maxCount = Math.min(500, Number($('supplierPurchaseCount').max || 500));
-    if (!count || count < 1 || count > maxCount) {
+    if (!count || count < minCount || count > maxCount) {
       toastWarning(t('suppliers.formAutoCountHint'));
       return;
     }

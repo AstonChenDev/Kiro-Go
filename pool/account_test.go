@@ -81,6 +81,26 @@ func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
 	}
 }
 
+func TestQuotaErrorSetsOneMinuteCooldown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "quota-account"})
+	before := time.Now()
+
+	p.RecordError("quota-account", true)
+
+	p.mu.RLock()
+	cooldown, ok := p.cooldowns["quota-account"]
+	p.mu.RUnlock()
+	if !ok {
+		t.Fatal("expected quota error to set a cooldown")
+	}
+	if cooldown.Before(before.Add(quotaErrorCooldown)) {
+		t.Fatalf("expected cooldown to last at least %v, got %v", quotaErrorCooldown, cooldown.Sub(before))
+	}
+	if cooldown.After(time.Now().Add(quotaErrorCooldown + time.Second)) {
+		t.Fatalf("expected cooldown to be about %v, got %v", quotaErrorCooldown, cooldown.Sub(before))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // IsAuthFailure
 // ---------------------------------------------------------------------------

@@ -19,6 +19,8 @@ const (
 	maxSupplierIntents    = 3000
 )
 
+var errSupplierWebhookConflict = errors.New("supplier webhook conflicts with durable state")
+
 type supplierWebhookEvent struct {
 	Event                    string              `json:"event"`
 	EventID                  string              `json:"event_id"`
@@ -29,7 +31,9 @@ type supplierWebhookEvent struct {
 	SuppliedCount            int                 `json:"supplied_count,omitempty"`
 	OrderID                  string              `json:"order_id,omitempty"`
 	PurchaseOrderID          string              `json:"purchase_order_id,omitempty"`
+	PoolID                   string              `json:"pool_id,omitempty"`
 	Region                   string              `json:"region,omitempty"`
+	Zone                     string              `json:"zone,omitempty"`
 	Regions                  []string            `json:"regions,omitempty"`
 	NewKeysByRegion          map[string]int      `json:"new_keys_by_region,omitempty"`
 	BatchIDsByRegion         map[string][]string `json:"batch_ids_by_region,omitempty"`
@@ -67,6 +71,8 @@ type supplierProviderStatus struct {
 	PriceMin         float64               `json:"priceMin"`
 	PriceMax         float64               `json:"priceMax"`
 	Balance          float64               `json:"balance"`
+	MinPurchase      int                   `json:"minPurchase,omitempty"`
+	MaxPurchase      int                   `json:"maxPurchase,omitempty"`
 	KeyCount         int                   `json:"keyCount"`
 	PublicOrderCount int                   `json:"publicOrderCount,omitempty"`
 	PublicBatches    []supplierPublicBatch `json:"publicBatches,omitempty"`
@@ -301,14 +307,29 @@ func (s *supplierStateStore) recordEventAndIntent(providerID string, event suppl
 	workAdded := false
 	err := s.mutate(func(candidate *supplierPersistentState) error {
 		existingEvent, duplicate := candidate.Events[key]
+		// Kiro CEO documents pool_id as the stable mother-account identity for
+		// suppressing repeated availability notifications. event_id and
+		// purchase_order_id remain the stronger exact-delivery/idempotency keys,
+		// while this additional guard prevents a supplier-side reissue for the
+		// same mother account from creating another charge.
+		provider := config.GetSupplierProvider(providerID)
+		if !duplicate && provider != nil && config.EffectiveSupplierAPIType(provider.APIType) == config.SupplierAPITypeKiroCEO &&
+			event.Event == "new_keys_available" && strings.TrimSpace(event.PoolID) != "" {
+			for _, recorded := range candidate.Events {
+				if recorded.ProviderID == providerID && recorded.Event == event.Event &&
+					strings.TrimSpace(recorded.Payload.PoolID) == strings.TrimSpace(event.PoolID) {
+					return nil
+				}
+			}
+		}
 		if intent != nil {
 			storageKey, existing, duplicate := findSupplierIntent(candidate.PurchaseIntents, intent.ProviderID, intent.ID)
 			if duplicate {
 				if existing.ProviderID != intent.ProviderID || existing.ClientOrderID != intent.ClientOrderID ||
-					existing.Count != intent.Count || existing.SupplierOrderID != intent.SupplierOrderID ||
+					existing.Count != intent.Count || existing.Region != intent.Region || existing.SupplierOrderID != intent.SupplierOrderID ||
 					config.EffectiveSupplierPurchaseSource(existing.PurchaseSource) != config.EffectiveSupplierPurchaseSource(intent.PurchaseSource) ||
-					existing.PublicBatchID != intent.PublicBatchID {
-					return errors.New("purchase_order_id conflicts with an existing supplier purchase")
+					existing.PublicBatchID != intent.PublicBatchID || existing.AutoImport != intent.AutoImport || existing.Trigger != intent.Trigger {
+					return fmt.Errorf("%w: purchase_order_id conflicts with an existing supplier purchase", errSupplierWebhookConflict)
 				}
 			} else {
 				candidate.PurchaseIntents[storageKey] = *intent
@@ -317,6 +338,9 @@ func (s *supplierStateStore) recordEventAndIntent(providerID string, event suppl
 			}
 		}
 		if duplicate {
+			if existingEvent.Status != "" && supplierWebhookPayloadConflicts(existingEvent.Payload, event) {
+				return fmt.Errorf("%w: event_id conflicts with a previously received supplier event", errSupplierWebhookConflict)
+			}
 			// Version-1 records have no status or payload. A supplier retry after
 			// upgrading must repair the missing durable work instead of being
 			// discarded merely because its event ID was already observed.
@@ -353,6 +377,16 @@ func (s *supplierStateStore) recordEventAndIntent(providerID string, event suppl
 		return nil
 	})
 	return added, workAdded, err
+}
+
+func supplierWebhookPayloadConflicts(existing, incoming supplierWebhookEvent) bool {
+	return existing.Event != incoming.Event ||
+		strings.TrimSpace(existing.PurchaseOrderID) != strings.TrimSpace(incoming.PurchaseOrderID) ||
+		existing.NewKeys != incoming.NewKeys || existing.Dead != incoming.Dead ||
+		!strings.EqualFold(strings.TrimSpace(existing.Zone), strings.TrimSpace(incoming.Zone)) ||
+		!strings.EqualFold(strings.TrimSpace(existing.Region), strings.TrimSpace(incoming.Region)) ||
+		strings.TrimSpace(existing.PoolID) != strings.TrimSpace(incoming.PoolID) ||
+		strings.TrimSpace(existing.OrderID) != strings.TrimSpace(incoming.OrderID)
 }
 
 func (s *supplierStateStore) pendingWebhookEvents() []supplierEventRecord {

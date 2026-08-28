@@ -4,7 +4,114 @@ import (
 	"context"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"strings"
 )
+
+// oauthStreamCompletion records the signals needed to recognize the current
+// OAuth/social upstream's valid completion shape. Those streams may omit
+// metadataEvent.stopReason, but a complete response ends with validated
+// context-usage and/or metering metadata after the final generated frame.
+//
+// terminalAfterLastOutput is reset whenever later output arrives. This matters:
+// a stale metadata frame followed by more content must not bless a subsequent
+// clean EOF as complete.
+type oauthStreamCompletion struct {
+	sawAnswer               bool
+	sawReasoning            bool
+	sawToolUse              bool
+	sawStopReason           bool
+	terminalAfterLastOutput bool
+}
+
+// trackOAuthStreamCompletion installs completion tracking without mutating the
+// caller's callback. On a fully parsed EOF it synthesizes a terminal reason only
+// when the stream has evidence that the upstream deliberately finished:
+//   - delivered tool input is complete on its own and maps to tool_use;
+//   - normal answer text requires a trailing metadata/metering/context frame.
+//
+// Reasoning-only output intentionally remains incomplete, preserving the
+// stricter guard that prevents a turn containing thinking but no answer from
+// being reported as successful.
+func trackOAuthStreamCompletion(callback *KiroStreamCallback) (*KiroStreamCallback, *oauthStreamCompletion) {
+	state := &oauthStreamCompletion{}
+	tracked := &KiroStreamCallback{}
+	if callback != nil {
+		*tracked = *callback
+	}
+
+	originalOnText := tracked.OnText
+	tracked.OnText = func(text string, thinking bool) {
+		if text != "" {
+			if thinking {
+				state.sawReasoning = true
+			} else {
+				state.sawAnswer = true
+			}
+			state.terminalAfterLastOutput = false
+		}
+		if originalOnText != nil {
+			originalOnText(text, thinking)
+		}
+	}
+
+	originalOnToolUse := tracked.OnToolUse
+	tracked.OnToolUse = func(toolUse KiroToolUse) {
+		state.sawToolUse = true
+		state.terminalAfterLastOutput = false
+		if originalOnToolUse != nil {
+			originalOnToolUse(toolUse)
+		}
+	}
+
+	originalOnStopReason := tracked.OnStopReason
+	tracked.OnStopReason = func(reason string) {
+		if strings.TrimSpace(reason) != "" {
+			state.sawStopReason = true
+		}
+		if originalOnStopReason != nil {
+			originalOnStopReason(reason)
+		}
+	}
+
+	originalOnTerminalEvent := tracked.onTerminalEvent
+	tracked.onTerminalEvent = func() {
+		if state.sawAnswer || state.sawReasoning || state.sawToolUse {
+			state.terminalAfterLastOutput = true
+		}
+		if originalOnTerminalEvent != nil {
+			originalOnTerminalEvent()
+		}
+	}
+
+	originalOnCleanEOF := tracked.onCleanEOF
+	tracked.onCleanEOF = func() {
+		completeOAuthStream(tracked, state)
+		if originalOnCleanEOF != nil {
+			originalOnCleanEOF()
+		}
+	}
+
+	return tracked, state
+}
+
+func completeOAuthStream(callback *KiroStreamCallback, state *oauthStreamCompletion) {
+	if callback == nil || state == nil || state.sawStopReason || callback.OnStopReason == nil {
+		return
+	}
+
+	reason := ""
+	switch {
+	case state.sawToolUse:
+		reason = "tool_use"
+	case state.sawAnswer && state.terminalAfterLastOutput:
+		reason = "end_turn"
+	default:
+		return
+	}
+
+	callback.OnStopReason(reason)
+	logger.Debugf("[StreamIntegrity] Synthesized missing OAuth stop reason %s after terminal metadata", reason)
+}
 
 // runKiroWithIntegrityRetry calls Kiro and recovers a truncated upstream stream
 // the way Kiro IDE does: retry the same request on the same account within a

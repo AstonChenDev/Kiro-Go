@@ -35,11 +35,12 @@ func supplierProviderCapabilities(provider config.SupplierProvider) map[string]b
 	return map[string]bool{
 		"balance":           apiType != config.SupplierAPITypeAWSMy,
 		"regions":           apiType != config.SupplierAPITypeAWSMy,
+		"euFallback":        config.SupplierSupportsEUFallback(provider),
 		"publicPool":        apiType == config.SupplierAPITypeAWSMy,
 		"webhookManagement": apiType != config.SupplierAPITypeKiroApp,
 		"remoteKeys":        apiType != config.SupplierAPITypeKiroDrop,
 		"signedWebhook":     apiType == config.SupplierAPITypeKiroDrop,
-		"purchaseRemaining": apiType == config.SupplierAPITypeKiroDrop,
+		"purchaseRemaining": apiType == config.SupplierAPITypeKiroDrop || apiType == config.SupplierAPITypeKiroCEO,
 	}
 }
 
@@ -78,16 +79,30 @@ func (h *Handler) apiGetSupplierOverview(w http.ResponseWriter, _ *http.Request)
 	for _, provider := range integration.Providers {
 		status := statuses[provider.ID]
 		autoBlock, autoBlocked := autoBlocks[provider.ID]
+		importUSMaxSSE, importUSMaxRPM := config.SupplierImportLimitsForRegion(provider, "us")
+		importEUMaxSSE, importEUMaxRPM := config.SupplierImportLimitsForRegion(provider, "eu")
+		providerPollInterval := config.EffectiveSupplierProviderPollIntervalSeconds(provider, integration.PollIntervalSeconds)
 		providers = append(providers, map[string]any{
-			"id":                  provider.ID,
-			"name":                provider.Name,
-			"baseUrl":             provider.BaseURL,
-			"apiType":             config.EffectiveSupplierAPIType(provider.APIType),
-			"purchaseSource":      config.EffectiveSupplierPurchaseSource(provider.PurchaseSource),
-			"capabilities":        supplierProviderCapabilities(provider),
-			"enabled":             provider.Enabled,
-			"priority":            provider.Priority,
-			"autoPurchaseCount":   provider.AutoPurchaseCount,
+			"id":                            provider.ID,
+			"name":                          provider.Name,
+			"baseUrl":                       provider.BaseURL,
+			"apiType":                       config.EffectiveSupplierAPIType(provider.APIType),
+			"purchaseSource":                config.EffectiveSupplierPurchaseSource(provider.PurchaseSource),
+			"capabilities":                  supplierProviderCapabilities(provider),
+			"enabled":                       provider.Enabled,
+			"priority":                      provider.Priority,
+			"autoPurchaseCount":             provider.AutoPurchaseCount,
+			"pollIntervalSeconds":           providerPollInterval,
+			"configuredPollIntervalSeconds": provider.PollIntervalSeconds,
+			"allowEUFallback":               provider.AllowEUFallback,
+			// Keep the shared aliases for older admin clients. They represent the
+			// US values; region-aware clients use the four explicit fields.
+			"importMaxSSE":        importUSMaxSSE,
+			"importMaxRPM":        importUSMaxRPM,
+			"importUSMaxSSE":      importUSMaxSSE,
+			"importUSMaxRPM":      importUSMaxRPM,
+			"importEUMaxSSE":      importEUMaxSSE,
+			"importEUMaxRPM":      importEUMaxRPM,
 			"hasToken":            strings.TrimSpace(provider.APIToken) != "",
 			"hasWebhookSecret":    strings.TrimSpace(provider.WebhookSecret) != "",
 			"tokenMasked":         maskSupplierToken(provider.APIToken),
@@ -112,8 +127,12 @@ func (h *Handler) apiGetSupplierOverview(w http.ResponseWriter, _ *http.Request)
 		"batches":             batches,
 		"lifetime":            supplierLifetimeSummary(batches),
 		"importDefaults": map[string]int{
-			"maxSSE": supplierImportedMaxSSE,
-			"maxRPM": supplierImportedMaxRPM,
+			"maxSSE":   config.DefaultSupplierImportMaxSSE,
+			"maxRPM":   config.DefaultSupplierImportMaxRPM,
+			"usMaxSSE": config.DefaultSupplierImportMaxSSE,
+			"usMaxRPM": config.DefaultSupplierImportMaxRPM,
+			"euMaxSSE": config.DefaultSupplierImportMaxSSE,
+			"euMaxRPM": config.DefaultSupplierImportMaxRPM,
 		},
 	})
 }
@@ -147,31 +166,88 @@ func (h *Handler) apiUpdateSupplierFeature(w http.ResponseWriter, r *http.Reques
 }
 
 type supplierProviderRequest struct {
-	ID                string `json:"id"`
-	Name              string `json:"name"`
-	BaseURL           string `json:"baseUrl"`
-	APIToken          string `json:"apiToken"`
-	APIType           string `json:"apiType"`
-	PurchaseSource    string `json:"purchaseSource"`
-	Enabled           bool   `json:"enabled"`
-	Priority          int    `json:"priority"`
-	AutoPurchaseCount int    `json:"autoPurchaseCount"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	BaseURL             string   `json:"baseUrl"`
+	APIToken            string   `json:"apiToken"`
+	APIType             string   `json:"apiType"`
+	PurchaseSource      string   `json:"purchaseSource"`
+	Enabled             bool     `json:"enabled"`
+	Priority            int      `json:"priority"`
+	AutoPurchaseCount   int      `json:"autoPurchaseCount"`
+	PollIntervalSeconds *float64 `json:"pollIntervalSeconds"`
+	AllowEUFallback     *bool    `json:"allowEUFallback"`
+	ImportMaxSSE        *int     `json:"importMaxSSE"`
+	ImportMaxRPM        *int     `json:"importMaxRPM"`
+	ImportUSMaxSSE      *int     `json:"importUSMaxSSE"`
+	ImportUSMaxRPM      *int     `json:"importUSMaxRPM"`
+	ImportEUMaxSSE      *int     `json:"importEUMaxSSE"`
+	ImportEUMaxRPM      *int     `json:"importEUMaxRPM"`
+}
+
+func supplierOptionalInt(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func supplierOptionalFloat(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func (r supplierProviderRequest) validateImportLimits() error {
+	if r.PollIntervalSeconds != nil && (*r.PollIntervalSeconds < config.MinSupplierProviderPollIntervalSeconds || *r.PollIntervalSeconds > config.MaxSupplierProviderPollIntervalSeconds) {
+		return fmt.Errorf("pollIntervalSeconds must be between %.1f and %.0f", config.MinSupplierProviderPollIntervalSeconds, config.MaxSupplierProviderPollIntervalSeconds)
+	}
+	limits := []struct {
+		name  string
+		value *int
+	}{
+		{name: "importMaxSSE", value: r.ImportMaxSSE},
+		{name: "importMaxRPM", value: r.ImportMaxRPM},
+		{name: "importUSMaxSSE", value: r.ImportUSMaxSSE},
+		{name: "importUSMaxRPM", value: r.ImportUSMaxRPM},
+		{name: "importEUMaxSSE", value: r.ImportEUMaxSSE},
+		{name: "importEUMaxRPM", value: r.ImportEUMaxRPM},
+	}
+	for _, limit := range limits {
+		if limit.value != nil && *limit.value < 1 {
+			return fmt.Errorf("%s must be greater than 0", limit.name)
+		}
+	}
+	return nil
 }
 
 func (r supplierProviderRequest) configValue(id string) config.SupplierProvider {
 	if id == "" {
 		id = r.ID
 	}
+	allowEUFallback := false
+	if r.AllowEUFallback != nil {
+		allowEUFallback = *r.AllowEUFallback
+	}
 	return config.SupplierProvider{
-		ID:                id,
-		Name:              r.Name,
-		BaseURL:           r.BaseURL,
-		APIToken:          r.APIToken,
-		APIType:           r.APIType,
-		PurchaseSource:    r.PurchaseSource,
-		Enabled:           r.Enabled,
-		Priority:          r.Priority,
-		AutoPurchaseCount: r.AutoPurchaseCount,
+		ID:                  id,
+		Name:                r.Name,
+		BaseURL:             r.BaseURL,
+		APIToken:            r.APIToken,
+		APIType:             r.APIType,
+		PurchaseSource:      r.PurchaseSource,
+		Enabled:             r.Enabled,
+		Priority:            r.Priority,
+		AutoPurchaseCount:   r.AutoPurchaseCount,
+		PollIntervalSeconds: supplierOptionalFloat(r.PollIntervalSeconds),
+		AllowEUFallback:     allowEUFallback,
+		ImportMaxSSE:        supplierOptionalInt(r.ImportMaxSSE),
+		ImportMaxRPM:        supplierOptionalInt(r.ImportMaxRPM),
+		ImportUSMaxSSE:      supplierOptionalInt(r.ImportUSMaxSSE),
+		ImportUSMaxRPM:      supplierOptionalInt(r.ImportUSMaxRPM),
+		ImportEUMaxSSE:      supplierOptionalInt(r.ImportEUMaxSSE),
+		ImportEUMaxRPM:      supplierOptionalInt(r.ImportEUMaxRPM),
 	}
 }
 
@@ -181,10 +257,20 @@ func (h *Handler) apiCreateSupplier(w http.ResponseWriter, r *http.Request) {
 		writeSupplierError(w, http.StatusBadRequest, err)
 		return
 	}
+	if err := body.validateImportLimits(); err != nil {
+		writeSupplierError(w, http.StatusBadRequest, err)
+		return
+	}
 	provider, err := config.AddSupplierProvider(body.configValue(""))
 	if err != nil {
 		writeSupplierError(w, http.StatusBadRequest, err)
 		return
+	}
+	if h.suppliers != nil && provider.Enabled {
+		integration := config.GetSupplierIntegration()
+		if integration.Enabled && integration.AutoPurchaseEnabled {
+			h.suppliers.signal(provider.ID)
+		}
 	}
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -200,6 +286,10 @@ func (h *Handler) apiUpdateSupplier(w http.ResponseWriter, r *http.Request, id s
 		writeSupplierError(w, http.StatusBadRequest, err)
 		return
 	}
+	if err := body.validateImportLimits(); err != nil {
+		writeSupplierError(w, http.StatusBadRequest, err)
+		return
+	}
 	existing := config.GetSupplierProvider(id)
 	if existing == nil {
 		writeSupplierError(w, http.StatusNotFound, config.ErrSupplierNotFound)
@@ -212,6 +302,16 @@ func (h *Handler) apiUpdateSupplier(w http.ResponseWriter, r *http.Request, id s
 	requestedPurchaseSource := config.EffectiveSupplierPurchaseSource(body.PurchaseSource)
 	if strings.TrimSpace(body.PurchaseSource) == "" {
 		requestedPurchaseSource = config.EffectiveSupplierPurchaseSource(existing.PurchaseSource)
+	}
+	// Older admin/API clients do not send this field. Preserve the existing
+	// setting for compatible protocols, while safely resetting it when a
+	// protocol/source change makes regional EU purchases impossible.
+	if body.AllowEUFallback == nil {
+		value := existing.AllowEUFallback
+		if !config.SupplierSupportsEUFallback(config.SupplierProvider{APIType: requestedAPIType, PurchaseSource: requestedPurchaseSource}) {
+			value = false
+		}
+		body.AllowEUFallback = &value
 	}
 	if h.suppliers != nil && h.suppliers.store.hasPendingIntentForProvider(existing.ID) {
 		if requestedAPIType != config.EffectiveSupplierAPIType(existing.APIType) {
@@ -231,6 +331,12 @@ func (h *Handler) apiUpdateSupplier(w http.ResponseWriter, r *http.Request, id s
 		}
 		writeSupplierError(w, status, err)
 		return
+	}
+	if h.suppliers != nil && provider.Enabled {
+		integration := config.GetSupplierIntegration()
+		if integration.Enabled && integration.AutoPurchaseEnabled {
+			h.suppliers.signal(provider.ID)
+		}
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":     true,
@@ -276,7 +382,7 @@ func (h *Handler) apiSetupSupplierWebhook(w http.ResponseWriter, r *http.Request
 		return
 	}
 	apiType := config.EffectiveSupplierAPIType(provider.APIType)
-	if apiType != config.SupplierAPITypeAWSMy && apiType != config.SupplierAPITypeKiroDrop {
+	if apiType != config.SupplierAPITypeAWSMy && apiType != config.SupplierAPITypeKiroDrop && apiType != config.SupplierAPITypeKiroCEO {
 		writeSupplierError(w, http.StatusBadRequest, errSupplierOperationUnsupported)
 		return
 	}
@@ -452,6 +558,7 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 	apiType := config.EffectiveSupplierAPIType(provider.APIType)
 	awsMyProtocol := apiType == config.SupplierAPITypeAWSMy
 	kiroDropProtocol := apiType == config.SupplierAPITypeKiroDrop
+	kiroCEOProtocol := apiType == config.SupplierAPITypeKiroCEO
 	if !kiroDropProtocol && !h.suppliers.allowWebhook(provider.ID) {
 		w.Header().Set("Retry-After", "60")
 		writeSupplierError(w, http.StatusTooManyRequests, errors.New("webhook rate limit exceeded"))
@@ -516,12 +623,12 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		// Providers use this event to verify a configured callback URL. It must
 		// remain a read-only health check even while the integration or provider
 		// is disabled, and must never enter the durable event/purchase workflow.
-		if event.Event == "webhook_test" || (kiroDropProtocol && event.Event == "test") {
+		if event.Event == "webhook_test" || ((kiroDropProtocol || kiroCEOProtocol) && event.Event == "test") {
 			if event.EventID == "" {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id is required"))
 				return
 			}
-			if (awsMyProtocol || kiroDropProtocol) && !isSupplier32HexID(event.EventID) {
+			if (awsMyProtocol || kiroDropProtocol || kiroCEOProtocol) && !isSupplier32HexID(event.EventID) {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
 				return
 			}
@@ -562,7 +669,7 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 		writeSupplierError(w, http.StatusBadRequest, errors.New("event or event_id is too long"))
 		return
 	}
-	if awsMyProtocol || kiroDropProtocol {
+	if awsMyProtocol || kiroDropProtocol || kiroCEOProtocol {
 		if !isSupplier32HexID(event.EventID) {
 			writeSupplierError(w, http.StatusBadRequest, errors.New("event_id must be a 32-character hexadecimal string"))
 			return
@@ -581,6 +688,23 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 	inventoryWake := false
 	switch event.Event {
 	case "new_keys_available":
+		if kiroCEOProtocol {
+			if err := validateKiroCEONewKeysEvent(event); err != nil {
+				writeSupplierError(w, http.StatusBadRequest, err)
+				return
+			}
+			zone := strings.ToLower(strings.TrimSpace(event.Zone))
+			regionAllowed := zone == supplierPurchaseRegionUS || provider.AllowEUFallback
+			if integration.AutoPurchaseEnabled && regionAllowed && liveSupplierAPIKeyCount(provider.ID) == 0 && !h.suppliers.autoPurchaseBlocked(provider.ID) {
+				value, intentErr := newSupplierWebhookPurchaseIntent(*provider, event)
+				if intentErr != nil {
+					writeSupplierError(w, http.StatusBadRequest, intentErr)
+					return
+				}
+				intent = &value
+			}
+			break
+		}
 		if kiroDropProtocol {
 			if err := validateKiroDropNewKeysEvent(event); err != nil {
 				writeSupplierError(w, http.StatusBadRequest, err)
@@ -604,12 +728,18 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 			inventoryWake = true
 		}
 	case "all_keys_dead":
-		if awsMyProtocol || kiroDropProtocol {
+		if awsMyProtocol || kiroDropProtocol || kiroCEOProtocol {
 			if event.Dead < 1 {
 				writeSupplierError(w, http.StatusBadRequest, errors.New("dead must be greater than zero"))
 				return
 			}
-			if awsMyProtocol {
+			if kiroCEOProtocol {
+				if err := validateKiroCEOAllKeysDeadEvent(event); err != nil {
+					writeSupplierError(w, http.StatusBadRequest, err)
+					return
+				}
+			}
+			if awsMyProtocol || kiroCEOProtocol {
 				pendingEvent = true
 			} else {
 				if err := validateKiroDropAllKeysDeadEvent(event); err != nil {
@@ -619,11 +749,20 @@ func (h *Handler) handleSupplierWebhook(w http.ResponseWriter, r *http.Request) 
 				inventoryWake = true
 			}
 		}
+	default:
+		if kiroCEOProtocol {
+			writeSupplierError(w, http.StatusBadRequest, fmt.Errorf("unsupported webhook event %q", event.Event))
+			return
+		}
 	}
 
 	added, workAdded, err := h.suppliers.store.recordEventAndIntent(provider.ID, event, intent, pendingEvent)
 	if err != nil {
-		writeSupplierError(w, http.StatusInternalServerError, fmt.Errorf("persist webhook event: %w", err))
+		status := http.StatusInternalServerError
+		if errors.Is(err, errSupplierWebhookConflict) {
+			status = http.StatusConflict
+		}
+		writeSupplierError(w, status, fmt.Errorf("persist webhook event: %w", err))
 		return
 	}
 	queued := workAdded || (added && inventoryWake)
@@ -744,6 +883,37 @@ func validateKiroDropAllKeysDeadEvent(event supplierWebhookEvent) error {
 	}
 	if strings.TrimSpace(event.OrderID) == "" || len(strings.TrimSpace(event.OrderID)) > 256 {
 		return errors.New("order_id is required and must not exceed 256 characters")
+	}
+	return nil
+}
+
+func validateKiroCEONewKeysEvent(event supplierWebhookEvent) error {
+	if event.NewKeys < 1 || event.NewKeys > config.MaxSupplierPurchaseCount {
+		return fmt.Errorf("new_keys must be between 1 and %d", config.MaxSupplierPurchaseCount)
+	}
+	if !isSupplier32HexID(strings.TrimSpace(event.PurchaseOrderID)) {
+		return errors.New("purchase_order_id must be a 32-character hexadecimal string")
+	}
+	poolID := strings.TrimSpace(event.PoolID)
+	if poolID == "" || len(poolID) > 256 {
+		return errors.New("pool_id is required and must not exceed 256 characters")
+	}
+	zone := strings.ToLower(strings.TrimSpace(event.Zone))
+	if zone != "us" && zone != "eu" {
+		return errors.New("zone must be us or eu")
+	}
+	if len(strings.TrimSpace(event.Message)) > 4096 {
+		return errors.New("message is too long")
+	}
+	return nil
+}
+
+func validateKiroCEOAllKeysDeadEvent(event supplierWebhookEvent) error {
+	if event.Dead < 1 || event.Dead > 100000 {
+		return errors.New("dead must be between 1 and 100000")
+	}
+	if len(strings.TrimSpace(event.Message)) > 4096 {
+		return errors.New("message is too long")
 	}
 	return nil
 }

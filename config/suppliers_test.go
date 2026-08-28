@@ -35,6 +35,9 @@ func TestSupplierProviderLifecycleKeepsPermanentIDAndSecret(t *testing.T) {
 	if created.PurchaseSource != SupplierPurchaseSourceOwn {
 		t.Fatalf("legacy/default purchase source = %q", created.PurchaseSource)
 	}
+	if created.AllowEUFallback {
+		t.Fatal("EU fallback must be disabled by default")
+	}
 
 	updated, err := UpdateSupplierProvider("vendor-a", SupplierProvider{
 		Name:              "Renamed Vendor",
@@ -62,6 +65,202 @@ func TestSupplierProviderLifecycleKeepsPermanentIDAndSecret(t *testing.T) {
 	got := GetSupplierIntegration()
 	if !got.Enabled || !got.AutoPurchaseEnabled || len(got.Providers) != 1 {
 		t.Fatalf("unexpected supplier integration: %+v", got)
+	}
+}
+
+func TestSupplierImportLimitsDefaultAndFollowProviderUpdates(t *testing.T) {
+	initSupplierTestConfig(t)
+	provider, err := AddSupplierProvider(SupplierProvider{
+		ID: "limits", Name: "Limits", BaseURL: "https://limits.example", APIToken: "secret",
+		Enabled: true, AutoPurchaseCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("AddSupplierProvider: %v", err)
+	}
+	if provider.ImportUSMaxSSE != DefaultSupplierImportMaxSSE || provider.ImportUSMaxRPM != DefaultSupplierImportMaxRPM ||
+		provider.ImportEUMaxSSE != DefaultSupplierImportMaxSSE || provider.ImportEUMaxRPM != DefaultSupplierImportMaxRPM {
+		t.Fatalf("default regional import limits = %+v", provider)
+	}
+	accounts := []Account{
+		{ID: "us-managed", AuthMethod: "api_key", KiroApiKey: "ksk_us_managed", AccessToken: "ksk_us_managed", SupplierID: provider.ID, Region: "us-east-1", Enabled: true, MaxSSE: provider.ImportUSMaxSSE, MaxRPM: provider.ImportUSMaxRPM},
+		{ID: "eu-managed", AuthMethod: "api_key", KiroApiKey: "ksk_eu_managed", AccessToken: "ksk_eu_managed", SupplierID: provider.ID, Region: "eu-central-1", Enabled: true, MaxSSE: provider.ImportEUMaxSSE, MaxRPM: provider.ImportEUMaxRPM},
+		{ID: "us-custom", AuthMethod: "api_key", KiroApiKey: "ksk_us_custom", AccessToken: "ksk_us_custom", SupplierID: provider.ID, Region: "us-east-1", Enabled: true, MaxSSE: provider.ImportUSMaxSSE + 1, MaxRPM: provider.ImportUSMaxRPM},
+		{ID: "eu-custom", AuthMethod: "api_key", KiroApiKey: "ksk_eu_custom", AccessToken: "ksk_eu_custom", SupplierID: provider.ID, Region: "eu-central-1", Enabled: true, MaxSSE: provider.ImportEUMaxSSE, MaxRPM: provider.ImportEUMaxRPM + 1},
+	}
+	if added, _, addErr := AddAccounts(accounts); addErr != nil || added != len(accounts) {
+		t.Fatalf("AddAccounts = %d, %v", added, addErr)
+	}
+
+	provider.ImportUSMaxSSE = 700
+	provider.ImportUSMaxRPM = 400
+	provider.ImportEUMaxSSE = 600
+	provider.ImportEUMaxRPM = 350
+	updated, err := UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	if updated.ImportUSMaxSSE != 700 || updated.ImportUSMaxRPM != 400 || updated.ImportEUMaxSSE != 600 || updated.ImportEUMaxRPM != 350 {
+		t.Fatalf("updated regional limits = %+v", updated)
+	}
+	byID := make(map[string]Account)
+	for _, account := range GetAccounts() {
+		byID[account.ID] = account
+	}
+	if got := byID["us-managed"]; got.MaxSSE != 700 || got.MaxRPM != 400 {
+		t.Fatalf("US managed account did not follow provider: %+v", got)
+	}
+	if got := byID["eu-managed"]; got.MaxSSE != 600 || got.MaxRPM != 350 {
+		t.Fatalf("EU managed account did not follow provider: %+v", got)
+	}
+	if got := byID["us-custom"]; got.MaxSSE != DefaultSupplierImportMaxSSE+1 || got.MaxRPM != DefaultSupplierImportMaxRPM {
+		t.Fatalf("US custom account was overwritten: %+v", got)
+	}
+	if got := byID["eu-custom"]; got.MaxSSE != DefaultSupplierImportMaxSSE || got.MaxRPM != DefaultSupplierImportMaxRPM+1 {
+		t.Fatalf("EU custom account was overwritten: %+v", got)
+	}
+
+	// A US-only edit must not alter EU defaults or EU accounts.
+	updated, err = UpdateSupplierProvider(provider.ID, SupplierProvider{
+		Name: updated.Name, BaseURL: updated.BaseURL, Enabled: true, Priority: 2, AutoPurchaseCount: 1,
+		ImportUSMaxSSE: 710, ImportUSMaxRPM: 410,
+	})
+	if err != nil || updated.ImportUSMaxSSE != 710 || updated.ImportUSMaxRPM != 410 || updated.ImportEUMaxSSE != 600 || updated.ImportEUMaxRPM != 350 {
+		t.Fatalf("US-only update changed the wrong limits: %+v, %v", updated, err)
+	}
+	byID = make(map[string]Account)
+	for _, account := range GetAccounts() {
+		byID[account.ID] = account
+	}
+	if got := byID["us-managed"]; got.MaxSSE != 710 || got.MaxRPM != 410 {
+		t.Fatalf("US-only migration failed: %+v", got)
+	}
+	if got := byID["eu-managed"]; got.MaxSSE != 600 || got.MaxRPM != 350 {
+		t.Fatalf("US-only update changed EU account: %+v", got)
+	}
+
+	// An older client that explicitly sends the former shared fields applies
+	// them to both regions, preserving the pre-regional API contract.
+	updated, err = UpdateSupplierProvider(provider.ID, SupplierProvider{
+		Name: updated.Name, BaseURL: updated.BaseURL, Enabled: true, Priority: 3, AutoPurchaseCount: 1,
+		ImportMaxSSE: 800, ImportMaxRPM: 450,
+	})
+	if err != nil || updated.ImportUSMaxSSE != 800 || updated.ImportUSMaxRPM != 450 || updated.ImportEUMaxSSE != 800 || updated.ImportEUMaxRPM != 450 {
+		t.Fatalf("legacy shared update was not applied to both regions: %+v, %v", updated, err)
+	}
+	byID = make(map[string]Account)
+	for _, account := range GetAccounts() {
+		byID[account.ID] = account
+	}
+	if got := byID["us-managed"]; got.MaxSSE != 800 || got.MaxRPM != 450 {
+		t.Fatalf("legacy shared update did not migrate US managed account: %+v", got)
+	}
+	if got := byID["eu-managed"]; got.MaxSSE != 800 || got.MaxRPM != 450 {
+		t.Fatalf("legacy shared update did not migrate EU managed account: %+v", got)
+	}
+	if got := byID["us-custom"]; got.MaxSSE != DefaultSupplierImportMaxSSE+1 || got.MaxRPM != DefaultSupplierImportMaxRPM {
+		t.Fatalf("legacy shared update overwrote US custom account: %+v", got)
+	}
+	if got := byID["eu-custom"]; got.MaxSSE != DefaultSupplierImportMaxSSE || got.MaxRPM != DefaultSupplierImportMaxRPM+1 {
+		t.Fatalf("legacy shared update overwrote EU custom account: %+v", got)
+	}
+
+	// Omitting every import field on an unrelated edit preserves both regions.
+	preserved, err := UpdateSupplierProvider(provider.ID, SupplierProvider{
+		Name: updated.Name, BaseURL: updated.BaseURL, Enabled: true, Priority: 4, AutoPurchaseCount: 1,
+	})
+	if err != nil || preserved.ImportUSMaxSSE != 800 || preserved.ImportUSMaxRPM != 450 || preserved.ImportEUMaxSSE != 800 || preserved.ImportEUMaxRPM != 450 {
+		t.Fatalf("unrelated update lost regional limits: %+v, %v", preserved, err)
+	}
+}
+
+func TestSupplierRegionalImportLimitsPersistAndLegacyValuesLoadIntoBothRegions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := AddSupplierProvider(SupplierProvider{
+		ID: "regional", Name: "Regional", BaseURL: "https://regional.example", APIToken: "secret", AutoPurchaseCount: 1,
+		ImportUSMaxSSE: 720, ImportUSMaxRPM: 410, ImportEUMaxSSE: 610, ImportEUMaxRPM: 340,
+	}); err != nil {
+		t.Fatalf("add regional provider: %v", err)
+	}
+	if _, err := AddSupplierProvider(SupplierProvider{
+		ID: "legacy-shared", Name: "Legacy shared", BaseURL: "https://legacy-shared.example", APIToken: "secret", AutoPurchaseCount: 1,
+		ImportMaxSSE: 660, ImportMaxRPM: 370,
+	}); err != nil {
+		t.Fatalf("add legacy provider: %v", err)
+	}
+	if err := Init(path); err != nil {
+		t.Fatalf("reload Init: %v", err)
+	}
+	regional := GetSupplierProvider("regional")
+	if regional == nil || regional.ImportUSMaxSSE != 720 || regional.ImportUSMaxRPM != 410 || regional.ImportEUMaxSSE != 610 || regional.ImportEUMaxRPM != 340 {
+		t.Fatalf("regional limits after reload = %+v", regional)
+	}
+	legacy := GetSupplierProvider("legacy-shared")
+	if legacy == nil || legacy.ImportUSMaxSSE != 660 || legacy.ImportUSMaxRPM != 370 || legacy.ImportEUMaxSSE != 660 || legacy.ImportEUMaxRPM != 370 {
+		t.Fatalf("legacy limits after reload = %+v", legacy)
+	}
+}
+
+func TestMigrateLegacySupplierImportLimitsIsScopedAndIdempotent(t *testing.T) {
+	initSupplierTestConfig(t)
+	defaultProvider, err := AddSupplierProvider(SupplierProvider{
+		ID: "default", Name: "Default", BaseURL: "https://default.example", APIToken: "default-secret", AutoPurchaseCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("add default provider: %v", err)
+	}
+	customProvider, err := AddSupplierProvider(SupplierProvider{
+		ID: "custom", Name: "Custom", BaseURL: "https://custom.example", APIToken: "custom-secret", AutoPurchaseCount: 1,
+		ImportUSMaxSSE: 800, ImportUSMaxRPM: 450, ImportEUMaxSSE: 600, ImportEUMaxRPM: 350,
+	})
+	if err != nil {
+		t.Fatalf("add custom provider: %v", err)
+	}
+	legacyProvider, err := AddSupplierProvider(SupplierProvider{
+		ID: "legacy", Name: "Legacy", BaseURL: "https://legacy.example", APIToken: "legacy-secret", AutoPurchaseCount: 1,
+		ImportMaxSSE: 300, ImportMaxRPM: 200,
+	})
+	if err != nil {
+		t.Fatalf("add legacy provider: %v", err)
+	}
+	accounts := []Account{
+		{ID: "legacy-default", AuthMethod: "api_key", KiroApiKey: "ksk_legacy_default", AccessToken: "ksk_legacy_default", SupplierID: defaultProvider.ID, MaxSSE: 300, MaxRPM: 200},
+		{ID: "legacy-custom-us", AuthMethod: "api_key", KiroApiKey: "ksk_legacy_custom_us", AccessToken: "ksk_legacy_custom_us", SupplierID: customProvider.ID, Region: "us-east-1", MaxSSE: 300, MaxRPM: 200},
+		{ID: "legacy-custom-eu", AuthMethod: "api_key", KiroApiKey: "ksk_legacy_custom_eu", AccessToken: "ksk_legacy_custom_eu", SupplierID: customProvider.ID, ApiRegion: "eu-central-1", Region: "us-east-1", MaxSSE: 300, MaxRPM: 200},
+		{ID: "manual", AuthMethod: "api_key", KiroApiKey: "ksk_manual", AccessToken: "ksk_manual", MaxSSE: 300, MaxRPM: 200},
+		{ID: "overridden", AuthMethod: "api_key", KiroApiKey: "ksk_overridden", AccessToken: "ksk_overridden", SupplierID: defaultProvider.ID, MaxSSE: 301, MaxRPM: 200},
+		{ID: "oauth", AuthMethod: "social", AccessToken: "oauth-token", RefreshToken: "oauth-refresh", SupplierID: defaultProvider.ID, MaxSSE: 300, MaxRPM: 200},
+		{ID: "intentional-legacy", AuthMethod: "api_key", KiroApiKey: "ksk_intentional_legacy", AccessToken: "ksk_intentional_legacy", SupplierID: legacyProvider.ID, MaxSSE: 300, MaxRPM: 200},
+	}
+	if added, _, addErr := AddAccounts(accounts); addErr != nil || added != len(accounts) {
+		t.Fatalf("AddAccounts = %d, %v", added, addErr)
+	}
+	migrated, err := MigrateLegacySupplierImportLimits()
+	if err != nil || migrated != 3 {
+		t.Fatalf("migration = %d, %v", migrated, err)
+	}
+	byID := make(map[string]Account)
+	for _, account := range GetAccounts() {
+		byID[account.ID] = account
+	}
+	if got := byID["legacy-default"]; got.MaxSSE != DefaultSupplierImportMaxSSE || got.MaxRPM != DefaultSupplierImportMaxRPM {
+		t.Fatalf("default-provider migration = %+v", got)
+	}
+	if got := byID["legacy-custom-us"]; got.MaxSSE != 800 || got.MaxRPM != 450 {
+		t.Fatalf("custom-provider US migration = %+v", got)
+	}
+	if got := byID["legacy-custom-eu"]; got.MaxSSE != 600 || got.MaxRPM != 350 {
+		t.Fatalf("custom-provider EU migration = %+v", got)
+	}
+	for _, id := range []string{"manual", "overridden", "oauth", "intentional-legacy"} {
+		if got := byID[id]; (id != "overridden" && (got.MaxSSE != 300 || got.MaxRPM != 200)) || (id == "overridden" && (got.MaxSSE != 301 || got.MaxRPM != 200)) {
+			t.Fatalf("account %s should be untouched: %+v", id, got)
+		}
+	}
+	if again, againErr := MigrateLegacySupplierImportLimits(); againErr != nil || again != 0 {
+		t.Fatalf("idempotent migration = %d, %v", again, againErr)
 	}
 }
 
@@ -110,6 +309,26 @@ func TestSupplierPublicPurchaseSourceIsValidatedAndPreserved(t *testing.T) {
 		APIType: SupplierAPITypeAWSMy, PurchaseSource: "shared-ish", AutoPurchaseCount: 1,
 	}); err == nil {
 		t.Fatal("unknown purchase source was accepted")
+	}
+}
+
+func TestSupplierEUFallbackIsRegionalOwnInventoryOnly(t *testing.T) {
+	initSupplierTestConfig(t)
+	regional, err := AddSupplierProvider(SupplierProvider{
+		ID: "regional", Name: "Regional", BaseURL: "https://regional.example", APIToken: "secret",
+		APIType: SupplierAPITypeKiroDrop, PurchaseSource: SupplierPurchaseSourceOwn,
+		Enabled: true, AutoPurchaseCount: 2, AllowEUFallback: true,
+	})
+	if err != nil || !regional.AllowEUFallback || !SupplierSupportsEUFallback(regional) {
+		t.Fatalf("regional EU fallback = %+v, %v", regional, err)
+	}
+	for _, provider := range []SupplierProvider{
+		{ID: "aws-own", Name: "AWS Own", BaseURL: "https://aws-own.example", APIToken: "secret", APIType: SupplierAPITypeAWSMy, PurchaseSource: SupplierPurchaseSourceOwn, AutoPurchaseCount: 1, AllowEUFallback: true},
+		{ID: "aws-public", Name: "AWS Public", BaseURL: "https://aws-public.example", APIToken: "secret", APIType: SupplierAPITypeAWSMy, PurchaseSource: SupplierPurchaseSourcePublic, AutoPurchaseCount: 1, AllowEUFallback: true},
+	} {
+		if _, err := AddSupplierProvider(provider); err == nil {
+			t.Fatalf("unsupported EU fallback was accepted: %+v", provider)
+		}
 	}
 }
 
@@ -193,6 +412,23 @@ func TestKiroDropProviderPreservesWriteOnlyWebhookSecret(t *testing.T) {
 	}
 }
 
+func TestKiroCEOProviderUsesDedicatedOwnInventoryProtocol(t *testing.T) {
+	initSupplierTestConfig(t)
+	created, err := AddSupplierProvider(SupplierProvider{
+		ID: "kiro-ceo", Name: "Kiro CEO", BaseURL: "https://kiro.ceo", APIToken: "ceo-secret",
+		APIType: SupplierAPITypeKiroCEO, PurchaseSource: SupplierPurchaseSourceOwn, Enabled: true, AutoPurchaseCount: 5,
+	})
+	if err != nil || created.APIType != SupplierAPITypeKiroCEO || created.PurchaseSource != SupplierPurchaseSourceOwn {
+		t.Fatalf("AddSupplierProvider = %+v, %v", created, err)
+	}
+	if _, err := AddSupplierProvider(SupplierProvider{
+		ID: "kiro-ceo-public", Name: "Invalid", BaseURL: "https://kiro.ceo", APIToken: "ceo-secret",
+		APIType: SupplierAPITypeKiroCEO, PurchaseSource: SupplierPurchaseSourcePublic, AutoPurchaseCount: 1,
+	}); err == nil {
+		t.Fatal("public source was accepted for Kiro CEO")
+	}
+}
+
 func TestSupplierPollIntervalDefaultsValidatesAndPersists(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -224,6 +460,50 @@ func TestSupplierPollIntervalDefaultsValidatesAndPersists(t *testing.T) {
 	}
 }
 
+func TestSupplierProviderPollIntervalIsIndependentPreciseAndCompatible(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	fast, err := AddSupplierProvider(SupplierProvider{
+		ID: "fast", Name: "Fast", BaseURL: "https://fast.example", APIToken: "secret", AutoPurchaseCount: 1,
+		PollIntervalSeconds: 0.1,
+	})
+	if err != nil || fast.PollIntervalSeconds != 0.1 {
+		t.Fatalf("fast provider = %+v, %v", fast, err)
+	}
+	legacy, err := AddSupplierProvider(SupplierProvider{
+		ID: "legacy", Name: "Legacy", BaseURL: "https://legacy.example", APIToken: "secret", AutoPurchaseCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("legacy provider: %v", err)
+	}
+	if got := EffectiveSupplierProviderPollIntervalSeconds(legacy, 7); got != 7 {
+		t.Fatalf("legacy effective interval = %v, want 7", got)
+	}
+	ceo, err := AddSupplierProvider(SupplierProvider{
+		ID: "ceo", Name: "CEO", BaseURL: "https://ceo.example", APIToken: "secret", APIType: SupplierAPITypeKiroCEO, AutoPurchaseCount: 1,
+		PollIntervalSeconds: 0.1,
+	})
+	if err != nil || EffectiveSupplierProviderPollIntervalSeconds(ceo, 1) != 0.1 {
+		t.Fatalf("CEO provider = %+v, %v", ceo, err)
+	}
+	for _, provider := range []SupplierProvider{
+		{ID: "too-fast", Name: "x", BaseURL: "https://x.example", APIToken: "secret", AutoPurchaseCount: 1, PollIntervalSeconds: 0.09},
+		{ID: "too-slow", Name: "x", BaseURL: "https://x.example", APIToken: "secret", AutoPurchaseCount: 1, PollIntervalSeconds: 301},
+	} {
+		if _, err := AddSupplierProvider(provider); err == nil {
+			t.Fatalf("invalid provider interval succeeded: %+v", provider)
+		}
+	}
+	if err := Init(path); err != nil {
+		t.Fatalf("reload Init: %v", err)
+	}
+	if got := GetSupplierProvider("fast"); got == nil || got.PollIntervalSeconds != 0.1 {
+		t.Fatalf("fast interval after reload = %+v", got)
+	}
+}
+
 func TestSupplierValidationRejectsUnsafeOrUnstableValues(t *testing.T) {
 	initSupplierTestConfig(t)
 	tests := []SupplierProvider{
@@ -234,6 +514,12 @@ func TestSupplierValidationRejectsUnsafeOrUnstableValues(t *testing.T) {
 		{ID: "vendor", Name: "x", BaseURL: "https://example.com?q=1", APIToken: "km_x", AutoPurchaseCount: 1},
 		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "", AutoPurchaseCount: 1},
 		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: MaxSupplierPurchaseCount + 1},
+		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: 1, ImportMaxSSE: -1},
+		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: 1, ImportMaxRPM: -1},
+		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: 1, ImportUSMaxSSE: -1},
+		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: 1, ImportUSMaxRPM: -1},
+		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: 1, ImportEUMaxSSE: -1},
+		{ID: "vendor", Name: "x", BaseURL: "https://example.com", APIToken: "km_x", AutoPurchaseCount: 1, ImportEUMaxRPM: -1},
 	}
 	for i, provider := range tests {
 		if _, err := AddSupplierProvider(provider); err == nil {

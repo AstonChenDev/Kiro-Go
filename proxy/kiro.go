@@ -32,6 +32,7 @@ const (
 	streamRetryBackoff           = 700 * time.Millisecond
 	maxStreamAttemptsPerEndpoint = 2
 	maxEventStreamMessageSize    = 16 * 1024 * 1024
+	maxKiroErrorBodyBytes        = 64 * 1024
 )
 
 var (
@@ -271,6 +272,13 @@ type KiroStreamCallback struct {
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
 	OnStopReason   func(reason string)
+
+	// Internal protocol hooks. Route adapters use these to distinguish a
+	// frame-aligned, metadata-terminated stream from a clean EOF that arrived
+	// immediately after generated output. They deliberately stay unexported so
+	// public callers cannot accidentally make transport-integrity decisions.
+	onTerminalEvent func()
+	onCleanEOF      func()
 }
 
 // ==================== API Call ====================
@@ -399,9 +407,13 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		}
 	}
 
+	isAPIKey := config.IsAPIKeyAccount(account)
+	if isAPIKey && apiKeyFourEndpointEnabled(account) {
+		return callAPIKeyFourEndpoints(ctx, account, payload, callback)
+	}
+
 	// Build endpoint list ordered by configuration / credential type.
 	endpoints := resolveKiroEndpoints(account)
-	isAPIKey := config.IsAPIKeyAccount(account)
 
 	var lastErr error
 endpointLoop:
@@ -476,9 +488,14 @@ endpointLoop:
 			}
 
 			if resp.StatusCode == 429 {
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxKiroErrorBodyBytes))
 				resp.Body.Close()
-				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+				upstreamMessage := strings.TrimSpace(string(errBody))
+				if upstreamMessage == "" {
+					upstreamMessage = "quota exhausted or rate limited"
+				}
+				lastErr = fmt.Errorf("HTTP 429 from %s: %s", ep.Name, upstreamMessage)
+				logger.Warnf("[KiroAPI] Endpoint %s returned 429, trying next: %s", ep.Name, upstreamMessage)
 				continue endpointLoop
 			}
 
@@ -499,7 +516,11 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			emitted, err := parseEventStreamTracked(resp.Body, callback)
+			streamCallback := callback
+			if !isAPIKey {
+				streamCallback, _ = trackOAuthStreamCompletion(callback)
+			}
+			emitted, err := parseEventStreamTracked(resp.Body, streamCallback)
 			resp.Body.Close()
 			if err == nil {
 				return nil
@@ -691,17 +712,28 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
+				if callback.onTerminalEvent != nil {
+					callback.onTerminalEvent()
+				}
 			}
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
+				if callback.onTerminalEvent != nil {
+					callback.onTerminalEvent()
+				}
 			}
 		case "metadataEvent":
 			// stopReason rides inside metadataEvent on the wire; there is no
-			// standalone stop reason event type. Its absence after content is
-			// how callers detect a truncated stream.
+			// standalone stop-reason event. Some valid OAuth/social streams omit
+			// it but finish with context/metering trailers; the route completion
+			// adapter handles that shape. Without either signal, callers retain
+			// the strict truncated-stream classification.
 			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
 				callback.OnStopReason(reason)
+			}
+			if callback.onTerminalEvent != nil {
+				callback.onTerminalEvent()
 			}
 		}
 	}
@@ -712,6 +744,12 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	}
 	if !sawOutput {
 		return emitted, errEmptyKiroStream
+	}
+	// Completion adapters run only after every frame and pending tool input was
+	// validated, but before OnComplete, matching the ordering of a real
+	// metadataEvent.stopReason callback.
+	if callback.onCleanEOF != nil {
+		callback.onCleanEOF()
 	}
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)

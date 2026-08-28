@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"sort"
@@ -12,16 +13,23 @@ import (
 )
 
 const (
-	DefaultSupplierPurchaseCount       = 1
-	MaxSupplierPurchaseCount           = 500
-	DefaultSupplierPollIntervalSeconds = 5
-	MinSupplierPollIntervalSeconds     = 1
-	MaxSupplierPollIntervalSeconds     = 300
-	SupplierAPITypeKiroApp             = "kiroapp"
-	SupplierAPITypeAWSMy               = "aws_my"
-	SupplierAPITypeKiroDrop            = "kiro_drop"
-	SupplierPurchaseSourceOwn          = "own"
-	SupplierPurchaseSourcePublic       = "public"
+	DefaultSupplierPurchaseCount           = 1
+	MaxSupplierPurchaseCount               = 500
+	DefaultSupplierPollIntervalSeconds     = 5
+	MinSupplierPollIntervalSeconds         = 1
+	MaxSupplierPollIntervalSeconds         = 300
+	MinSupplierProviderPollIntervalSeconds = 0.1
+	MaxSupplierProviderPollIntervalSeconds = 300.0
+	DefaultSupplierImportMaxSSE            = 500
+	DefaultSupplierImportMaxRPM            = 300
+	SupplierAPITypeKiroApp                 = "kiroapp"
+	SupplierAPITypeAWSMy                   = "aws_my"
+	SupplierAPITypeKiroDrop                = "kiro_drop"
+	SupplierAPITypeKiroCEO                 = "kiro_ceo"
+	SupplierPurchaseSourceOwn              = "own"
+	SupplierPurchaseSourcePublic           = "public"
+	legacySupplierImportMaxSSE             = 300
+	legacySupplierImportMaxRPM             = 200
 )
 
 var supplierIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -52,8 +60,21 @@ type SupplierProvider struct {
 	Enabled           bool   `json:"enabled"`
 	Priority          int    `json:"priority"`
 	AutoPurchaseCount int    `json:"autoPurchaseCount"`
-	CreatedAt         int64  `json:"createdAt"`
-	UpdatedAt         int64  `json:"updatedAt"`
+	// PollIntervalSeconds is a provider-level override. Zero keeps older
+	// configurations following the integration-wide default.
+	PollIntervalSeconds float64 `json:"pollIntervalSeconds,omitempty"`
+	AllowEUFallback     bool    `json:"allowEUFallback,omitempty"`
+	// ImportMaxSSE/ImportMaxRPM are retained as the legacy shared aliases for
+	// older configuration files and API clients. New code uses the regional
+	// fields below; the aliases mirror the US values when saved.
+	ImportMaxSSE   int   `json:"importMaxSSE,omitempty"`
+	ImportMaxRPM   int   `json:"importMaxRPM,omitempty"`
+	ImportUSMaxSSE int   `json:"importUSMaxSSE,omitempty"`
+	ImportUSMaxRPM int   `json:"importUSMaxRPM,omitempty"`
+	ImportEUMaxSSE int   `json:"importEUMaxSSE,omitempty"`
+	ImportEUMaxRPM int   `json:"importEUMaxRPM,omitempty"`
+	CreatedAt      int64 `json:"createdAt"`
+	UpdatedAt      int64 `json:"updatedAt"`
 }
 
 func EffectiveSupplierAPIType(apiType string) string {
@@ -90,10 +111,25 @@ func validateSupplierPurchaseSource(apiType, source string) error {
 
 func validateSupplierAPIType(apiType string) error {
 	switch EffectiveSupplierAPIType(apiType) {
-	case SupplierAPITypeKiroApp, SupplierAPITypeAWSMy, SupplierAPITypeKiroDrop:
+	case SupplierAPITypeKiroApp, SupplierAPITypeAWSMy, SupplierAPITypeKiroDrop, SupplierAPITypeKiroCEO:
 		return nil
 	default:
-		return errors.New("apiType must be kiroapp, aws_my, or kiro_drop")
+		return errors.New("apiType must be kiroapp, aws_my, kiro_drop, or kiro_ceo")
+	}
+}
+
+// SupplierSupportsEUFallback reports whether a provider exposes distinct US
+// and EU inventory that can be selected at purchase time. AWS My own/public
+// pools are regionless from the client's perspective and must remain US-only.
+func SupplierSupportsEUFallback(provider SupplierProvider) bool {
+	if EffectiveSupplierPurchaseSource(provider.PurchaseSource) != SupplierPurchaseSourceOwn {
+		return false
+	}
+	switch EffectiveSupplierAPIType(provider.APIType) {
+	case SupplierAPITypeKiroApp, SupplierAPITypeKiroDrop, SupplierAPITypeKiroCEO:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -162,6 +198,9 @@ func normalizeSupplierProvider(provider *SupplierProvider, creating bool) error 
 	if err := validateSupplierPurchaseSource(provider.APIType, provider.PurchaseSource); err != nil {
 		return err
 	}
+	if provider.AllowEUFallback && !SupplierSupportsEUFallback(*provider) {
+		return errors.New("allowEUFallback requires a regional own-inventory supplier protocol")
+	}
 	if creating && provider.APIToken == "" {
 		return errors.New("apiToken is required")
 	}
@@ -171,8 +210,25 @@ func normalizeSupplierProvider(provider *SupplierProvider, creating bool) error 
 	if provider.AutoPurchaseCount < 1 || provider.AutoPurchaseCount > MaxSupplierPurchaseCount {
 		return fmt.Errorf("autoPurchaseCount must be between 1 and %d", MaxSupplierPurchaseCount)
 	}
+	if err := validateSupplierProviderPollInterval(provider); err != nil {
+		return err
+	}
+	if err := normalizeSupplierImportLimits(provider); err != nil {
+		return err
+	}
 	if provider.Priority < 0 || provider.Priority > 10000 {
 		return errors.New("priority must be between 0 and 10000")
+	}
+	return nil
+}
+
+func validateSupplierProviderPollInterval(provider *SupplierProvider) error {
+	if provider == nil || provider.PollIntervalSeconds == 0 {
+		return nil
+	}
+	interval := provider.PollIntervalSeconds
+	if math.IsNaN(interval) || math.IsInf(interval, 0) || interval < MinSupplierProviderPollIntervalSeconds || interval > MaxSupplierProviderPollIntervalSeconds {
+		return fmt.Errorf("pollIntervalSeconds must be between %.1f and %.0f", MinSupplierProviderPollIntervalSeconds, MaxSupplierProviderPollIntervalSeconds)
 	}
 	return nil
 }
@@ -183,8 +239,71 @@ func cloneSupplierConfig(in SupplierIntegrationConfig) SupplierIntegrationConfig
 	for i := range out.Providers {
 		out.Providers[i].APIType = EffectiveSupplierAPIType(out.Providers[i].APIType)
 		out.Providers[i].PurchaseSource = EffectiveSupplierPurchaseSource(out.Providers[i].PurchaseSource)
+		applySupplierImportLimitDefaults(&out.Providers[i])
 	}
 	return out
+}
+
+func normalizeSupplierImportLimits(provider *SupplierProvider) error {
+	for name, value := range map[string]int{
+		"importMaxSSE": provider.ImportMaxSSE, "importMaxRPM": provider.ImportMaxRPM,
+		"importUSMaxSSE": provider.ImportUSMaxSSE, "importUSMaxRPM": provider.ImportUSMaxRPM,
+		"importEUMaxSSE": provider.ImportEUMaxSSE, "importEUMaxRPM": provider.ImportEUMaxRPM,
+	} {
+		if value < 0 {
+			return fmt.Errorf("%s must be greater than zero", name)
+		}
+	}
+	applySupplierImportLimitDefaults(provider)
+	return nil
+}
+
+func applySupplierImportLimitDefaults(provider *SupplierProvider) {
+	legacySSE := EffectiveSupplierImportMaxSSE(provider.ImportMaxSSE)
+	legacyRPM := EffectiveSupplierImportMaxRPM(provider.ImportMaxRPM)
+	if provider.ImportUSMaxSSE <= 0 {
+		provider.ImportUSMaxSSE = legacySSE
+	}
+	if provider.ImportUSMaxRPM <= 0 {
+		provider.ImportUSMaxRPM = legacyRPM
+	}
+	if provider.ImportEUMaxSSE <= 0 {
+		provider.ImportEUMaxSSE = legacySSE
+	}
+	if provider.ImportEUMaxRPM <= 0 {
+		provider.ImportEUMaxRPM = legacyRPM
+	}
+	// Keep the old fields useful to older readers without collapsing the EU
+	// values. An older writer that explicitly sends these aliases intentionally
+	// applies its shared value to both regions in UpdateSupplierProvider.
+	provider.ImportMaxSSE = provider.ImportUSMaxSSE
+	provider.ImportMaxRPM = provider.ImportUSMaxRPM
+}
+
+func EffectiveSupplierImportMaxSSE(limit int) int {
+	if limit <= 0 {
+		return DefaultSupplierImportMaxSSE
+	}
+	return limit
+}
+
+func EffectiveSupplierImportMaxRPM(limit int) int {
+	if limit <= 0 {
+		return DefaultSupplierImportMaxRPM
+	}
+	return limit
+}
+
+// SupplierImportLimitsForRegion resolves the account limits that must be
+// applied when a supplier key is imported. Older providers with only the
+// shared fields transparently use those values for both regions.
+func SupplierImportLimitsForRegion(provider SupplierProvider, region string) (maxSSE, maxRPM int) {
+	applySupplierImportLimitDefaults(&provider)
+	region = strings.ToLower(strings.TrimSpace(region))
+	if region == "eu" || strings.HasPrefix(region, "eu-") {
+		return provider.ImportEUMaxSSE, provider.ImportEUMaxRPM
+	}
+	return provider.ImportUSMaxSSE, provider.ImportUSMaxRPM
 }
 
 // EffectiveSupplierPollIntervalSeconds keeps configurations written before
@@ -195,6 +314,17 @@ func EffectiveSupplierPollIntervalSeconds(seconds int) int {
 		return DefaultSupplierPollIntervalSeconds
 	}
 	return seconds
+}
+
+// EffectiveSupplierProviderPollIntervalSeconds resolves the independent stock
+// polling cadence for one provider. A zero override inherits the legacy global
+// setting. Every supported protocol uses the same provider-level range.
+func EffectiveSupplierProviderPollIntervalSeconds(provider SupplierProvider, fallbackSeconds int) float64 {
+	interval := provider.PollIntervalSeconds
+	if math.IsNaN(interval) || math.IsInf(interval, 0) || interval < MinSupplierProviderPollIntervalSeconds || interval > MaxSupplierProviderPollIntervalSeconds {
+		interval = float64(EffectiveSupplierPollIntervalSeconds(fallbackSeconds))
+	}
+	return interval
 }
 
 func GetSupplierIntegration() SupplierIntegrationConfig {
@@ -220,6 +350,7 @@ func GetSupplierProvider(id string) *SupplierProvider {
 			provider := cfg.SupplierIntegration.Providers[i]
 			provider.APIType = EffectiveSupplierAPIType(provider.APIType)
 			provider.PurchaseSource = EffectiveSupplierPurchaseSource(provider.PurchaseSource)
+			applySupplierImportLimitDefaults(&provider)
 			return &provider
 		}
 	}
@@ -295,6 +426,13 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 	apiTypeProvided := strings.TrimSpace(update.APIType) != ""
 	purchaseSourceProvided := strings.TrimSpace(update.PurchaseSource) != ""
 	apiTokenProvided := strings.TrimSpace(update.APIToken) != ""
+	pollIntervalProvided := update.PollIntervalSeconds != 0
+	importMaxSSEProvided := update.ImportMaxSSE != 0
+	importMaxRPMProvided := update.ImportMaxRPM != 0
+	importUSMaxSSEProvided := update.ImportUSMaxSSE != 0
+	importUSMaxRPMProvided := update.ImportUSMaxRPM != 0
+	importEUMaxSSEProvided := update.ImportEUMaxSSE != 0
+	importEUMaxRPMProvided := update.ImportEUMaxRPM != 0
 	if err := normalizeSupplierProvider(&update, false); err != nil {
 		return SupplierProvider{}, err
 	}
@@ -318,28 +456,131 @@ func UpdateSupplierProvider(id string, update SupplierProvider) (SupplierProvide
 				update.PurchaseSource = EffectiveSupplierPurchaseSource(previous.PurchaseSource)
 			}
 		}
+		if !pollIntervalProvided {
+			update.PollIntervalSeconds = previous.PollIntervalSeconds
+		}
 		if err := validateSupplierPurchaseSource(update.APIType, update.PurchaseSource); err != nil {
 			return SupplierProvider{}, err
+		}
+		if err := validateSupplierProviderPollInterval(&update); err != nil {
+			return SupplierProvider{}, err
+		}
+		if update.AllowEUFallback && !SupplierSupportsEUFallback(update) {
+			return SupplierProvider{}, errors.New("allowEUFallback requires a regional own-inventory supplier protocol")
 		}
 		connectionChanged := update.APIType != EffectiveSupplierAPIType(previous.APIType) ||
 			update.BaseURL != previous.BaseURL || (apiTokenProvided && update.APIToken != previous.APIToken)
 		if update.APIToken == "" {
 			update.APIToken = previous.APIToken
 		}
+		previousLimits := previous
+		applySupplierImportLimitDefaults(&previousLimits)
+		if !importUSMaxSSEProvided && !importMaxSSEProvided {
+			update.ImportUSMaxSSE = previousLimits.ImportUSMaxSSE
+		}
+		if !importUSMaxRPMProvided && !importMaxRPMProvided {
+			update.ImportUSMaxRPM = previousLimits.ImportUSMaxRPM
+		}
+		if !importEUMaxSSEProvided && !importMaxSSEProvided {
+			update.ImportEUMaxSSE = previousLimits.ImportEUMaxSSE
+		}
+		if !importEUMaxRPMProvided && !importMaxRPMProvided {
+			update.ImportEUMaxRPM = previousLimits.ImportEUMaxRPM
+		}
+		update.ImportMaxSSE = update.ImportUSMaxSSE
+		update.ImportMaxRPM = update.ImportUSMaxRPM
 		if update.WebhookSecret == "" && !connectionChanged {
 			update.WebhookSecret = previous.WebhookSecret
 		}
 		if update.APIToken == "" {
 			return SupplierProvider{}, errors.New("apiToken is required")
 		}
+		previousAccounts := append([]Account(nil), cfg.Accounts...)
 		cfg.SupplierIntegration.Providers[i] = update
+		migrateSupplierAccountRegionLimitsLocked(previous.ID, false, previousLimits.ImportUSMaxSSE, previousLimits.ImportUSMaxRPM, update.ImportUSMaxSSE, update.ImportUSMaxRPM)
+		migrateSupplierAccountRegionLimitsLocked(previous.ID, true, previousLimits.ImportEUMaxSSE, previousLimits.ImportEUMaxRPM, update.ImportEUMaxSSE, update.ImportEUMaxRPM)
 		if err := saveLocked(); err != nil {
 			cfg.SupplierIntegration.Providers[i] = previous
+			cfg.Accounts = previousAccounts
 			return SupplierProvider{}, err
 		}
 		return update, nil
 	}
 	return SupplierProvider{}, ErrSupplierNotFound
+}
+
+func migrateSupplierAccountRegionLimitsLocked(providerID string, eu bool, oldSSE, oldRPM, newSSE, newRPM int) int {
+	if providerID == "" || oldSSE == newSSE && oldRPM == newRPM {
+		return 0
+	}
+	migrated := 0
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		if account.SupplierID != providerID || !IsAPIKeyAccount(account) || supplierAccountUsesEU(account) != eu ||
+			account.MaxSSE != oldSSE || account.MaxRPM != oldRPM {
+			continue
+		}
+		account.MaxSSE = newSSE
+		account.MaxRPM = newRPM
+		migrated++
+	}
+	return migrated
+}
+
+func supplierAccountUsesEU(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	region := strings.ToLower(strings.TrimSpace(account.ApiRegion))
+	if region == "" {
+		region = strings.ToLower(strings.TrimSpace(account.Region))
+	}
+	return region == "eu" || strings.HasPrefix(region, "eu-")
+}
+
+// MigrateLegacySupplierImportLimits upgrades only supplier-managed API-key
+// accounts that still carry the former 300/200 defaults. Manual accounts and
+// accounts whose limits were customized remain untouched. It is idempotent and
+// can safely run at every startup.
+func MigrateLegacySupplierImportLimits() (int, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return 0, nil
+	}
+
+	providers := make(map[string]SupplierProvider, len(cfg.SupplierIntegration.Providers))
+	for _, provider := range cfg.SupplierIntegration.Providers {
+		providers[provider.ID] = provider
+	}
+	previousAccounts := append([]Account(nil), cfg.Accounts...)
+	migrated := 0
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		provider, ok := providers[account.SupplierID]
+		if !ok || !IsAPIKeyAccount(account) || account.MaxSSE != legacySupplierImportMaxSSE || account.MaxRPM != legacySupplierImportMaxRPM {
+			continue
+		}
+		region := "us"
+		if supplierAccountUsesEU(account) {
+			region = "eu"
+		}
+		newSSE, newRPM := SupplierImportLimitsForRegion(provider, region)
+		if newSSE == legacySupplierImportMaxSSE && newRPM == legacySupplierImportMaxRPM {
+			continue
+		}
+		account.MaxSSE = newSSE
+		account.MaxRPM = newRPM
+		migrated++
+	}
+	if migrated == 0 {
+		return 0, nil
+	}
+	if err := saveLocked(); err != nil {
+		cfg.Accounts = previousAccounts
+		return 0, err
+	}
+	return migrated, nil
 }
 
 // UpdateSupplierWebhookSecret persists the signing secret returned by a

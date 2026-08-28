@@ -939,6 +939,39 @@ func TestCallKiroAPIContextStopsRetryWhenClientCancels(t *testing.T) {
 	}
 }
 
+func TestCallKiroAPIIncludesUpstream429Body(t *testing.T) {
+	const upstreamBody = `{"message":"Monthly quota reached","reason":"QUOTA_EXHAUSTED"}`
+	installKiroStreamTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+			Header:     make(http.Header),
+		}, nil
+	}))
+
+	err := CallKiroAPI(newKiroRetryTestAPIKeyAccount(""), newKiroRetryTestPayload(), &KiroStreamCallback{})
+	want := "HTTP 429 from Kiro CLI: " + upstreamBody
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestCallKiroAPIUsesReadableFallbackForEmpty429Body(t *testing.T) {
+	installKiroStreamTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	}))
+
+	err := CallKiroAPI(newKiroRetryTestAPIKeyAccount(""), newKiroRetryTestPayload(), &KiroStreamCallback{})
+	want := "HTTP 429 from Kiro CLI: quota exhausted or rate limited"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
 func installKiroRetryTestEndpoints(t *testing.T) {
 	t.Helper()
 	oldResolver := resolveKiroEndpoints

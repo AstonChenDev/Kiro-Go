@@ -20,31 +20,181 @@ import (
 )
 
 type fakeSupplierAPI struct {
-	mu              sync.Mutex
-	stock           supplierStock
-	stockErr        error
-	publicStock     supplierPublicStock
-	publicStockErr  error
-	publicOrders    []supplierPublicPurchaseOrder
-	publicOrdersErr error
-	profile         supplierProfile
-	keys            supplierKeysPage
-	keysErr         error
-	purchase        supplierPurchaseResponse
-	purchaseErr     error
-	purchaseCalls   int
-	purchaseIDs     []string
-	purchaseRegions []string
-	purchaseCounts  []int
-	purchaseOrders  []string
-	purchaseSources []string
-	purchaseBatches []string
-	stockCallCh     chan struct{}
-	setWebhookURL   string
-	webhookSecret   string
-	setWebhookErr   error
-	webhookTestErr  error
-	webhookTests    int
+	mu               sync.Mutex
+	stock            supplierStock
+	stockErr         error
+	stockCalls       int
+	publicStock      supplierPublicStock
+	publicStockErr   error
+	publicOrders     []supplierPublicPurchaseOrder
+	publicOrdersErr  error
+	profile          supplierProfile
+	profileErr       error
+	profileCalls     int
+	keys             supplierKeysPage
+	keysErr          error
+	purchase         supplierPurchaseResponse
+	purchaseErr      error
+	purchaseCalls    int
+	purchaseIDs      []string
+	purchaseRegions  []string
+	purchaseCounts   []int
+	purchaseOrders   []string
+	purchaseSources  []string
+	purchaseBatches  []string
+	purchaseTriggers []string
+	stockCallCh      chan struct{}
+	stockEntered     chan struct{}
+	stockRelease     <-chan struct{}
+	setWebhookURL    string
+	webhookSecret    string
+	setWebhookErr    error
+	webhookTestErr   error
+	webhookTests     int
+}
+
+func TestKiroCEOSupplierAPIContractAndPartialFill(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	const orderID = "0123456789abcdef0123456789abcdef"
+	var purchaseBody map[string]any
+	var webhookMethod string
+	var testedWebhook bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "ceo-secret" {
+			t.Errorf("X-API-Key = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("unexpected Authorization = %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/my/profile":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": "merchant-1", "name": "Merchant", "email": "ops@example.com",
+				"remaining": "88.50", "min_purchase": 1, "max_purchase": 20,
+			})
+		case "/api/my/stock":
+			json.NewEncoder(w).Encode(map[string]any{"zones": []map[string]any{
+				{"zone": "us", "aws_region": "us-east-1", "stock": 12, "available": 9, "max": 7, "unit_price": "10.50", "enabled": true},
+				{"zone": "eu", "aws_region": "eu-central-1", "stock": 4, "available": 3, "max": 2, "unit_price": "12.00", "enabled": true},
+			}})
+		case "/api/my/keys":
+			if r.URL.Query().Get("history") != "1" {
+				t.Errorf("history query = %q", r.URL.RawQuery)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"count": 2, "active": 1, "keys": []map[string]any{
+					{"key": "ksk_ceo_active", "status": "active", "zone": "us", "aws_region": "us-east-1"},
+					{"key": "ksk_ceo_dead", "status": "dead", "zone": "eu", "aws_region": "eu-central-1"},
+				},
+			})
+		case "/api/my/purchase":
+			if err := json.NewDecoder(r.Body).Decode(&purchaseBody); err != nil {
+				t.Errorf("decode purchase: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"client_order_id": orderID, "order_id": "ceo-order-1", "purchased": 2,
+				"remaining": "67.50", "zone": "us", "unit_price": 10.5, "total_credits": 21,
+				"keys": []map[string]any{{"key": "ksk_ceo_one"}, {"key": "ksk_ceo_two"}},
+			})
+		case "/api/my/webhook":
+			webhookMethod = r.Method
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode webhook: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"webhook_url": body["webhook_url"]})
+		case "/api/me/webhook/test":
+			testedWebhook = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	api := newHTTPSupplierAPI(config.SupplierProvider{
+		BaseURL: server.URL, APIToken: "ceo-secret", APIType: config.SupplierAPITypeKiroCEO,
+	})
+	profile, err := api.GetProfile()
+	if err != nil || profile.User.ID != "merchant-1" || profile.User.Balance != 88.5 || profile.User.MinPurchase != 1 || profile.User.MaxPurchase != 20 {
+		t.Fatalf("GetProfile = %+v, %v", profile, err)
+	}
+	stock, err := api.GetStock()
+	if err != nil || stock.Stock != 9 || stock.StockUS != 7 || stock.StockEU != 2 || stock.PriceMin != 10.5 || stock.PriceMax != 12 {
+		t.Fatalf("GetStock = %+v, %v", stock, err)
+	}
+	keys, err := api.GetKeys(true, 1, 50)
+	if err != nil || keys.Total != 2 || keys.Items[0].Region != "us-east-1" || keys.Items[1].Region != "eu-central-1" {
+		t.Fatalf("GetKeys = %+v, %v", keys, err)
+	}
+	purchase, err := api.Purchase(supplierPurchaseRequest{Count: 3, Region: "us", ClientOrderID: orderID})
+	if err != nil || purchase.Requested != 3 || purchase.Purchased != 2 || purchase.TotalDebit != 21 || purchase.Remaining != float64(67.5) ||
+		len(purchase.Keys) != 2 || purchase.Keys[0].Region != "us-east-1" {
+		t.Fatalf("Purchase = %+v, %v", purchase, err)
+	}
+	if purchaseBody["count"] != float64(3) || purchaseBody["zone"] != "us" || purchaseBody["client_order_id"] != orderID || purchaseBody["region"] != nil {
+		t.Fatalf("purchase body = %#v", purchaseBody)
+	}
+	webhookURL := "https://kiro.example/api/supplier-webhooks/ceo"
+	if _, err := api.SetWebhook(webhookURL); err != nil || webhookMethod != http.MethodPut {
+		t.Fatalf("SetWebhook method=%q err=%v", webhookMethod, err)
+	}
+	if err := api.TestWebhook(); err != nil || !testedWebhook {
+		t.Fatalf("TestWebhook tested=%v err=%v", testedWebhook, err)
+	}
+}
+
+func TestKiroCEOPurchaseRejectsUnsafeResponses(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	const orderID = "0123456789abcdef0123456789abcdef"
+	base := map[string]any{
+		"client_order_id": orderID, "order_id": "ceo-order", "purchased": 1,
+		"remaining": 90, "zone": "us", "unit_price": 10, "total_credits": 10,
+		"keys": []map[string]any{{"key": "ksk_valid"}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "wrong client order", mutate: func(v map[string]any) { v["client_order_id"] = strings.Repeat("a", 32) }},
+		{name: "overfilled", mutate: func(v map[string]any) {
+			v["purchased"] = 3
+			v["keys"] = []map[string]any{{"key": "a"}, {"key": "b"}, {"key": "c"}}
+			v["total_credits"] = 30
+		}},
+		{name: "missing key", mutate: func(v map[string]any) { v["keys"] = []map[string]any{} }},
+		{name: "wrong zone", mutate: func(v map[string]any) { v["zone"] = "eu" }},
+		{name: "missing order", mutate: func(v map[string]any) { v["order_id"] = "" }},
+		{name: "debit mismatch", mutate: func(v map[string]any) { v["total_credits"] = 11 }},
+		{name: "negative remaining", mutate: func(v map[string]any) { v["remaining"] = -1 }},
+		{name: "duplicate keys", mutate: func(v map[string]any) {
+			v["purchased"] = 2
+			v["total_credits"] = 20
+			v["keys"] = []map[string]any{{"key": "same"}, {"key": "same"}}
+		}},
+		{name: "wrong key region", mutate: func(v map[string]any) {
+			v["keys"] = []map[string]any{{"key": "ksk_valid", "aws_region": "eu-central-1"}}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := make(map[string]any, len(base))
+			for key, value := range base {
+				response[key] = value
+			}
+			tt.mutate(response)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(response) }))
+			defer server.Close()
+			api := newHTTPSupplierAPI(config.SupplierProvider{BaseURL: server.URL, APIToken: "secret", APIType: config.SupplierAPITypeKiroCEO})
+			if _, err := api.Purchase(supplierPurchaseRequest{Count: 2, Region: "us", ClientOrderID: orderID}); err == nil {
+				t.Fatalf("unsafe response was accepted: %#v", response)
+			}
+		})
+	}
 }
 
 func TestKiroDropSupplierAPIContract(t *testing.T) {
@@ -163,14 +313,28 @@ func TestKiroDropPurchaseRejectsWrongRegionAndRefundedReplay(t *testing.T) {
 
 func (f *fakeSupplierAPI) GetStock() (supplierStock, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.stockCalls++
+	stock := f.stock
+	err := f.stockErr
+	entered := f.stockEntered
+	release := f.stockRelease
 	if f.stockCallCh != nil {
 		select {
 		case f.stockCallCh <- struct{}{}:
 		default:
 		}
 	}
-	return f.stock, f.stockErr
+	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
+	return stock, err
 }
 
 func (f *fakeSupplierAPI) GetPublicStock() (supplierPublicStock, error) {
@@ -194,7 +358,8 @@ func (f *fakeSupplierAPI) GetPublicPurchaseOrders() ([]supplierPublicPurchaseOrd
 func (f *fakeSupplierAPI) GetProfile() (supplierProfile, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.profile, nil
+	f.profileCalls++
+	return f.profile, f.profileErr
 }
 
 func (f *fakeSupplierAPI) GetKeys(bool, int, int) (supplierKeysPage, error) {
@@ -213,6 +378,7 @@ func (f *fakeSupplierAPI) Purchase(request supplierPurchaseRequest) (supplierPur
 	f.purchaseOrders = append(f.purchaseOrders, request.SupplierOrderID)
 	f.purchaseSources = append(f.purchaseSources, request.PurchaseSource)
 	f.purchaseBatches = append(f.purchaseBatches, request.BatchID)
+	f.purchaseTriggers = append(f.purchaseTriggers, request.Trigger)
 	return f.purchase, f.purchaseErr
 }
 
@@ -264,7 +430,8 @@ func newSupplierTestManager(t *testing.T, fake *fakeSupplierAPI) (*Handler, *sup
 		apiFactory: func(config.SupplierProvider) supplierAPI {
 			return fake
 		},
-		wake: make(chan supplierWake, 1),
+		wake:         make(chan supplierWake, 1),
+		pollInterval: currentSupplierPollInterval,
 	}
 	h.suppliers = m
 	return h, m, provider
@@ -295,7 +462,7 @@ func TestSupplierPurchaseImportsAccountsWithRequiredDefaults(t *testing.T) {
 		t.Fatalf("accounts = %d, want 2", len(accounts))
 	}
 	for _, account := range accounts {
-		if account.MaxSSE != 300 || account.MaxRPM != 200 {
+		if account.MaxSSE != config.DefaultSupplierImportMaxSSE || account.MaxRPM != config.DefaultSupplierImportMaxRPM {
 			t.Fatalf("supplier defaults not applied: %+v", account)
 		}
 		if account.SupplierID != provider.ID || account.SupplierBatchID != outcome.Intent.ID {
@@ -304,6 +471,72 @@ func TestSupplierPurchaseImportsAccountsWithRequiredDefaults(t *testing.T) {
 		if !account.Enabled || account.AuthMethod != "api_key" || account.Region != "us-east-1" {
 			t.Fatalf("invalid imported account: %+v", account)
 		}
+	}
+}
+
+func TestSupplierPurchaseUsesProviderSpecificImportLimits(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "provider-limits",
+		Keys: []supplierKey{{Key: "ksk_provider_specific_limits"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.ImportUSMaxSSE = 750
+	provider.ImportUSMaxRPM = 420
+	provider.ImportEUMaxSSE = 640
+	provider.ImportEUMaxRPM = 360
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	if _, err := manager.startPurchase(updated, 1, "us", true, "manual"); err != nil {
+		t.Fatalf("US startPurchase: %v", err)
+	}
+	fake.mu.Lock()
+	fake.purchase = supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "provider-eu-limits",
+		Keys: []supplierKey{{Key: "ksk_provider_eu_limits"}},
+	}
+	fake.mu.Unlock()
+	if _, err := manager.startPurchase(updated, 1, "eu", true, "manual"); err != nil {
+		t.Fatalf("EU startPurchase: %v", err)
+	}
+	accounts := config.GetAccounts()
+	if len(accounts) != 2 {
+		t.Fatalf("provider-specific limits not applied: %+v", accounts)
+	}
+	byRegion := make(map[string]config.Account, len(accounts))
+	for _, account := range accounts {
+		byRegion[account.Region] = account
+	}
+	if got := byRegion["us-east-1"]; got.MaxSSE != 750 || got.MaxRPM != 420 {
+		t.Fatalf("US provider limits not applied: %+v", got)
+	}
+	if got := byRegion["eu-central-1"]; got.MaxSSE != 640 || got.MaxRPM != 360 {
+		t.Fatalf("EU provider limits not applied: %+v", got)
+	}
+
+	overview := httptest.NewRecorder()
+	h.apiGetSupplierOverview(overview, httptest.NewRequest(http.MethodGet, "/admin/api/suppliers/overview", nil))
+	if overview.Code != http.StatusOK {
+		t.Fatalf("overview status=%d body=%s", overview.Code, overview.Body.String())
+	}
+	var body struct {
+		Providers []struct {
+			ImportMaxSSE   int `json:"importMaxSSE"`
+			ImportMaxRPM   int `json:"importMaxRPM"`
+			ImportUSMaxSSE int `json:"importUSMaxSSE"`
+			ImportUSMaxRPM int `json:"importUSMaxRPM"`
+			ImportEUMaxSSE int `json:"importEUMaxSSE"`
+			ImportEUMaxRPM int `json:"importEUMaxRPM"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(overview.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	if len(body.Providers) != 1 || body.Providers[0].ImportMaxSSE != 750 || body.Providers[0].ImportMaxRPM != 420 ||
+		body.Providers[0].ImportUSMaxSSE != 750 || body.Providers[0].ImportUSMaxRPM != 420 ||
+		body.Providers[0].ImportEUMaxSSE != 640 || body.Providers[0].ImportEUMaxRPM != 360 {
+		t.Fatalf("overview limits = %+v", body.Providers)
 	}
 }
 
@@ -339,10 +572,107 @@ func TestSupplierSettingsUpdatePollIntervalAndPreserveItForOlderClients(t *testi
 	}
 }
 
+func TestSupplierProviderAPIUpdatesImportLimits(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	h, _, provider := newSupplierTestManager(t, fake)
+	body := fmt.Sprintf(`{"name":%q,"baseUrl":%q,"enabled":true,"priority":1,"autoPurchaseCount":2,"pollIntervalSeconds":0.1,"allowEUFallback":true,"importUSMaxSSE":680,"importUSMaxRPM":390,"importEUMaxSSE":580,"importEUMaxRPM":330}`, provider.Name, provider.BaseURL)
+	recorder := httptest.NewRecorder()
+	h.apiUpdateSupplier(recorder, httptest.NewRequest(http.MethodPut, "/admin/api/suppliers/"+provider.ID, strings.NewReader(body)), provider.ID)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	updated := config.GetSupplierProvider(provider.ID)
+	if updated == nil || updated.ImportUSMaxSSE != 680 || updated.ImportUSMaxRPM != 390 ||
+		updated.ImportEUMaxSSE != 580 || updated.ImportEUMaxRPM != 330 || updated.PollIntervalSeconds != 0.1 || !updated.AllowEUFallback {
+		t.Fatalf("provider import limits not saved: %+v", updated)
+	}
+	overview := httptest.NewRecorder()
+	h.apiGetSupplierOverview(overview, httptest.NewRequest(http.MethodGet, "/admin/api/suppliers/overview", nil))
+	var overviewBody struct {
+		Providers []struct {
+			AllowEUFallback     bool            `json:"allowEUFallback"`
+			Capabilities        map[string]bool `json:"capabilities"`
+			ImportUSMaxSSE      int             `json:"importUSMaxSSE"`
+			ImportUSMaxRPM      int             `json:"importUSMaxRPM"`
+			ImportEUMaxSSE      int             `json:"importEUMaxSSE"`
+			ImportEUMaxRPM      int             `json:"importEUMaxRPM"`
+			PollIntervalSeconds float64         `json:"pollIntervalSeconds"`
+		} `json:"providers"`
+	}
+	if overview.Code != http.StatusOK || json.Unmarshal(overview.Body.Bytes(), &overviewBody) != nil || len(overviewBody.Providers) != 1 ||
+		!overviewBody.Providers[0].AllowEUFallback || !overviewBody.Providers[0].Capabilities["euFallback"] ||
+		overviewBody.Providers[0].ImportUSMaxSSE != 680 || overviewBody.Providers[0].ImportUSMaxRPM != 390 ||
+		overviewBody.Providers[0].ImportEUMaxSSE != 580 || overviewBody.Providers[0].ImportEUMaxRPM != 330 || overviewBody.Providers[0].PollIntervalSeconds != 0.1 {
+		t.Fatalf("overview did not expose EU fallback: status=%d body=%s", overview.Code, overview.Body.String())
+	}
+
+	// Older clients omit the new switch. Unrelated edits must preserve it.
+	legacyBody := fmt.Sprintf(`{"name":%q,"baseUrl":%q,"enabled":true,"priority":2,"autoPurchaseCount":2,"importMaxSSE":680,"importMaxRPM":390}`, provider.Name, provider.BaseURL)
+	legacy := httptest.NewRecorder()
+	h.apiUpdateSupplier(legacy, httptest.NewRequest(http.MethodPut, "/admin/api/suppliers/"+provider.ID, strings.NewReader(legacyBody)), provider.ID)
+	legacyProvider := config.GetSupplierProvider(provider.ID)
+	if legacy.Code != http.StatusOK || legacyProvider == nil || !legacyProvider.AllowEUFallback ||
+		legacyProvider.ImportUSMaxSSE != 680 || legacyProvider.ImportUSMaxRPM != 390 ||
+		legacyProvider.ImportEUMaxSSE != 680 || legacyProvider.ImportEUMaxRPM != 390 || legacyProvider.PollIntervalSeconds != 0.1 {
+		t.Fatalf("legacy update lost EU fallback: status=%d body=%s provider=%+v", legacy.Code, legacy.Body.String(), legacyProvider)
+	}
+
+	disableBody := fmt.Sprintf(`{"name":%q,"baseUrl":%q,"enabled":true,"priority":2,"autoPurchaseCount":2,"allowEUFallback":false,"importMaxSSE":680,"importMaxRPM":390}`, provider.Name, provider.BaseURL)
+	disabled := httptest.NewRecorder()
+	h.apiUpdateSupplier(disabled, httptest.NewRequest(http.MethodPut, "/admin/api/suppliers/"+provider.ID, strings.NewReader(disableBody)), provider.ID)
+	disabledProvider := config.GetSupplierProvider(provider.ID)
+	if disabled.Code != http.StatusOK || disabledProvider == nil || disabledProvider.AllowEUFallback {
+		t.Fatalf("explicit disable failed: status=%d body=%s provider=%+v", disabled.Code, disabled.Body.String(), disabledProvider)
+	}
+}
+
+func TestSupplierProviderAPIRejectsExplicitNonPositiveImportLimits(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	h, _, provider := newSupplierTestManager(t, fake)
+	fields := []string{
+		"importMaxSSE", "importMaxRPM",
+		"importUSMaxSSE", "importUSMaxRPM",
+		"importEUMaxSSE", "importEUMaxRPM",
+	}
+	for _, field := range fields {
+		for _, value := range []int{0, -1} {
+			t.Run(fmt.Sprintf("update_%s_%d", field, value), func(t *testing.T) {
+				body := fmt.Sprintf(`{%q:%d}`, field, value)
+				recorder := httptest.NewRecorder()
+				h.apiUpdateSupplier(recorder, httptest.NewRequest(http.MethodPut, "/admin/api/suppliers/"+provider.ID, strings.NewReader(body)), provider.ID)
+				if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), field) {
+					t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+				}
+			})
+		}
+	}
+
+	create := httptest.NewRecorder()
+	createBody := `{"id":"invalid-limits","name":"Invalid limits","baseUrl":"https://invalid.example","apiToken":"secret","enabled":true,"autoPurchaseCount":1,"importEUMaxRPM":0}`
+	h.apiCreateSupplier(create, httptest.NewRequest(http.MethodPost, "/admin/api/suppliers", strings.NewReader(createBody)))
+	if create.Code != http.StatusBadRequest || !strings.Contains(create.Body.String(), "importEUMaxRPM") || config.GetSupplierProvider("invalid-limits") != nil {
+		t.Fatalf("create status=%d body=%s provider=%+v", create.Code, create.Body.String(), config.GetSupplierProvider("invalid-limits"))
+	}
+	for _, value := range []string{"0", "0.09", "301"} {
+		t.Run("poll_interval_"+value, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			body := `{"pollIntervalSeconds":` + value + `}`
+			h.apiUpdateSupplier(recorder, httptest.NewRequest(http.MethodPut, "/admin/api/suppliers/"+provider.ID, strings.NewReader(body)), provider.ID)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "pollIntervalSeconds") {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestSupplierManagerReschedulesPollIntervalWithoutRestart(t *testing.T) {
 	calls := make(chan struct{}, 4)
 	fake := &fakeSupplierAPI{stockCallCh: calls}
-	_, manager, _ := newSupplierTestManager(t, fake)
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.PollIntervalSeconds = 0.1
+	if _, err := config.UpdateSupplierProvider(provider.ID, provider); err != nil {
+		t.Fatalf("set provider polling interval: %v", err)
+	}
 
 	var intervalMu sync.RWMutex
 	interval := time.Hour
@@ -372,6 +702,121 @@ func TestSupplierManagerReschedulesPollIntervalWithoutRestart(t *testing.T) {
 			<-done
 			t.Fatalf("timed out waiting for stock call %d after dynamic reschedule", call)
 		}
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("supplier manager did not stop")
+	}
+}
+
+func TestSupplierManagerSchedulesProvidersIndependentlyAtOneHundredMilliseconds(t *testing.T) {
+	fastCalls := make(chan struct{}, 8)
+	slowCalls := make(chan struct{}, 8)
+	fastAPI := &fakeSupplierAPI{stockCallCh: fastCalls}
+	slowAPI := &fakeSupplierAPI{stockCallCh: slowCalls}
+	_, manager, fastProvider := newSupplierTestManager(t, fastAPI)
+	fastProvider.PollIntervalSeconds = 0.1
+	if _, err := config.UpdateSupplierProvider(fastProvider.ID, fastProvider); err != nil {
+		t.Fatalf("update fast provider: %v", err)
+	}
+	slowProvider, err := config.AddSupplierProvider(config.SupplierProvider{
+		ID: "vendor-slow", Name: "Slow", BaseURL: "https://slow.example", APIToken: "slow-secret",
+		Enabled: true, Priority: 2, AutoPurchaseCount: 1, PollIntervalSeconds: 0.3,
+	})
+	if err != nil {
+		t.Fatalf("add slow provider: %v", err)
+	}
+	manager.apiFactory = func(provider config.SupplierProvider) supplierAPI {
+		if provider.ID == slowProvider.ID {
+			return slowAPI
+		}
+		return fastAPI
+	}
+	stop := make(chan struct{})
+	manager.stop = stop
+	done := make(chan struct{})
+	go func() {
+		manager.run()
+		close(done)
+	}()
+	waitCall := func(name string, calls <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-calls:
+		case <-time.After(time.Second):
+			close(stop)
+			<-done
+			t.Fatalf("timed out waiting for %s stock call", name)
+		}
+	}
+	waitCall("fast first", fastCalls)
+	waitCall("slow first", slowCalls)
+	waitCall("fast second", fastCalls)
+	select {
+	case <-slowCalls:
+		close(stop)
+		<-done
+		t.Fatal("0.3-second provider was polled at the 0.1-second provider cadence")
+	default:
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("supplier manager did not stop")
+	}
+}
+
+func TestSupplierManagerNeverOverlapsOneProvidersStockChecks(t *testing.T) {
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	fake := &fakeSupplierAPI{stockEntered: entered, stockRelease: release}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.PollIntervalSeconds = 0.1
+	if _, err := config.UpdateSupplierProvider(provider.ID, provider); err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+	stop := make(chan struct{})
+	manager.stop = stop
+	done := make(chan struct{})
+	go func() {
+		manager.run()
+		close(done)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(stop)
+		close(release)
+		<-done
+		t.Fatal("first stock check did not start")
+	}
+	select {
+	case <-entered:
+		close(stop)
+		close(release)
+		<-done
+		t.Fatal("same provider started overlapping stock checks")
+	case <-time.After(250 * time.Millisecond):
+	}
+	fake.mu.Lock()
+	stockCalls := fake.stockCalls
+	fake.mu.Unlock()
+	if stockCalls != 1 {
+		close(stop)
+		close(release)
+		<-done
+		t.Fatalf("stock calls while first was blocked = %d, want 1", stockCalls)
+	}
+	close(release)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(stop)
+		<-done
+		t.Fatal("polling did not resume after the in-flight check completed")
 	}
 	close(stop)
 	select {
@@ -521,6 +966,141 @@ func TestAutomaticPurchaseRequiresZeroLiveKeysAndUsesUS(t *testing.T) {
 	}
 	if len(fake.purchaseRegions) != 1 || fake.purchaseRegions[0] != "us" {
 		t.Fatalf("purchase regions = %#v", fake.purchaseRegions)
+	}
+}
+
+func TestAutomaticEUFallbackIsOffByDefault(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		stock: supplierStock{Stock: 4, StockUS: 0, StockEU: 4, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "must-not-purchase-eu",
+			Keys: []supplierKey{{Key: "ksk_must_not_purchase_eu"}},
+		},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	manager.maybeAutoPurchase(provider.ID)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 0 || len(config.GetAccounts()) != 0 {
+		t.Fatalf("default-off EU fallback purchased unexpectedly: calls=%d accounts=%+v", fake.purchaseCalls, config.GetAccounts())
+	}
+}
+
+func TestAutomaticEUFallbackUsesEUOnlyWhenUSIsEmpty(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		stock: supplierStock{Stock: 1, StockUS: 0, StockEU: 1, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "eu-fallback-order",
+			Keys: []supplierKey{{Key: "ksk_eu_fallback"}},
+		},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroDrop
+	provider.AllowEUFallback = true
+	provider.ImportUSMaxSSE = 730
+	provider.ImportUSMaxRPM = 410
+	provider.ImportEUMaxSSE = 620
+	provider.ImportEUMaxRPM = 350
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("enable EU fallback: %v", err)
+	}
+	manager.maybeAutoPurchase(updated.ID)
+	accounts := config.GetAccounts()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || len(fake.purchaseRegions) != 1 || fake.purchaseRegions[0] != "eu" ||
+		len(fake.purchaseCounts) != 1 || fake.purchaseCounts[0] != 1 || len(accounts) != 1 || accounts[0].Region != "eu-central-1" ||
+		accounts[0].MaxSSE != 620 || accounts[0].MaxRPM != 350 {
+		t.Fatalf("EU fallback calls=%d regions=%#v counts=%#v accounts=%+v", fake.purchaseCalls, fake.purchaseRegions, fake.purchaseCounts, accounts)
+	}
+}
+
+func TestAutomaticEUFallbackStillPrefersUS(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		stock: supplierStock{Stock: 6, StockUS: 1, StockEU: 5, Balance: 100},
+		purchase: supplierPurchaseResponse{
+			Purchased: 1, Requested: 1, OrderID: "us-priority-order",
+			Keys: []supplierKey{{Key: "ksk_us_priority"}},
+		},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.AllowEUFallback = true
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("enable EU fallback: %v", err)
+	}
+	manager.maybeAutoPurchase(updated.ID)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || len(fake.purchaseRegions) != 1 || fake.purchaseRegions[0] != supplierPurchaseRegionUS {
+		t.Fatalf("US priority calls=%d regions=%#v", fake.purchaseCalls, fake.purchaseRegions)
+	}
+}
+
+func TestKiroCEOManagerImportsPartialFillAndPreservesRequestedCount(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 2, OrderID: "ceo-partial-order", UnitPrice: 10, TotalDebit: 20,
+		Keys: []supplierKey{{Key: "ksk_ceo_partial_one"}, {Key: "ksk_ceo_partial_two"}},
+	}}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	outcome, err := manager.startPurchase(updated, 3, "us", true, "manual")
+	if err != nil {
+		t.Fatalf("partial purchase: %v", err)
+	}
+	if outcome.Batch.Requested != 3 || outcome.Batch.Purchased != 2 || outcome.Batch.Imported != 2 || len(config.GetAccounts()) != 2 {
+		t.Fatalf("partial outcome=%+v accounts=%+v", outcome, config.GetAccounts())
+	}
+}
+
+func TestKiroCEOAutomaticPollingSupportsOneHundredMilliseconds(t *testing.T) {
+	calls := make(chan struct{}, 4)
+	fake := &fakeSupplierAPI{stockCallCh: calls}
+	fake.profile.User.Balance = 100
+	fake.profile.User.MinPurchase = 1
+	fake.profile.User.MaxPurchase = 10
+	_, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	provider.PollIntervalSeconds = 0.1
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	stop := make(chan struct{})
+	manager.stop = stop
+	done := make(chan struct{})
+	go func() {
+		manager.run()
+		close(done)
+	}()
+	for call := 1; call <= 2; call++ {
+		select {
+		case <-calls:
+		case <-time.After(time.Second):
+			close(stop)
+			<-done
+			t.Fatalf("timed out waiting for Kiro CEO 100 ms stock call %d", call)
+		}
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("supplier manager did not stop")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.stockCalls < 2 || fake.profileCalls < 2 || fake.purchaseCalls != 0 {
+		t.Fatalf("100 ms CEO polling: stock=%d profile=%d purchase=%d", fake.stockCalls, fake.profileCalls, fake.purchaseCalls)
+	}
+	status := manager.store.providerStatuses()[updated.ID]
+	if status.Balance != 100 || status.MinPurchase != 1 || status.MaxPurchase != 10 {
+		t.Fatalf("CEO status did not merge profile: %+v", status)
 	}
 }
 
@@ -969,6 +1549,31 @@ func TestAutomaticPurchaseCircuitBreakerPreventsRepeatedCharges(t *testing.T) {
 	}
 }
 
+func TestAutomaticStockCheckFailureNeverStopsFuturePolling(t *testing.T) {
+	fake := &fakeSupplierAPI{
+		stockErr: &supplierAPIError{StatusCode: http.StatusUnauthorized, Code: "INVALID_API_KEY", Message: "temporary credential rejection"},
+	}
+	_, manager, provider := newSupplierTestManager(t, fake)
+	manager.maybeAutoPurchase(provider.ID)
+	manager.maybeAutoPurchase(provider.ID)
+	fake.mu.Lock()
+	calls := fake.stockCalls
+	fake.stockErr = nil
+	fake.stock = supplierStock{Stock: 1, StockUS: 1, Balance: 100}
+	fake.purchase = supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "recovered-after-check-failure",
+		Keys: []supplierKey{{Key: "ksk_recovered_after_check_failure"}},
+	}
+	fake.mu.Unlock()
+	if calls != 2 || manager.autoPurchaseBlocked(provider.ID) {
+		t.Fatalf("failed stock checks calls=%d blocked=%v", calls, manager.autoPurchaseBlocked(provider.ID))
+	}
+	manager.maybeAutoPurchase(provider.ID)
+	if liveSupplierAPIKeyCount(provider.ID) != 1 {
+		t.Fatalf("supplier did not recover automatically, live=%d", liveSupplierAPIKeyCount(provider.ID))
+	}
+}
+
 func TestAutomaticPurchaseRejectionPausesUntilConnectionTest(t *testing.T) {
 	fake := &fakeSupplierAPI{
 		stock:       supplierStock{StockUS: 2, Balance: 0},
@@ -1072,6 +1677,252 @@ func TestSupplierWebhookIsProviderScopedDurableAndDeduplicated(t *testing.T) {
 	}
 }
 
+func TestKiroCEOWebhookQueuesExactRegionalPurchaseOnlyAtLocalZero(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "ceo-webhook-order",
+		Keys: []supplierKey{{Key: "ksk_ceo_webhook"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	provider.AutoPurchaseCount = 3
+	provider.AllowEUFallback = true
+	provider.ImportUSMaxSSE = 740
+	provider.ImportUSMaxRPM = 420
+	provider.ImportEUMaxSSE = 630
+	provider.ImportEUMaxRPM = 360
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	if added, _, err := config.AddAccounts([]config.Account{{
+		ID: "ceo-existing", AuthMethod: "api_key", KiroApiKey: "ksk_ceo_existing", AccessToken: "ksk_ceo_existing",
+		SupplierID: provider.ID, Enabled: true,
+	}}); err != nil || added != 1 {
+		t.Fatalf("AddAccounts = %d, %v", added, err)
+	}
+	call := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body)))
+		return rec
+	}
+	firstBody := `{"event":"new_keys_available","event_id":"11111111111111111111111111111111","purchase_order_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pool_id":"pool-us","new_keys":1,"zone":"us","message":"ready"}`
+	first := call(firstBody)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"queued":false`) || len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("live-key callback status=%d body=%s pending=%+v", first.Code, first.Body.String(), manager.store.pendingIntents())
+	}
+	if disabled, err := config.DisableSupplierAPIKeyAccounts(provider.ID, []string{"ksk_ceo_existing"}, "test"); err != nil || disabled != 1 {
+		t.Fatalf("DisableSupplierAPIKeyAccounts = %d, %v", disabled, err)
+	}
+	secondBody := `{"event":"new_keys_available","event_id":"22222222222222222222222222222222","purchase_order_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pool_id":"pool-eu","new_keys":10,"zone":"eu","message":"ready"}`
+	second := call(secondBody)
+	pending := manager.store.pendingIntents()
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"queued":true`) || len(pending) != 1 ||
+		pending[0].ClientOrderID != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || pending[0].Region != "eu" || pending[0].Count != 3 {
+		t.Fatalf("zero-key callback status=%d body=%s pending=%+v", second.Code, second.Body.String(), pending)
+	}
+	conflict := call(`{"event":"new_keys_available","event_id":"99999999999999999999999999999999","purchase_order_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pool_id":"pool-conflict","new_keys":1,"zone":"us"}`)
+	if conflict.Code != http.StatusConflict || len(manager.store.pendingIntents()) != 1 {
+		t.Fatalf("conflicting idempotency instruction status=%d body=%s pending=%+v", conflict.Code, conflict.Body.String(), manager.store.pendingIntents())
+	}
+	manager.processPendingIntents()
+	accounts := config.GetAccounts()
+	if liveSupplierAPIKeyCount(provider.ID) != 1 || len(accounts) != 2 || accounts[1].Region != "eu-central-1" ||
+		accounts[1].MaxSSE != 630 || accounts[1].MaxRPM != 360 {
+		t.Fatalf("CEO webhook import accounts=%+v", accounts)
+	}
+	duplicate := call(secondBody)
+	if duplicate.Code != http.StatusOK || !strings.Contains(duplicate.Body.String(), `"duplicate":true`) || !strings.Contains(duplicate.Body.String(), `"queued":false`) {
+		t.Fatalf("duplicate callback status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	poolReissue := call(`{"event":"new_keys_available","event_id":"88888888888888888888888888888888","purchase_order_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","pool_id":"pool-eu","new_keys":1,"zone":"eu"}`)
+	if poolReissue.Code != http.StatusOK || !strings.Contains(poolReissue.Body.String(), `"duplicate":true`) || len(manager.store.state.Events) != 2 {
+		t.Fatalf("pool duplicate status=%d body=%s events=%+v", poolReissue.Code, poolReissue.Body.String(), manager.store.state.Events)
+	}
+	manager.processPendingIntents()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 || fake.purchaseIDs[0] != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || fake.purchaseRegions[0] != "eu" || fake.purchaseCounts[0] != 3 ||
+		fake.purchaseTriggers[0] != "webhook" {
+		t.Fatalf("CEO webhook purchases calls=%d ids=%#v regions=%#v counts=%#v triggers=%#v", fake.purchaseCalls, fake.purchaseIDs, fake.purchaseRegions, fake.purchaseCounts, fake.purchaseTriggers)
+	}
+}
+
+func TestKiroCEOWebhookEURespectsFallbackSwitchBeforeFirstPost(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
+		Purchased: 1, Requested: 1, OrderID: "eu-webhook-must-not-run",
+		Keys: []supplierKey{{Key: "ksk_eu_webhook_must_not_run"}},
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("set CEO protocol: %v", err)
+	}
+	call := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+updated.ID, strings.NewReader(body)))
+		return rec
+	}
+	disabled := call(`{"event":"new_keys_available","event_id":"10101010101010101010101010101010","purchase_order_id":"20202020202020202020202020202020","pool_id":"eu-disabled","new_keys":2,"zone":"eu"}`)
+	if disabled.Code != http.StatusOK || !strings.Contains(disabled.Body.String(), `"queued":false`) || len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("disabled EU callback status=%d body=%s pending=%+v", disabled.Code, disabled.Body.String(), manager.store.pendingIntents())
+	}
+
+	updated.AllowEUFallback = true
+	updated, err = config.UpdateSupplierProvider(updated.ID, updated)
+	if err != nil {
+		t.Fatalf("enable EU fallback: %v", err)
+	}
+	queued := call(`{"event":"new_keys_available","event_id":"30303030303030303030303030303030","purchase_order_id":"40404040404040404040404040404040","pool_id":"eu-race","new_keys":2,"zone":"eu"}`)
+	if queued.Code != http.StatusOK || !strings.Contains(queued.Body.String(), `"queued":true`) || len(manager.store.pendingIntents()) != 1 {
+		t.Fatalf("enabled EU callback status=%d body=%s pending=%+v", queued.Code, queued.Body.String(), manager.store.pendingIntents())
+	}
+	// Turning the switch off before the first outbound POST must cancel the
+	// queued EU extraction. Once a POST has been sent, normal idempotent retry
+	// rules still apply so an ambiguous supplier charge can be resolved safely.
+	updated.AllowEUFallback = false
+	if _, err := config.UpdateSupplierProvider(updated.ID, updated); err != nil {
+		t.Fatalf("disable EU fallback before processing: %v", err)
+	}
+	manager.processPendingIntents()
+	if len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("disabled EU intent remained pending: %+v", manager.store.pendingIntents())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 0 {
+		t.Fatalf("EU fallback switch race allowed %d purchase(s)", fake.purchaseCalls)
+	}
+}
+
+func TestWebhookAutomaticPurchaseCountNeverExceedsProviderSetting(t *testing.T) {
+	const purchaseID = "0123456789abcdef0123456789abcdef"
+	tests := []struct {
+		name      string
+		apiType   string
+		available int
+		want      int
+	}{
+		{name: "CEO availability above configured count", apiType: config.SupplierAPITypeKiroCEO, available: 10, want: 3},
+		{name: "CEO availability below configured count", apiType: config.SupplierAPITypeKiroCEO, available: 2, want: 2},
+		{name: "AWS availability above configured count", apiType: config.SupplierAPITypeAWSMy, available: 10, want: 3},
+		{name: "AWS availability below configured count", apiType: config.SupplierAPITypeAWSMy, available: 2, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			intent, err := newSupplierWebhookPurchaseIntent(config.SupplierProvider{
+				ID: "vendor", APIType: tt.apiType, AutoPurchaseCount: 3,
+			}, supplierWebhookEvent{
+				Event: "new_keys_available", PurchaseOrderID: purchaseID, NewKeys: tt.available, Zone: "us",
+			})
+			if err != nil || intent.Count != tt.want {
+				t.Fatalf("intent count=%d, want %d, err=%v", intent.Count, tt.want, err)
+			}
+		})
+	}
+}
+
+func TestKiroCEOWebhookTestAndAutomationDisabledAreReadOnly(t *testing.T) {
+	fake := &fakeSupplierAPI{}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	provider = updated
+	if err := config.UpdateSupplierFeature(true, false); err != nil {
+		t.Fatalf("disable automatic purchasing: %v", err)
+	}
+	call := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(body)))
+		return rec
+	}
+	testResponse := call(`{"event":"test","event_id":"33333333333333333333333333333333","message":"Webhook test"}`)
+	if testResponse.Code != http.StatusOK || strings.TrimSpace(testResponse.Body.String()) != `{"ok":"true"}` {
+		t.Fatalf("test callback status=%d body=%q", testResponse.Code, testResponse.Body.String())
+	}
+	newKeys := call(`{"event":"new_keys_available","event_id":"44444444444444444444444444444444","purchase_order_id":"cccccccccccccccccccccccccccccccc","pool_id":"pool-us","new_keys":2,"zone":"us"}`)
+	if newKeys.Code != http.StatusOK || !strings.Contains(newKeys.Body.String(), `"queued":false`) || len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("automation-disabled callback status=%d body=%s pending=%+v", newKeys.Code, newKeys.Body.String(), manager.store.pendingIntents())
+	}
+	if len(manager.store.state.Events) != 1 {
+		t.Fatalf("test callback was persisted or availability was lost: events=%+v", manager.store.state.Events)
+	}
+	unknown := call(`{"event":"unknown","event_id":"55555555555555555555555555555555"}`)
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown callback status=%d body=%s", unknown.Code, unknown.Body.String())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 0 {
+		t.Fatalf("read-only callbacks triggered %d purchases", fake.purchaseCalls)
+	}
+}
+
+func TestKiroCEOWebhookPurchaseRechecksLocalPoolBeforePosting(t *testing.T) {
+	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{Purchased: 1, Keys: []supplierKey{{Key: "should-not-buy"}}}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	body := `{"event":"new_keys_available","event_id":"66666666666666666666666666666666","purchase_order_id":"dddddddddddddddddddddddddddddddd","pool_id":"pool-us","new_keys":1,"zone":"us"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+updated.ID, strings.NewReader(body)))
+	if rec.Code != http.StatusOK || len(manager.store.pendingIntents()) != 1 {
+		t.Fatalf("queue status=%d body=%s pending=%+v", rec.Code, rec.Body.String(), manager.store.pendingIntents())
+	}
+	if added, _, err := config.AddAccounts([]config.Account{{
+		ID: "ceo-race-winner", AuthMethod: "api_key", KiroApiKey: "ksk_ceo_race", AccessToken: "ksk_ceo_race",
+		SupplierID: updated.ID, Enabled: true,
+	}}); err != nil || added != 1 {
+		t.Fatalf("AddAccounts = %d, %v", added, err)
+	}
+	manager.processPendingIntents()
+	if len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("unneeded intent remained pending: %+v", manager.store.pendingIntents())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 0 {
+		t.Fatalf("race guard allowed %d purchase(s)", fake.purchaseCalls)
+	}
+}
+
+func TestKiroCEOWebhookNonRetryableRejectionFailsClosed(t *testing.T) {
+	fake := &fakeSupplierAPI{purchaseErr: &supplierAPIError{StatusCode: http.StatusUnauthorized, Code: "INVALID_API_KEY", Message: "invalid key"}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	body := `{"event":"new_keys_available","event_id":"abababababababababababababababab","purchase_order_id":"f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0","pool_id":"pool-rejected","new_keys":1,"zone":"us"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+updated.ID, strings.NewReader(body)))
+	if rec.Code != http.StatusOK || len(manager.store.pendingIntents()) != 1 {
+		t.Fatalf("queue status=%d body=%s pending=%+v", rec.Code, rec.Body.String(), manager.store.pendingIntents())
+	}
+	manager.processPendingIntents()
+	manager.processPendingIntents()
+	if len(manager.store.pendingIntents()) != 0 {
+		t.Fatalf("non-retryable callback remained pending: %+v", manager.store.pendingIntents())
+	}
+	block, blocked := manager.automaticPurchaseBlock(updated.ID)
+	if !blocked || block.Reason != "purchase_rejected" {
+		t.Fatalf("automatic purchase block = %+v, %v", block, blocked)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.purchaseCalls != 1 {
+		t.Fatalf("non-retryable callback made %d purchase attempts", fake.purchaseCalls)
+	}
+}
+
 func TestAWSMyWebhookNeedsNoCredentialsAndExtractsExactOrderOnce(t *testing.T) {
 	fake := &fakeSupplierAPI{purchase: supplierPurchaseResponse{
 		Purchased: 2, Requested: 2, Keys: []supplierKey{{Key: "ksk_webhook_one"}, {Key: "ksk_webhook_two"}},
@@ -1084,7 +1935,7 @@ func TestAWSMyWebhookNeedsNoCredentialsAndExtractsExactOrderOnce(t *testing.T) {
 	}
 	provider = updated
 
-	body := `{"event":"new_keys_available","event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","purchase_order_id":"0123456789ABCDEF0123456789ABCDEF","message":"new keys","new_keys":2}`
+	body := `{"event":"new_keys_available","event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","purchase_order_id":"0123456789ABCDEF0123456789ABCDEF","message":"new keys","new_keys":10}`
 	call := func(eventBody, token string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+provider.ID, strings.NewReader(eventBody))
 		if token != "" {
@@ -1519,6 +2370,35 @@ func TestWebhookPurchaseObeysMasterSwitchBeforeFirstAttempt(t *testing.T) {
 	manager.processPendingIntents()
 	if liveAPIKeyCount() != 1 || len(manager.store.pendingIntents()) != 0 {
 		t.Fatalf("re-enabled exact extraction live=%d pending=%d", liveAPIKeyCount(), len(manager.store.pendingIntents()))
+	}
+}
+
+func TestKiroCEOAllKeysDeadReconcilesRemoteHistory(t *testing.T) {
+	fake := &fakeSupplierAPI{keys: supplierKeysPage{
+		Items: []supplierKey{{Key: "ksk_ceo_dead", Status: "dead"}}, Total: 1, Pages: 1,
+	}}
+	h, manager, provider := newSupplierTestManager(t, fake)
+	provider.APIType = config.SupplierAPITypeKiroCEO
+	updated, err := config.UpdateSupplierProvider(provider.ID, provider)
+	if err != nil {
+		t.Fatalf("UpdateSupplierProvider: %v", err)
+	}
+	if added, _, err := config.AddAccounts([]config.Account{{
+		ID: "ceo-dead", AuthMethod: "api_key", KiroApiKey: "ksk_ceo_dead", AccessToken: "ksk_ceo_dead",
+		SupplierID: updated.ID, Enabled: true,
+	}}); err != nil || added != 1 {
+		t.Fatalf("AddAccounts = %d, %v", added, err)
+	}
+	body := `{"event":"all_keys_dead","event_id":"77777777777777777777777777777777","message":"all dead","dead":1}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/supplier-webhooks/"+updated.ID, strings.NewReader(body)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"queued":true`) || len(manager.store.pendingWebhookEvents()) != 1 {
+		t.Fatalf("all-dead status=%d body=%s pending=%+v", rec.Code, rec.Body.String(), manager.store.pendingWebhookEvents())
+	}
+	manager.processPendingWebhookEvents()
+	accounts := config.GetAccounts()
+	if len(accounts) != 1 || accounts[0].Enabled || len(manager.store.pendingWebhookEvents()) != 0 {
+		t.Fatalf("all-dead reconciliation accounts=%+v pending=%+v", accounts, manager.store.pendingWebhookEvents())
 	}
 }
 
