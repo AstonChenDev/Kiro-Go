@@ -9,6 +9,10 @@
 /data/
 *.log
 
+# Local deployment overrides and credential exports
+/docker-compose.override.yml
+/kiro-accounts-*.json
+
 # Editor / OS
 .idea/
 .vscode/

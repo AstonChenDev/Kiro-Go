@@ -113,7 +113,7 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 ## Thinking Mode
 
-Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
+Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. For `enabled` requests, `budget_tokens` is forwarded through the upstream `<max_thinking_length>` prompt. This is a soft budget, not a guaranteed exact token cap. Adaptive thinking and the model suffix continue to use the default budget. Configure output format in the admin panel under Settings - Thinking Mode.
 
 The OpenAI-compatible endpoints also accept the standard parameters, without changing the model name:
 

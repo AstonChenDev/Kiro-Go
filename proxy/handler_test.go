@@ -313,8 +313,9 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 
 func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *testing.T) {
 	req := &ClaudeRequest{
-		Model:  "claude-sonnet-4.6",
-		System: "Follow the user instructions.",
+		Model:    "claude-sonnet-4.5",
+		System:   "Follow the user instructions.",
+		Thinking: &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
 	}
 
 	cloned := cloneClaudeRequestForThinking(req, true)
@@ -326,7 +327,7 @@ func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *te
 		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
 	}
 	gotPrompt := extractSystemPrompt(cloned.System)
-	expected := ThinkingModePrompt + "\n\nFollow the user instructions."
+	expected := thinkingModePrompt(2048) + "\n\nFollow the user instructions."
 	if gotPrompt != expected {
 		t.Fatalf("expected injected system prompt %q, got %q", expected, gotPrompt)
 	}
@@ -369,6 +370,42 @@ func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing
 	cacheControl, ok := second["cache_control"].(map[string]interface{})
 	if !ok || cacheControl["type"] != "ephemeral" {
 		t.Fatalf("expected original cache_control to be preserved, got %#v", second["cache_control"])
+	}
+}
+
+func TestClaudeToKiroForwardsThinkingBudget(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:     "claude-sonnet-4.5",
+		MaxTokens: 4096,
+		Thinking:  &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
+		Messages:  []ClaudeMessage{{Role: "user", Content: "solve this"}},
+	}
+
+	payload := ClaudeToKiro(req, true)
+	if len(payload.ConversationState.History) < 1 || payload.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatalf("expected thinking priming history, got %#v", payload.ConversationState.History)
+	}
+	prompt := payload.ConversationState.History[0].UserInputMessage.Content
+	if !strings.Contains(prompt, "<max_thinking_length>2048</max_thinking_length>") {
+		t.Fatalf("expected client budget in upstream prompt, got %q", prompt)
+	}
+	if strings.Contains(prompt, "<max_thinking_length>200000</max_thinking_length>") {
+		t.Fatalf("unexpected legacy default budget in upstream prompt: %q", prompt)
+	}
+}
+
+func TestClaudeToKiroUsesDefaultBudgetForAdaptiveThinking(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 4096,
+		Thinking:  &ClaudeThinkingConfig{Type: "adaptive"},
+		Messages:  []ClaudeMessage{{Role: "user", Content: "solve this"}},
+	}
+
+	payload := ClaudeToKiro(req, true)
+	prompt := payload.ConversationState.History[0].UserInputMessage.Content
+	if !strings.Contains(prompt, ThinkingModePrompt) {
+		t.Fatalf("expected adaptive thinking to retain the default prompt, got %q", prompt)
 	}
 }
 

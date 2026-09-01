@@ -113,7 +113,7 @@ API Key 账号会走 Kiro CLI runtime（`https://runtime.{region}.kiro.dev/`）�
 
 ## 思考模式
 
-在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
+在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。`enabled` 请求的 `budget_tokens` 会写入上游 `<max_thinking_length>` 提示；这是软预算，不保证精确的 token 上限。`adaptive` 和仅使用模型后缀时继续使用默认预算。输出格式可在管理面板「设置 - Thinking 模式」中配置。
 
 OpenAI 兼容接口也支持标准参数，无需修改模型名：
 

@@ -202,7 +202,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, claudeThinkingBudget(req.Thinking))
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -344,16 +344,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}, thinking bool, maxThinkingLength int) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
+	thinkingPrompt := thinkingModePrompt(maxThinkingLength)
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return thinkingPrompt
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return thinkingPrompt + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -532,13 +533,20 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 
 	cloned := *req
 	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+		cloned.System = prependThinkingSystem(req.System, claudeThinkingBudget(req.Thinking))
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+func claudeThinkingBudget(thinkingCfg *ClaudeThinkingConfig) int {
+	if thinkingCfg != nil && strings.EqualFold(strings.TrimSpace(thinkingCfg.Type), "enabled") && thinkingCfg.BudgetTokens > 0 {
+		return thinkingCfg.BudgetTokens
+	}
+	return defaultMaxThinkingLength
+}
+
+func prependThinkingSystem(system interface{}, maxThinkingLength int) interface{} {
+	thinkingText := thinkingModePrompt(maxThinkingLength)
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}

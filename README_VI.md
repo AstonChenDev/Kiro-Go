@@ -113,7 +113,7 @@ Tài khoản API Key gọi Kiro CLI runtime (`https://runtime.{region}.kiro.dev/
 
 ## Chế độ Thinking
 
-Thêm hậu tố (mặc định `-thinking`) vào tên mô hình, ví dụ `claude-sonnet-4.5-thinking`. Các yêu cầu tương thích Claude có cấu hình `thinking` ở top-level như `{"type":"enabled","budget_tokens":2048}` hoặc `{"type":"adaptive"}` cũng tự bật chế độ thinking. Cấu hình định dạng đầu ra trong bảng quản trị tại Cài đặt - Chế độ Thinking.
+Thêm hậu tố (mặc định `-thinking`) vào tên mô hình, ví dụ `claude-sonnet-4.5-thinking`. Các yêu cầu tương thích Claude có cấu hình `thinking` ở top-level như `{"type":"enabled","budget_tokens":2048}` hoặc `{"type":"adaptive"}` cũng tự bật chế độ thinking. Với yêu cầu `enabled`, `budget_tokens` được chuyển tiếp qua gợi ý `<max_thinking_length>` của upstream. Đây là ngân sách mềm, không đảm bảo giới hạn token chính xác. Chế độ `adaptive` và hậu tố mô hình tiếp tục dùng ngân sách mặc định. Cấu hình định dạng đầu ra trong bảng quản trị tại Cài đặt - Chế độ Thinking.
 
 ## Proxy ra ngoài
 
