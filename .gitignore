@@ -11,6 +11,7 @@
 
 # Local deployment overrides and credential exports
 /docker-compose.override.yml
+/.env
 /kiro-accounts-*.json
 
 # Editor / OS
