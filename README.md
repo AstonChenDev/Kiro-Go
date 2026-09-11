@@ -153,6 +153,22 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_INTEGRATION_TOKEN` | Import-only service token (at least 32 characters); the integration API is disabled when unset | - |
+
+### kiro-login-web integration
+
+Generate a dedicated service token (do not reuse the admin password):
+
+```bash
+openssl rand -hex 32
+```
+
+Set it as `KIRO_INTEGRATION_TOKEN` and restart Kiro-Go. The integration exposes
+`GET /internal/v1/credentials/status` for capability checks and
+`POST /internal/v1/credentials/import` for batches of up to 100 credentials.
+Authenticate with `Authorization: Bearer <KIRO_INTEGRATION_TOKEN>`. The importer
+normalizes `idc`, `external_idp`, and `api_key` credentials, reports per-item
+`imported`, `duplicate`, or `failed` results, and rejects login passwords and MFA seeds.
 
 ## Contributing
 

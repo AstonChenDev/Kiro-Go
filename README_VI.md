@@ -127,6 +127,17 @@ Cài đặt có hiệu lực ngay, không cần khởi động lại.
 |------|-------|----------|
 | `CONFIG_PATH` | Đường dẫn file cấu hình | `data/config.json` |
 | `ADMIN_PASSWORD` | Mật khẩu bảng quản trị (ghi đè config) | - |
+| `KIRO_INTEGRATION_TOKEN` | Token chỉ dùng để nhập thông tin xác thực (ít nhất 32 ký tự); API tích hợp bị tắt khi chưa đặt | - |
+
+### Tích hợp với kiro-login-web
+
+Tạo token dịch vụ riêng bằng `openssl rand -hex 32`, đặt nó vào
+`KIRO_INTEGRATION_TOKEN`, rồi khởi động lại Kiro-Go. Dùng
+`GET /internal/v1/credentials/status` để kiểm tra kết nối và
+`POST /internal/v1/credentials/import` để nhập tối đa 100 thông tin xác thực mỗi lần.
+Gửi `Authorization: Bearer <KIRO_INTEGRATION_TOKEN>`. API tự chuẩn hóa `idc`,
+`external_idp` và `api_key`, trả kết quả `imported`, `duplicate` hoặc `failed`
+cho từng mục, đồng thời từ chối mật khẩu đăng nhập và khóa MFA.
 
 ## Đóng góp
 

@@ -153,6 +153,24 @@ OpenAI 兼容接口也支持标准参数，无需修改模型名：
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `KIRO_INTEGRATION_TOKEN` | 服务间凭据导入专用密钥（至少 32 字符）；未设置时联动接口关闭 | - |
+
+### 与 kiro-login-web 联动
+
+先为 Kiro-Go 生成独立的服务间密钥（不要复用管理密码）：
+
+```bash
+openssl rand -hex 32
+```
+
+将结果配置为 `KIRO_INTEGRATION_TOKEN` 并重启 Kiro-Go。联动使用两个限权接口：
+
+- `GET /internal/v1/credentials/status`：测试连接并读取协议能力。
+- `POST /internal/v1/credentials/import`：一次导入最多 100 条凭据。
+
+请求使用 `Authorization: Bearer <KIRO_INTEGRATION_TOKEN>`。批量接口会自动识别并规范化
+`idc`、`external_idp` 与 `api_key`，逐条返回 `imported`、`duplicate` 或 `failed`；重复的
+refresh token / API Key 按幂等成功处理。接口明确拒绝登录密码和 MFA 密钥。
 
 ## 参与贡献
 

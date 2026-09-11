@@ -152,7 +152,8 @@ func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 	h := &Handler{pool: accountpool.GetPool()}
 
 	before := time.Now().Unix()
-	body := `{"refreshToken":"rt-good","clientId":"c","clientSecret":"s","authMethod":"idc","region":"us-east-1"}`
+	const importedMachineID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	body := `{"refreshToken":"rt-good","clientId":"c","clientSecret":"s","authMethod":"idc","region":"us-east-1","machineId":"` + importedMachineID + `"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -173,6 +174,9 @@ func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 	}
 	if got.RefreshToken != "rt-rotated" {
 		t.Fatalf("expected rotated refreshToken to be persisted, got %q", got.RefreshToken)
+	}
+	if got.MachineId != importedMachineID {
+		t.Fatalf("expected imported machineId to be preserved, got %q", got.MachineId)
 	}
 	// Allow ±5s of drift but require the value to clearly come from upstream's
 	// expiresIn rather than the old 300s fallback.
