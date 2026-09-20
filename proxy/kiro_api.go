@@ -823,17 +823,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 }
 
 func parseSubscriptionType(raw string) string {
-	upper := strings.ToUpper(raw)
-	if strings.Contains(upper, "PRO_PLUS") || strings.Contains(upper, "PROPLUS") {
-		return "PRO_PLUS"
-	}
-	if strings.Contains(upper, "POWER") {
-		return "POWER"
-	}
-	if strings.Contains(upper, "PRO") {
-		return "PRO"
-	}
-	return "FREE"
+	return config.NormalizeAccountType(raw)
 }
 
 // 响应结构体

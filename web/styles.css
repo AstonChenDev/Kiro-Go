@@ -3206,6 +3206,31 @@ img.brand-icon {
   font-weight: 500;
   word-break: break-all;
 }
+.model-policy-textarea {
+  min-height: 8rem;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8125rem;
+}
+.model-policy-known {
+  max-height: 5rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+}
+.policy-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+@media (max-width: 640px) {
+  .policy-limit-grid {
+    grid-template-columns: 1fr;
+  }
+}
 .machine-id-row {
   display: flex;
   gap: 0.75rem;

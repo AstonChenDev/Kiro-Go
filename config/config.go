@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -243,6 +244,13 @@ type Account struct {
 	MaxSSE int `json:"maxSSE,omitempty"` // Custom maximum concurrent SSE streams
 	MaxRPM int `json:"maxRPM,omitempty"` // Custom maximum requests per minute
 
+	// ModelPolicyOverride controls whether AllowedModels is an account-specific
+	// allow-list. When false, the account inherits the policy of its subscription
+	// type. An explicit override with an empty list intentionally disables model
+	// routing for the account without disabling credential maintenance.
+	ModelPolicyOverride bool     `json:"modelPolicyOverride,omitempty"`
+	AllowedModels       []string `json:"allowedModels,omitempty"`
+
 	// Runtime statistics (updated during operation)
 	RequestCount int     `json:"requestCount,omitempty"` // Total requests processed
 	ErrorCount   int     `json:"errorCount,omitempty"`   // Total errors encountered
@@ -356,6 +364,11 @@ type Config struct {
 	SystemVersion string        `json:"systemVersion,omitempty"`
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+
+	// AccountTypePolicies stores defaults shared by subscription type
+	// (FREE/PRO/PRO_PLUS/POWER). Per-account fields remain authoritative when
+	// explicitly configured.
+	AccountTypePolicies map[string]AccountTypePolicy `json:"accountTypePolicies,omitempty"`
 
 	// SupplierIntegration contains the opt-in, multi-provider API-key procurement
 	// configuration. Runtime events and purchase ledgers live in a separate
@@ -523,8 +536,12 @@ func loadLocked() error {
 	if err != nil {
 		return err
 	}
+	policiesNormalized, err := normalizeAccountPolicies(&c)
+	if err != nil {
+		return err
+	}
 	cfg = &c
-	if regionsNormalized {
+	if regionsNormalized || policiesNormalized {
 		if err := saveLocked(); err != nil {
 			return err
 		}
@@ -679,6 +696,9 @@ func GetAccounts() []Account {
 	applyAutoRestoreLocked()
 	accounts := make([]Account, len(cfg.Accounts))
 	copy(accounts, cfg.Accounts)
+	for i := range accounts {
+		accounts[i].AllowedModels = append([]string(nil), cfg.Accounts[i].AllowedModels...)
+	}
 	return accounts
 }
 
@@ -706,6 +726,7 @@ func GetEnabledAccounts() []Account {
 	var accounts []Account
 	for _, a := range cfg.Accounts {
 		if a.Enabled {
+			a.AllowedModels = append([]string(nil), a.AllowedModels...)
 			accounts = append(accounts, a)
 		}
 	}
@@ -843,12 +864,12 @@ func normalizeConfigRegions(c *Config) (bool, error) {
 		changed = changed || fieldChanged
 	}
 	for i := range c.Accounts {
-		before := c.Accounts[i]
 		if IsAPIKeyAccount(&c.Accounts[i]) {
+			before := c.Accounts[i]
 			if err := NormalizeAPIKeyAccount(&c.Accounts[i]); err != nil {
 				return false, fmt.Errorf("account %q: %w", c.Accounts[i].ID, err)
 			}
-			changed = changed || before != c.Accounts[i]
+			changed = changed || !reflect.DeepEqual(before, c.Accounts[i])
 			continue
 		}
 		accountChanged, err := normalizeAccountRegions(&c.Accounts[i])
@@ -965,6 +986,9 @@ func AccountAPIKeyExists(apiKey string) bool {
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if err := normalizeAccountRoutingPolicy(&account); err != nil {
+		return err
+	}
 	if IsAPIKeyAccount(&account) {
 		if err := NormalizeAPIKeyAccount(&account); err != nil {
 			return err
@@ -1009,6 +1033,9 @@ func AddAccount(account Account) error {
 }
 
 func UpdateAccount(id string, account Account) error {
+	if err := normalizeAccountRoutingPolicy(&account); err != nil {
+		return err
+	}
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
@@ -1257,6 +1284,9 @@ func AddAccounts(accounts []Account) (added int, skipped int, err error) {
 	normalizedAccounts := make([]Account, len(accounts))
 	copy(normalizedAccounts, accounts)
 	for i := range normalizedAccounts {
+		if err := normalizeAccountRoutingPolicy(&normalizedAccounts[i]); err != nil {
+			return 0, 0, fmt.Errorf("account %q: %w", normalizedAccounts[i].ID, err)
+		}
 		if IsAPIKeyAccount(&normalizedAccounts[i]) {
 			if err := NormalizeAPIKeyAccount(&normalizedAccounts[i]); err != nil {
 				return 0, 0, fmt.Errorf("account %q: %w", normalizedAccounts[i].ID, err)

@@ -2799,6 +2799,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/suppliers/") && r.Method == "PUT":
 		id := strings.TrimPrefix(path, "/suppliers/")
 		h.apiUpdateSupplier(w, r, id)
+	case path == "/account-type-policies" && r.Method == "GET":
+		h.apiGetAccountTypePolicies(w, r)
+	case strings.HasPrefix(path, "/account-type-policies/") && r.Method == "PUT":
+		accountType := strings.TrimPrefix(path, "/account-type-policies/")
+		h.apiUpdateAccountTypePolicy(w, r, accountType)
 	case path == "/accounts" && r.Method == "GET":
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
@@ -2938,52 +2943,67 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	for i, a := range accounts {
 		// 获取运行时统计
 		stats := statsMap[a.ID]
+		limits := config.EffectiveAccountLimits(a)
+		effectiveModels, modelPolicySource, modelPolicyRestricted := config.EffectiveAllowedModels(a)
+		if effectiveModels == nil {
+			effectiveModels = []string{}
+		}
 
 		result[i] = map[string]interface{}{
-			"id":                a.ID,
-			"email":             a.Email,
-			"userId":            a.UserId,
-			"nickname":          a.Nickname,
-			"authMethod":        a.AuthMethod,
-			"provider":          a.Provider,
-			"region":            a.Region,
-			"enabled":           a.Enabled,
-			"banStatus":         a.BanStatus,
-			"banReason":         a.BanReason,
-			"banTime":           a.BanTime,
-			"expiresAt":         a.ExpiresAt,
-			"hasToken":          accountBearerToken(&a) != "",
-			"machineId":         a.MachineId,
-			"weight":            a.Weight,
-			"overageStatus":     a.OverageStatus,
-			"overageCapability": a.OverageCapability,
-			"overageCap":        a.OverageCap,
-			"overageRate":       a.OverageRate,
-			"currentOverages":   a.CurrentOverages,
-			"overageCheckedAt":  a.OverageCheckedAt,
-			"proxyURL":          a.ProxyURL,
-			"subscriptionType":  a.SubscriptionType,
-			"subscriptionTitle": a.SubscriptionTitle,
-			"daysRemaining":     a.DaysRemaining,
-			"usageCurrent":      a.UsageCurrent,
-			"usageLimit":        a.UsageLimit,
-			"usagePercent":      a.UsagePercent,
-			"nextResetDate":     a.NextResetDate,
-			"lastRefresh":       a.LastRefresh,
-			"trialUsageCurrent": a.TrialUsageCurrent,
-			"trialUsageLimit":   a.TrialUsageLimit,
-			"trialUsagePercent": a.TrialUsagePercent,
-			"trialStatus":       a.TrialStatus,
-			"trialExpiresAt":    a.TrialExpiresAt,
-			"requestCount":      stats.RequestCount,
-			"errorCount":        stats.ErrorCount,
-			"totalTokens":       stats.TotalTokens,
-			"totalCredits":      stats.TotalCredits,
-			"lastUsed":          stats.LastUsed,
-			"maxSSE":            a.MaxSSE,
-			"maxRPM":            a.MaxRPM,
-			"activeSSE":         h.pool.GetActiveSSE(a.ID),
-			"currentRPM":        h.pool.GetCurrentRPM(a.ID),
+			"id":                     a.ID,
+			"email":                  a.Email,
+			"userId":                 a.UserId,
+			"nickname":               a.Nickname,
+			"authMethod":             a.AuthMethod,
+			"provider":               a.Provider,
+			"region":                 a.Region,
+			"enabled":                a.Enabled,
+			"banStatus":              a.BanStatus,
+			"banReason":              a.BanReason,
+			"banTime":                a.BanTime,
+			"expiresAt":              a.ExpiresAt,
+			"hasToken":               accountBearerToken(&a) != "",
+			"machineId":              a.MachineId,
+			"weight":                 a.Weight,
+			"overageStatus":          a.OverageStatus,
+			"overageCapability":      a.OverageCapability,
+			"overageCap":             a.OverageCap,
+			"overageRate":            a.OverageRate,
+			"currentOverages":        a.CurrentOverages,
+			"overageCheckedAt":       a.OverageCheckedAt,
+			"proxyURL":               a.ProxyURL,
+			"subscriptionType":       a.SubscriptionType,
+			"subscriptionTitle":      a.SubscriptionTitle,
+			"daysRemaining":          a.DaysRemaining,
+			"usageCurrent":           a.UsageCurrent,
+			"usageLimit":             a.UsageLimit,
+			"usagePercent":           a.UsagePercent,
+			"nextResetDate":          a.NextResetDate,
+			"lastRefresh":            a.LastRefresh,
+			"trialUsageCurrent":      a.TrialUsageCurrent,
+			"trialUsageLimit":        a.TrialUsageLimit,
+			"trialUsagePercent":      a.TrialUsagePercent,
+			"trialStatus":            a.TrialStatus,
+			"trialExpiresAt":         a.TrialExpiresAt,
+			"requestCount":           stats.RequestCount,
+			"errorCount":             stats.ErrorCount,
+			"totalTokens":            stats.TotalTokens,
+			"totalCredits":           stats.TotalCredits,
+			"lastUsed":               stats.LastUsed,
+			"maxSSE":                 a.MaxSSE,
+			"maxRPM":                 a.MaxRPM,
+			"accountType":            config.AccountTypeFor(a),
+			"modelPolicyOverride":    a.ModelPolicyOverride,
+			"allowedModels":          append([]string{}, a.AllowedModels...),
+			"effectiveAllowedModels": effectiveModels,
+			"modelPolicySource":      modelPolicySource,
+			"modelPolicyRestricted":  modelPolicyRestricted,
+			"effectiveMaxSSE":        limits.MaxSSE,
+			"effectiveMaxRPM":        limits.MaxRPM,
+			"maxSSESource":           limits.SSESource,
+			"maxRPMSource":           limits.RPMSource,
+			"activeSSE":              h.pool.GetActiveSSE(a.ID),
+			"currentRPM":             h.pool.GetCurrentRPM(a.ID),
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -3087,11 +3107,46 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
 	}
-	if v, ok := updates["maxSSE"].(float64); ok {
-		existing.MaxSSE = int(v)
+	if raw, ok := updates["maxSSE"]; ok {
+		value, err := parseIntegerPatch("maxSSE", raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		existing.MaxSSE = value
 	}
-	if v, ok := updates["maxRPM"].(float64); ok {
-		existing.MaxRPM = int(v)
+	if raw, ok := updates["maxRPM"]; ok {
+		value, err := parseIntegerPatch("maxRPM", raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		existing.MaxRPM = value
+	}
+	if raw, ok := updates["modelPolicyOverride"]; ok {
+		value, valid := raw.(bool)
+		if !valid {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "modelPolicyOverride must be a boolean"})
+			return
+		}
+		existing.ModelPolicyOverride = value
+	}
+	if raw, ok := updates["allowedModels"]; ok {
+		models, err := parseAllowedModelsPatch(raw)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		existing.AllowedModels = models
+	}
+	if err := config.ValidateAccountRoutingPolicy(existing); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -4975,6 +5030,9 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	// Subscription type selects the inherited account-type policy, so publish
+	// the refreshed category to the runtime pool immediately.
+	h.pool.Reload()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -5001,6 +5059,11 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
 	}
+	limits := config.EffectiveAccountLimits(*account)
+	effectiveModels, modelPolicySource, modelPolicyRestricted := config.EffectiveAllowedModels(*account)
+	if effectiveModels == nil {
+		effectiveModels = []string{}
+	}
 
 	// 获取运行时统计
 	var stats config.Account
@@ -5013,53 +5076,63 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 
 	// 返回完整账号信息（包含敏感字段）
 	result := map[string]interface{}{
-		"id":                account.ID,
-		"email":             account.Email,
-		"userId":            account.UserId,
-		"nickname":          account.Nickname,
-		"accessToken":       account.AccessToken,
-		"refreshToken":      account.RefreshToken,
-		"clientId":          account.ClientID,
-		"clientSecret":      account.ClientSecret,
-		"authMethod":        account.AuthMethod,
-		"provider":          account.Provider,
-		"region":            account.Region,
-		"profileArn":        account.ProfileArn,
-		"tokenEndpoint":     account.TokenEndpoint,
-		"issuerUrl":         account.IssuerURL,
-		"scopes":            account.Scopes,
-		"expiresAt":         account.ExpiresAt,
-		"machineId":         account.MachineId,
-		"weight":            account.Weight,
-		"overageStatus":     account.OverageStatus,
-		"overageCapability": account.OverageCapability,
-		"overageCap":        account.OverageCap,
-		"overageRate":       account.OverageRate,
-		"currentOverages":   account.CurrentOverages,
-		"overageCheckedAt":  account.OverageCheckedAt,
-		"proxyURL":          account.ProxyURL,
-		"enabled":           account.Enabled,
-		"banStatus":         account.BanStatus,
-		"banReason":         account.BanReason,
-		"banTime":           account.BanTime,
-		"subscriptionType":  account.SubscriptionType,
-		"subscriptionTitle": account.SubscriptionTitle,
-		"daysRemaining":     account.DaysRemaining,
-		"usageCurrent":      account.UsageCurrent,
-		"usageLimit":        account.UsageLimit,
-		"usagePercent":      account.UsagePercent,
-		"nextResetDate":     account.NextResetDate,
-		"lastRefresh":       account.LastRefresh,
-		"trialUsageCurrent": account.TrialUsageCurrent,
-		"trialUsageLimit":   account.TrialUsageLimit,
-		"trialUsagePercent": account.TrialUsagePercent,
-		"trialStatus":       account.TrialStatus,
-		"trialExpiresAt":    account.TrialExpiresAt,
-		"requestCount":      stats.RequestCount,
-		"errorCount":        stats.ErrorCount,
-		"totalTokens":       stats.TotalTokens,
-		"totalCredits":      stats.TotalCredits,
-		"lastUsed":          stats.LastUsed,
+		"id":                     account.ID,
+		"email":                  account.Email,
+		"userId":                 account.UserId,
+		"nickname":               account.Nickname,
+		"accessToken":            account.AccessToken,
+		"refreshToken":           account.RefreshToken,
+		"clientId":               account.ClientID,
+		"clientSecret":           account.ClientSecret,
+		"authMethod":             account.AuthMethod,
+		"provider":               account.Provider,
+		"region":                 account.Region,
+		"profileArn":             account.ProfileArn,
+		"tokenEndpoint":          account.TokenEndpoint,
+		"issuerUrl":              account.IssuerURL,
+		"scopes":                 account.Scopes,
+		"expiresAt":              account.ExpiresAt,
+		"machineId":              account.MachineId,
+		"weight":                 account.Weight,
+		"overageStatus":          account.OverageStatus,
+		"overageCapability":      account.OverageCapability,
+		"overageCap":             account.OverageCap,
+		"overageRate":            account.OverageRate,
+		"currentOverages":        account.CurrentOverages,
+		"overageCheckedAt":       account.OverageCheckedAt,
+		"proxyURL":               account.ProxyURL,
+		"enabled":                account.Enabled,
+		"banStatus":              account.BanStatus,
+		"banReason":              account.BanReason,
+		"banTime":                account.BanTime,
+		"subscriptionType":       account.SubscriptionType,
+		"subscriptionTitle":      account.SubscriptionTitle,
+		"daysRemaining":          account.DaysRemaining,
+		"usageCurrent":           account.UsageCurrent,
+		"usageLimit":             account.UsageLimit,
+		"usagePercent":           account.UsagePercent,
+		"nextResetDate":          account.NextResetDate,
+		"lastRefresh":            account.LastRefresh,
+		"trialUsageCurrent":      account.TrialUsageCurrent,
+		"trialUsageLimit":        account.TrialUsageLimit,
+		"trialUsagePercent":      account.TrialUsagePercent,
+		"trialStatus":            account.TrialStatus,
+		"trialExpiresAt":         account.TrialExpiresAt,
+		"requestCount":           stats.RequestCount,
+		"errorCount":             stats.ErrorCount,
+		"totalTokens":            stats.TotalTokens,
+		"totalCredits":           stats.TotalCredits,
+		"lastUsed":               stats.LastUsed,
+		"maxSSE":                 account.MaxSSE,
+		"maxRPM":                 account.MaxRPM,
+		"accountType":            config.AccountTypeFor(*account),
+		"modelPolicyOverride":    account.ModelPolicyOverride,
+		"allowedModels":          append([]string{}, account.AllowedModels...),
+		"effectiveAllowedModels": effectiveModels,
+		"modelPolicySource":      modelPolicySource,
+		"modelPolicyRestricted":  modelPolicyRestricted,
+		"effectiveMaxSSE":        limits.MaxSSE,
+		"effectiveMaxRPM":        limits.MaxRPM,
 	}
 
 	json.NewEncoder(w).Encode(result)

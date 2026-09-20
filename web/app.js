@@ -16,6 +16,7 @@
   if (!supportedLangs.includes(currentLang)) currentLang = 'zh';
   const dict = { en: null, zh: null, vi: null };
   let accountsData = [];
+  let accountTypePoliciesData = null;
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
@@ -1019,8 +1020,8 @@
       const selectLabel = t('accounts.selectAccount', displayEmail);
 
       const isEnt = (a.provider && (a.provider.toLowerCase() === 'enterprise' || a.provider.toLowerCase() === 'azuread')) || (a.authMethod && (a.authMethod.toLowerCase() === 'idc' || a.authMethod.toLowerCase() === 'external_idp'));
-      const sseLimit = a.maxSSE > 0 ? a.maxSSE : (isEnt ? 30 : 3);
-      const rpmLimit = a.maxRPM > 0 ? a.maxRPM : (isEnt ? 15 : 10);
+      const sseLimit = Number(a.effectiveMaxSSE) > 0 ? Number(a.effectiveMaxSSE) : (isEnt ? 30 : 3);
+      const rpmLimit = Number(a.effectiveMaxRPM) > 0 ? Number(a.effectiveMaxRPM) : (isEnt ? 15 : 10);
       const activeSseVal = a.activeSSE || 0;
       const currentRpmVal = a.currentRPM || 0;
 
@@ -1344,7 +1345,26 @@
       '    <input type="number" id="maxRPMInput" value="' + (a.maxRPM || 0) + '" min="0" placeholder="' + escapeAttr(t('detail.limitPlaceholder')) + '" />' +
       '  </div>' +
       '</div>' +
+      '<p class="help-block">' + escapeHtml(t('detail.concurrencyInheritance', a.effectiveMaxSSE || 0, a.effectiveMaxRPM || 0)) + '</p>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveConcurrency" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div>' +
+
+      '<div class="detail-section"><h4>' + escapeHtml(t('detail.modelPolicy')) + '</h4>' +
+      '<div class="form-group">' +
+      '<label for="modelPolicyMode">' + escapeHtml(t('detail.modelPolicyMode')) + '</label>' +
+      '<select id="modelPolicyMode">' +
+      '<option value="inherit"' + (!a.modelPolicyOverride ? ' selected' : '') + '>' + escapeHtml(t('detail.modelPolicyInherit')) + '</option>' +
+      '<option value="custom"' + (a.modelPolicyOverride ? ' selected' : '') + '>' + escapeHtml(t('detail.modelPolicyCustom')) + '</option>' +
+      '</select>' +
+      '</div>' +
+      '<div class="form-group">' +
+      '<label for="allowedModelsInput">' + escapeHtml(t('detail.allowedModels')) + '</label>' +
+      '<textarea id="allowedModelsInput" class="model-policy-textarea" rows="6"' + (!a.modelPolicyOverride ? ' disabled' : '') + ' placeholder="claude-sonnet-4.6\nclaude-opus-4.8">' +
+      escapeHtml((a.modelPolicyOverride ? (a.allowedModels || []) : (a.effectiveAllowedModels || [])).join('\n')) + '</textarea>' +
+      '<small>' + escapeHtml(t('detail.allowedModelsHint')) + '</small>' +
+      '</div>' +
+      '<p class="help-block">' + escapeHtml(t('detail.modelPolicyEffective', policySourceLabel(a.modelPolicySource), formatModelPolicySummary(a))) + '</p>' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="saveModelPolicy" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
 
       '<div class="detail-section">' +
@@ -1433,13 +1453,15 @@
       const d = await res.json();
       if (d.success) {
         toast(successMsg, 'success');
-        loadAccounts();
+        await loadAccounts();
+        return true;
       } else {
         toast(t('detail.saveFailed') + (d.error ? ': ' + d.error : ''), 'error');
       }
     } catch (e) {
       toast(t('detail.saveFailed'), 'error');
     }
+    return false;
   }
   async function saveMachineId(id) {
     const m = $('machineIdInput').value.trim();
@@ -1455,7 +1477,98 @@
   async function saveConcurrency(id) {
     const maxSSE = parseInt($('maxSSEInput').value, 10) || 0;
     const maxRPM = parseInt($('maxRPMInput').value, 10) || 0;
-    await putAccount(id, { maxSSE, maxRPM }, t('detail.saved'));
+    if (await putAccount(id, { maxSSE, maxRPM }, t('detail.saved'))) showDetail(id);
+  }
+  function parseModelPolicyText(value) {
+    const seen = new Set();
+    String(value || '').split(/[\n,]+/).forEach(raw => {
+      const model = raw.trim().toLowerCase();
+      if (model) seen.add(model);
+    });
+    return Array.from(seen).sort();
+  }
+  function policySourceLabel(source) {
+    if (source === 'account') return t('accountPolicies.sourceAccount');
+    if (source === 'type') return t('accountPolicies.sourceType');
+    return t('accountPolicies.sourceSystem');
+  }
+  function formatModelPolicySummary(account) {
+    if (!account.modelPolicyRestricted) return t('accountPolicies.unrestricted');
+    const models = account.effectiveAllowedModels || [];
+    return models.length ? models.join(', ') : t('accountPolicies.noneAllowed');
+  }
+  function syncModelPolicyMode() {
+    const mode = $('modelPolicyMode');
+    const input = $('allowedModelsInput');
+    if (!mode || !input) return;
+    input.disabled = mode.value !== 'custom';
+  }
+  async function saveModelPolicy(id) {
+    const custom = $('modelPolicyMode').value === 'custom';
+    const allowedModels = custom ? parseModelPolicyText($('allowedModelsInput').value) : [];
+    if (await putAccount(id, { modelPolicyOverride: custom, allowedModels }, t('detail.saved'))) showDetail(id);
+  }
+  async function showAccountTypePolicies() {
+    $('accountTypePoliciesBody').innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.loading')) + '</p>';
+    openDialog('accountTypePoliciesModal');
+    try {
+      const res = await api('/account-type-policies');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      accountTypePoliciesData = await res.json();
+      renderAccountTypePolicyEditor('FREE');
+    } catch (e) {
+      $('accountTypePoliciesBody').innerHTML = '<p class="message message-error">' + escapeHtml(t('accountPolicies.loadFailed')) + '</p>';
+    }
+  }
+  function renderAccountTypePolicyEditor(selectedType) {
+    if (!accountTypePoliciesData) return;
+    const policies = accountTypePoliciesData.types || [];
+    const policy = policies.find(item => item.type === selectedType) || policies[0];
+    if (!policy) return;
+    const options = policies.map(item => '<option value="' + escapeAttr(item.type) + '"' + (item.type === policy.type ? ' selected' : '') + '>' +
+      escapeHtml(formatSubscriptionLabel(item.type)) + ' (' + Number(item.accountCount || 0) + ')' + '</option>').join('');
+    const knownModels = accountTypePoliciesData.availableModels || [];
+    const knownHint = knownModels.length
+      ? t('accountPolicies.knownModels', knownModels.join(', '))
+      : t('accountPolicies.noKnownModels');
+    $('accountTypePoliciesBody').innerHTML =
+      '<div class="form-group"><label for="accountTypePolicySelect">' + escapeHtml(t('accountPolicies.accountType')) + '</label>' +
+      '<select id="accountTypePolicySelect">' + options + '</select></div>' +
+      '<div class="form-group"><label for="accountTypeAllowedModels">' + escapeHtml(t('accountPolicies.allowedModels')) + '</label>' +
+      '<textarea id="accountTypeAllowedModels" class="model-policy-textarea" rows="7" placeholder="claude-sonnet-4.6\nclaude-opus-4.8">' + escapeHtml((policy.allowedModels || []).join('\n')) + '</textarea>' +
+      '<small>' + escapeHtml(t('accountPolicies.allowedModelsHint')) + '</small></div>' +
+      '<p class="help-block model-policy-known">' + escapeHtml(knownHint) + '</p>' +
+      '<div class="policy-limit-grid">' +
+      '<div class="form-group"><label for="accountTypeMaxSSE">' + escapeHtml(t('detail.maxSSE')) + '</label><input id="accountTypeMaxSSE" type="number" min="0" value="' + Number(policy.maxSSE || 0) + '" /></div>' +
+      '<div class="form-group"><label for="accountTypeMaxRPM">' + escapeHtml(t('detail.maxRPM')) + '</label><input id="accountTypeMaxRPM" type="number" min="0" value="' + Number(policy.maxRPM || 0) + '" /></div>' +
+      '</div>' +
+      '<p class="help-block">' + escapeHtml(t('accountPolicies.inheritanceHint')) + '</p>' +
+      '<div class="flex gap-2"><button class="btn btn-primary" id="saveAccountTypePolicyBtn" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+      '<button class="btn btn-outline" id="resetAccountTypePolicyBtn" type="button">' + escapeHtml(t('accountPolicies.reset')) + '</button></div>';
+  }
+  async function saveAccountTypePolicy(reset) {
+    const accountType = $('accountTypePolicySelect').value;
+    const body = reset ? { allowedModels: [], maxSSE: 0, maxRPM: 0 } : {
+      allowedModels: parseModelPolicyText($('accountTypeAllowedModels').value),
+      maxSSE: parseInt($('accountTypeMaxSSE').value, 10) || 0,
+      maxRPM: parseInt($('accountTypeMaxRPM').value, 10) || 0
+    };
+    try {
+      const res = await api('/account-type-policies/' + encodeURIComponent(accountType), { method: 'PUT', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'HTTP ' + res.status);
+      const refreshed = await api('/account-type-policies');
+      if (!refreshed.ok) throw new Error('HTTP ' + refreshed.status);
+      accountTypePoliciesData = await refreshed.json();
+      renderAccountTypePolicyEditor(accountType);
+      await loadAccounts();
+      toast(reset ? t('accountPolicies.resetDone') : t('accountPolicies.saved'), 'success');
+    } catch (e) {
+      toast(t('detail.saveFailed') + ': ' + e.message, 'error');
+    }
+  }
+  function closeAccountTypePoliciesModal() {
+    closeDialog('accountTypePoliciesModal');
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -4165,6 +4278,7 @@
 
     $('exportBtn').addEventListener('click', showExportModal);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
+    $('accountTypePoliciesBtn').addEventListener('click', showAccountTypePolicies);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
@@ -4334,12 +4448,14 @@
   function bindModalEvents() {
     $('addModalClose').addEventListener('click', closeModal);
     $('detailModalClose').addEventListener('click', closeDetailModal);
+    $('accountTypePoliciesModalClose').addEventListener('click', closeAccountTypePoliciesModal);
     $('exportModalClose').addEventListener('click', closeExportModal);
     $('testModalClose').addEventListener('click', closeTestModal);
     $('updateModalClose').addEventListener('click', closeUpdateModal);
     [
       ['addModal', closeModal],
       ['detailModal', closeDetailModal],
+      ['accountTypePoliciesModal', closeAccountTypePoliciesModal],
       ['exportModal', closeExportModal],
       ['testModal', closeTestModal],
       ['updateModal', closeUpdateModal],
@@ -4362,6 +4478,9 @@
   }
 
   function bindDetailEvents() {
+    $('detailBody').addEventListener('change', e => {
+      if (e.target.id === 'modelPolicyMode') syncModelPolicyMode();
+    });
     $('detailBody').addEventListener('click', e => {
       if (e.target.id === 'generateMachineIdBtn') { generateMachineId(); return; }
       const b = e.target.closest('[data-detail-action]');
@@ -4371,11 +4490,20 @@
       if (a === 'saveMachineId') saveMachineId(id);
       else if (a === 'saveWeight') saveWeight(id);
       else if (a === 'saveConcurrency') saveConcurrency(id);
+      else if (a === 'saveModelPolicy') saveModelPolicy(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
+    });
+
+    $('accountTypePoliciesBody').addEventListener('change', e => {
+      if (e.target.id === 'accountTypePolicySelect') renderAccountTypePolicyEditor(e.target.value);
+    });
+    $('accountTypePoliciesBody').addEventListener('click', e => {
+      if (e.target.closest('#saveAccountTypePolicyBtn')) saveAccountTypePolicy(false);
+      else if (e.target.closest('#resetAccountTypePolicyBtn')) saveAccountTypePolicy(true);
     });
   }
 

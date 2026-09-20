@@ -82,6 +82,18 @@ func (p *AccountPool) ensurePoolMapsLocked() {
 	if p.modelLists == nil {
 		p.modelLists = make(map[string]map[string]bool)
 	}
+	if p.modelPolicies == nil {
+		p.modelPolicies = make(map[string]map[string]bool)
+	}
+	if p.effectiveLimits == nil {
+		p.effectiveLimits = make(map[string]config.AccountLimits)
+	}
+	if p.activeSSE == nil {
+		p.activeSSE = make(map[string]int)
+	}
+	if p.reqTimestamps == nil {
+		p.reqTimestamps = make(map[string][]time.Time)
+	}
 	if p.runtimeStats == nil {
 		p.runtimeStats = make(map[string]*accountRuntimeStats)
 	}

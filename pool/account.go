@@ -5,6 +5,7 @@ package pool
 import (
 	"kiro-go/config"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,16 +51,18 @@ func errorCooldownDuration(consecutiveErrors int) time.Duration {
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time            // 账号冷却时间
-	errorCounts   map[string]int                  // 连续错误计数
-	modelLists    map[string]map[string]bool      // accountID → set of modelIDs (from ListAvailableModels)
-	activeSSE     map[string]int                  // accountID → active SSE stream count
-	reqTimestamps map[string][]time.Time          // accountID → sliding window of request timestamps
-	runtimeStats  map[string]*accountRuntimeStats // accountID → dispatch health/load signals (health-scoring)
+	mu              sync.RWMutex
+	accounts        []config.Account
+	totalAccounts   int
+	currentIndex    uint64
+	cooldowns       map[string]time.Time            // 账号冷却时间
+	errorCounts     map[string]int                  // 连续错误计数
+	modelLists      map[string]map[string]bool      // accountID → set of modelIDs (from ListAvailableModels)
+	modelPolicies   map[string]map[string]bool      // accountID → effective manual allow-list; presence means restricted
+	effectiveLimits map[string]config.AccountLimits // accountID → resolved account/type/system limits
+	activeSSE       map[string]int                  // accountID → active SSE stream count
+	reqTimestamps   map[string][]time.Time          // accountID → sliding window of request timestamps
+	runtimeStats    map[string]*accountRuntimeStats // accountID → dispatch health/load signals (health-scoring)
 }
 
 var (
@@ -71,12 +74,14 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:     make(map[string]time.Time),
-			errorCounts:   make(map[string]int),
-			modelLists:    make(map[string]map[string]bool),
-			activeSSE:     make(map[string]int),
-			reqTimestamps: make(map[string][]time.Time),
-			runtimeStats:  make(map[string]*accountRuntimeStats),
+			cooldowns:       make(map[string]time.Time),
+			errorCounts:     make(map[string]int),
+			modelLists:      make(map[string]map[string]bool),
+			modelPolicies:   make(map[string]map[string]bool),
+			effectiveLimits: make(map[string]config.AccountLimits),
+			activeSSE:       make(map[string]int),
+			reqTimestamps:   make(map[string][]time.Time),
+			runtimeStats:    make(map[string]*accountRuntimeStats),
 		}
 		pool.Reload()
 	})
@@ -89,22 +94,34 @@ func GetPool() *AccountPool {
 // Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
 // setting permits over-quota routing.
 func (p *AccountPool) Reload() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
 	var weighted []config.Account
+	modelPolicies := make(map[string]map[string]bool, len(enabled))
+	effectiveLimits := make(map[string]config.AccountLimits, len(enabled))
 	for _, a := range enabled {
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
+		if models, _, restricted := config.EffectiveAllowedModels(a); restricted {
+			allowlist := make(map[string]bool, len(models))
+			for _, model := range models {
+				allowlist[model] = true
+			}
+			modelPolicies[a.ID] = allowlist
+		}
+		effectiveLimits[a.ID] = config.EffectiveAccountLimits(a)
 		w := effectiveWeight(a.Weight)
 		for j := 0; j < w; j++ {
 			weighted = append(weighted, a)
 		}
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.accounts = weighted
 	p.totalAccounts = len(enabled)
+	p.modelPolicies = modelPolicies
+	p.effectiveLimits = effectiveLimits
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -132,6 +149,7 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 		set[strings.ToLower(strings.TrimSpace(id))] = true
 	}
 	p.mu.Lock()
+	p.ensurePoolMapsLocked()
 	p.modelLists[accountID] = set
 	p.mu.Unlock()
 }
@@ -152,19 +170,44 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 	return ids
 }
 
-// accountHasModel 检查账号是否支持指定模型。
-// 若该账号尚无模型列表（冷启动），视为支持所有模型。
+// GetKnownModels returns the union of all runtime account capability caches.
+// The sorted snapshot is used by the admin policy editor and never exposes
+// account credentials or model-to-account membership.
+func (p *AccountPool) GetKnownModels() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := make(map[string]struct{})
+	for _, models := range p.modelLists {
+		for model := range models {
+			seen[model] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for model := range seen {
+		out = append(out, model)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// accountHasModel checks both the persisted manual policy and the upstream
+// capability cache. During a cold start only the upstream cache is optimistic;
+// explicit account/type restrictions remain authoritative.
 func (p *AccountPool) accountHasModel(accountID, model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if allowlist, restricted := p.modelPolicies[accountID]; restricted && !allowlist[normalized] {
+		return false
+	}
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
 		return true // 冷启动：列表未就绪，乐观放行
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+	return list[normalized]
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号。
 // model 应为去掉 thinking 后缀的实际模型名。
-// 若无账号有该模型列表数据，行为与 GetNext 相同（乐观路由）。
+// 上游能力缓存未就绪时保持乐观路由，但仍严格执行人工模型策略。
 func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
@@ -466,6 +509,7 @@ func effectiveWeight(weight int) int {
 func (p *AccountPool) Acquire(accountID string, isStream bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.ensurePoolMapsLocked()
 
 	now := time.Now()
 
@@ -499,22 +543,24 @@ func (p *AccountPool) Acquire(accountID string, isStream bool) bool {
 		}
 	}
 
-	// Determine defaults based on credentials
-	limitSSE := 3
-	limitRPM := 10
-	isEnterprise := false
-
+	// Resolve account override > subscription-type default > legacy system
+	// defaults. Reload precomputes the common path; the fallback keeps tests and
+	// manually constructed pools backward compatible.
+	limitSSE, limitRPM := 3, 10
 	if acc != nil {
-		isEnterprise = strings.EqualFold(acc.Provider, "Enterprise") || acc.AuthMethod == "idc" || acc.AuthMethod == "external_idp" || strings.EqualFold(acc.Provider, "AzureAD")
-		if isEnterprise {
-			limitSSE = 30
-			limitRPM = 15
-		}
-		if acc.MaxSSE > 0 {
-			limitSSE = acc.MaxSSE
-		}
-		if acc.MaxRPM > 0 {
-			limitRPM = acc.MaxRPM
+		if limits, ok := p.effectiveLimits[accountID]; ok {
+			limitSSE, limitRPM = limits.MaxSSE, limits.MaxRPM
+		} else {
+			isEnterprise := strings.EqualFold(acc.Provider, "Enterprise") || strings.EqualFold(acc.Provider, "AzureAD") || strings.EqualFold(acc.AuthMethod, "idc") || strings.EqualFold(acc.AuthMethod, "external_idp")
+			if isEnterprise {
+				limitSSE, limitRPM = 30, 15
+			}
+			if acc.MaxSSE > 0 {
+				limitSSE = acc.MaxSSE
+			}
+			if acc.MaxRPM > 0 {
+				limitRPM = acc.MaxRPM
+			}
 		}
 	}
 
