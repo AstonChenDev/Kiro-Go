@@ -40,6 +40,7 @@ func parseAllowedModelsPatch(value interface{}) ([]string, error) {
 
 type accountTypePolicyResponse struct {
 	Type          string   `json:"type"`
+	Group         string   `json:"group"`
 	AccountCount  int      `json:"accountCount"`
 	AllowedModels []string `json:"allowedModels"`
 	MaxSSE        int      `json:"maxSSE"`
@@ -48,13 +49,16 @@ type accountTypePolicyResponse struct {
 
 func (h *Handler) apiGetAccountTypePolicies(w http.ResponseWriter, _ *http.Request) {
 	accounts := config.GetAccounts()
-	counts := make(map[string]int, len(config.SupportedAccountTypes))
+	counts := make(map[string]int, len(config.SupportedAccountPolicyCategories))
 	knownModels := make(map[string]struct{})
 	for _, model := range h.pool.GetKnownModels() {
 		knownModels[model] = struct{}{}
 	}
 	for _, account := range accounts {
 		counts[config.AccountTypeFor(account)]++
+		if credentialType, ok := config.CredentialTypeFor(account); ok {
+			counts[credentialType]++
+		}
 		for _, model := range account.AllowedModels {
 			knownModels[model] = struct{}{}
 		}
@@ -70,15 +74,16 @@ func (h *Handler) apiGetAccountTypePolicies(w http.ResponseWriter, _ *http.Reque
 	h.modelsCacheMu.RUnlock()
 
 	policies := config.GetAccountTypePolicies()
-	result := make([]accountTypePolicyResponse, 0, len(config.SupportedAccountTypes))
-	for _, accountType := range config.SupportedAccountTypes {
-		policy := policies[accountType]
+	result := make([]accountTypePolicyResponse, 0, len(config.SupportedAccountPolicyCategories))
+	for _, category := range config.SupportedAccountPolicyCategories {
+		policy := policies[category.Type]
 		for _, model := range policy.AllowedModels {
 			knownModels[model] = struct{}{}
 		}
 		result = append(result, accountTypePolicyResponse{
-			Type:          accountType,
-			AccountCount:  counts[accountType],
+			Type:          category.Type,
+			Group:         category.Group,
+			AccountCount:  counts[category.Type],
 			AllowedModels: append([]string{}, policy.AllowedModels...),
 			MaxSSE:        policy.MaxSSE,
 			MaxRPM:        policy.MaxRPM,

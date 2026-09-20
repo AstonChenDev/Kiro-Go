@@ -20,6 +20,8 @@ func TestAccountTypePolicyAdminRoundTrip(t *testing.T) {
 		Enabled:          true,
 		AccessToken:      "token",
 		SubscriptionType: config.AccountTypePro,
+		Provider:         "GitHub",
+		AuthMethod:       "social",
 	}); err != nil {
 		t.Fatalf("config.AddAccount: %v", err)
 	}
@@ -46,15 +48,23 @@ func TestAccountTypePolicyAdminRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(get.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	var pro *accountTypePolicyResponse
+	if len(response.Types) != len(config.SupportedAccountPolicyCategories) {
+		t.Fatalf("policy categories=%d, want %d", len(response.Types), len(config.SupportedAccountPolicyCategories))
+	}
+	var pro, github *accountTypePolicyResponse
 	for i := range response.Types {
 		if response.Types[i].Type == config.AccountTypePro {
 			pro = &response.Types[i]
-			break
+		}
+		if response.Types[i].Type == config.CredentialTypeGitHub {
+			github = &response.Types[i]
 		}
 	}
-	if pro == nil || pro.AccountCount != 1 || pro.MaxSSE != 6 || pro.MaxRPM != 18 || len(pro.AllowedModels) != 1 || pro.AllowedModels[0] != "claude-opus-4.8" {
+	if pro == nil || pro.Group != config.PolicyGroupSubscription || pro.AccountCount != 1 || pro.MaxSSE != 6 || pro.MaxRPM != 18 || len(pro.AllowedModels) != 1 || pro.AllowedModels[0] != "claude-opus-4.8" {
 		t.Fatalf("PRO policy = %+v", pro)
+	}
+	if github == nil || github.Group != config.PolicyGroupCredential || github.AccountCount != 1 {
+		t.Fatalf("GitHub policy category = %+v", github)
 	}
 }
 
@@ -93,7 +103,7 @@ func TestAccountUpdateAndListExposeEffectivePolicy(t *testing.T) {
 		t.Fatalf("accounts=%d", len(accounts))
 	}
 	a := accounts[0]
-	if a["accountType"] != config.AccountTypeFree || a["modelPolicySource"] != "account" || a["maxSSESource"] != "account" || a["maxRPMSource"] != "type" {
+	if a["accountType"] != config.AccountTypeFree || a["modelPolicySource"] != "account" || a["maxSSESource"] != "account" || a["maxRPMSource"] != "subscription_type" {
 		t.Fatalf("policy sources = %#v", a)
 	}
 	if a["effectiveMaxSSE"] != float64(9) || a["effectiveMaxRPM"] != float64(14) {

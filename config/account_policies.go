@@ -13,24 +13,45 @@ const (
 	AccountTypeProPlus = "PRO_PLUS"
 	AccountTypePower   = "POWER"
 
+	CredentialTypeBuilderID  = "BUILDER_ID"
+	CredentialTypeEnterprise = "ENTERPRISE"
+	CredentialTypeGoogle     = "GOOGLE"
+	CredentialTypeGitHub     = "GITHUB"
+	CredentialTypeAPIKey     = "API_KEY"
+
+	PolicyGroupSubscription = "subscription"
+	PolicyGroupCredential   = "credential"
+
 	maxAccountPolicyLimit = 1_000_000
 	maxAllowedModels      = 512
 	maxModelIDLength      = 256
 )
 
-// SupportedAccountTypes is the stable display and API order for subscription
-// policy categories.
-var SupportedAccountTypes = []string{
-	AccountTypeFree,
-	AccountTypePro,
-	AccountTypeProPlus,
-	AccountTypePower,
+// AccountPolicyCategory describes one selectable shared-policy scope.
+type AccountPolicyCategory struct {
+	Type  string
+	Group string
 }
 
-// AccountTypePolicy defines defaults inherited by accounts of one subscription
-// type. Zero concurrency values retain the existing system defaults. An empty
-// model list means unrestricted; actual upstream model availability is still
-// enforced independently by the account pool.
+// SupportedAccountPolicyCategories is the stable display and API order. An
+// account belongs to one subscription category and, when identifiable, one
+// credential/provider category.
+var SupportedAccountPolicyCategories = []AccountPolicyCategory{
+	{Type: AccountTypeFree, Group: PolicyGroupSubscription},
+	{Type: AccountTypePro, Group: PolicyGroupSubscription},
+	{Type: AccountTypeProPlus, Group: PolicyGroupSubscription},
+	{Type: AccountTypePower, Group: PolicyGroupSubscription},
+	{Type: CredentialTypeBuilderID, Group: PolicyGroupCredential},
+	{Type: CredentialTypeEnterprise, Group: PolicyGroupCredential},
+	{Type: CredentialTypeGoogle, Group: PolicyGroupCredential},
+	{Type: CredentialTypeGitHub, Group: PolicyGroupCredential},
+	{Type: CredentialTypeAPIKey, Group: PolicyGroupCredential},
+}
+
+// AccountTypePolicy defines defaults inherited from a subscription tier or a
+// credential/provider family. Zero concurrency values inherit the next policy
+// layer. An empty model list is unrestricted at this layer; actual upstream
+// model availability is always enforced independently by the account pool.
 type AccountTypePolicy struct {
 	AllowedModels []string `json:"allowedModels,omitempty"`
 	MaxSSE        int      `json:"maxSSE,omitempty"`
@@ -38,7 +59,8 @@ type AccountTypePolicy struct {
 }
 
 // AccountLimits is the resolved concurrency/rate-limit view used by both the
-// scheduler and the admin API. Sources are "account", "type", or "system".
+// scheduler and the admin API. Sources are "account", "credential_type",
+// "subscription_type", or "system".
 type AccountLimits struct {
 	MaxSSE    int
 	MaxRPM    int
@@ -63,10 +85,10 @@ func NormalizeAccountType(raw string) string {
 	}
 }
 
-func IsSupportedAccountType(raw string) bool {
+func IsSupportedAccountPolicyType(raw string) bool {
 	normalized := strings.ToUpper(strings.TrimSpace(raw))
-	for _, accountType := range SupportedAccountTypes {
-		if normalized == accountType {
+	for _, category := range SupportedAccountPolicyCategories {
+		if normalized == category.Type {
 			return true
 		}
 	}
@@ -75,6 +97,31 @@ func IsSupportedAccountType(raw string) bool {
 
 func AccountTypeFor(account Account) string {
 	return NormalizeAccountType(account.SubscriptionType)
+}
+
+// CredentialTypeFor classifies the credential/provider families shown on
+// account cards. The bool is false when legacy social credentials do not retain
+// enough provider metadata to distinguish Google from GitHub.
+func CredentialTypeFor(account Account) (string, bool) {
+	if IsAPIKeyAccount(&account) {
+		return CredentialTypeAPIKey, true
+	}
+	provider := strings.ToLower(strings.TrimSpace(account.Provider))
+	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
+	switch {
+	case strings.Contains(provider, "builder"), method == "builderid", method == "builder_id":
+		return CredentialTypeBuilderID, true
+	case strings.Contains(provider, "google"):
+		return CredentialTypeGoogle, true
+	case strings.Contains(provider, "github"):
+		return CredentialTypeGitHub, true
+	case strings.Contains(provider, "enterprise"), strings.Contains(provider, "azure"), strings.Contains(provider, "microsoft"):
+		return CredentialTypeEnterprise, true
+	case method == "external_idp", method == "idc":
+		return CredentialTypeEnterprise, true
+	default:
+		return "", false
+	}
 }
 
 // NormalizeAllowedModels canonicalizes model IDs for case-insensitive routing.
@@ -179,7 +226,7 @@ func normalizeAccountPolicies(c *Config) (bool, error) {
 	seenTypes := make(map[string]struct{}, len(c.AccountTypePolicies))
 	for rawType, rawPolicy := range c.AccountTypePolicies {
 		accountType := strings.ToUpper(strings.TrimSpace(rawType))
-		if !IsSupportedAccountType(accountType) {
+		if !IsSupportedAccountPolicyType(accountType) {
 			return false, fmt.Errorf("unsupported account type policy %q", rawType)
 		}
 		policy, err := normalizeAccountTypePolicy(rawPolicy)
@@ -216,19 +263,19 @@ func cloneAccountTypePolicy(policy AccountTypePolicy) AccountTypePolicy {
 func GetAccountTypePolicies() map[string]AccountTypePolicy {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	out := make(map[string]AccountTypePolicy, len(SupportedAccountTypes))
+	out := make(map[string]AccountTypePolicy, len(SupportedAccountPolicyCategories))
 	if cfg == nil {
 		return out
 	}
-	for _, accountType := range SupportedAccountTypes {
-		out[accountType] = cloneAccountTypePolicy(cfg.AccountTypePolicies[accountType])
+	for _, category := range SupportedAccountPolicyCategories {
+		out[category.Type] = cloneAccountTypePolicy(cfg.AccountTypePolicies[category.Type])
 	}
 	return out
 }
 
 func SetAccountTypePolicy(accountType string, policy AccountTypePolicy) error {
 	accountType = strings.ToUpper(strings.TrimSpace(accountType))
-	if !IsSupportedAccountType(accountType) {
+	if !IsSupportedAccountPolicyType(accountType) {
 		return fmt.Errorf("unsupported account type %q", accountType)
 	}
 	normalized, err := normalizeAccountTypePolicy(policy)
@@ -261,11 +308,22 @@ func SetAccountTypePolicy(accountType string, policy AccountTypePolicy) error {
 	return nil
 }
 
-func accountTypePolicyLocked(account Account) AccountTypePolicy {
+func subscriptionPolicyLocked(account Account) AccountTypePolicy {
 	if cfg == nil || cfg.AccountTypePolicies == nil {
 		return AccountTypePolicy{}
 	}
 	return cfg.AccountTypePolicies[AccountTypeFor(account)]
+}
+
+func credentialPolicyLocked(account Account) (AccountTypePolicy, bool) {
+	if cfg == nil || cfg.AccountTypePolicies == nil {
+		return AccountTypePolicy{}, false
+	}
+	credentialType, ok := CredentialTypeFor(account)
+	if !ok {
+		return AccountTypePolicy{}, false
+	}
+	return cfg.AccountTypePolicies[credentialType], true
 }
 
 // EffectiveAllowedModels returns the active manual allow-list and its source.
@@ -277,11 +335,14 @@ func EffectiveAllowedModels(account Account) (models []string, source string, re
 	}
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	policy := accountTypePolicyLocked(account)
-	if len(policy.AllowedModels) == 0 {
-		return nil, "system", false
+	if policy, ok := credentialPolicyLocked(account); ok && len(policy.AllowedModels) > 0 {
+		return append([]string(nil), policy.AllowedModels...), "credential_type", true
 	}
-	return append([]string(nil), policy.AllowedModels...), "type", true
+	policy := subscriptionPolicyLocked(account)
+	if len(policy.AllowedModels) > 0 {
+		return append([]string(nil), policy.AllowedModels...), "subscription_type", true
+	}
+	return nil, "system", false
 }
 
 func isEnterpriseAccount(account Account) bool {
@@ -305,15 +366,24 @@ func EffectiveAccountLimits(account Account) AccountLimits {
 	result := AccountLimits{MaxSSE: maxSSE, MaxRPM: maxRPM, SSESource: "system", RPMSource: "system"}
 
 	cfgLock.RLock()
-	policy := accountTypePolicyLocked(account)
+	subscriptionPolicy := subscriptionPolicyLocked(account)
+	credentialPolicy, hasCredentialPolicy := credentialPolicyLocked(account)
 	cfgLock.RUnlock()
-	if policy.MaxSSE > 0 {
-		result.MaxSSE = policy.MaxSSE
-		result.SSESource = "type"
+	if subscriptionPolicy.MaxSSE > 0 {
+		result.MaxSSE = subscriptionPolicy.MaxSSE
+		result.SSESource = "subscription_type"
 	}
-	if policy.MaxRPM > 0 {
-		result.MaxRPM = policy.MaxRPM
-		result.RPMSource = "type"
+	if subscriptionPolicy.MaxRPM > 0 {
+		result.MaxRPM = subscriptionPolicy.MaxRPM
+		result.RPMSource = "subscription_type"
+	}
+	if hasCredentialPolicy && credentialPolicy.MaxSSE > 0 {
+		result.MaxSSE = credentialPolicy.MaxSSE
+		result.SSESource = "credential_type"
+	}
+	if hasCredentialPolicy && credentialPolicy.MaxRPM > 0 {
+		result.MaxRPM = credentialPolicy.MaxRPM
+		result.RPMSource = "credential_type"
 	}
 	if account.MaxSSE > 0 {
 		result.MaxSSE = account.MaxSSE

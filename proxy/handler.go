@@ -2945,6 +2945,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		stats := statsMap[a.ID]
 		limits := config.EffectiveAccountLimits(a)
 		effectiveModels, modelPolicySource, modelPolicyRestricted := config.EffectiveAllowedModels(a)
+		credentialType, _ := config.CredentialTypeFor(a)
 		if effectiveModels == nil {
 			effectiveModels = []string{}
 		}
@@ -2993,6 +2994,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"maxSSE":                 a.MaxSSE,
 			"maxRPM":                 a.MaxRPM,
 			"accountType":            config.AccountTypeFor(a),
+			"credentialType":         credentialType,
 			"modelPolicyOverride":    a.ModelPolicyOverride,
 			"allowedModels":          append([]string{}, a.AllowedModels...),
 			"effectiveAllowedModels": effectiveModels,
@@ -5061,6 +5063,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 	}
 	limits := config.EffectiveAccountLimits(*account)
 	effectiveModels, modelPolicySource, modelPolicyRestricted := config.EffectiveAllowedModels(*account)
+	credentialType, _ := config.CredentialTypeFor(*account)
 	if effectiveModels == nil {
 		effectiveModels = []string{}
 	}
@@ -5126,6 +5129,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"maxSSE":                 account.MaxSSE,
 		"maxRPM":                 account.MaxRPM,
 		"accountType":            config.AccountTypeFor(*account),
+		"credentialType":         credentialType,
 		"modelPolicyOverride":    account.ModelPolicyOverride,
 		"allowedModels":          append([]string{}, account.AllowedModels...),
 		"effectiveAllowedModels": effectiveModels,

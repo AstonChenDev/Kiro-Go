@@ -923,6 +923,18 @@
     if (s.includes('FREE')) return t('subscription.free');
     return type || t('subscription.free');
   }
+  function formatPolicyCategoryLabel(type) {
+    const normalized = String(type || '').toUpperCase();
+    if (normalized === 'BUILDER_ID') return 'BuilderID';
+    if (normalized === 'ENTERPRISE') return 'Enterprise';
+    if (normalized === 'GOOGLE') return 'Google';
+    if (normalized === 'GITHUB') return 'GitHub';
+    if (normalized === 'API_KEY') return 'API Key';
+    return formatSubscriptionLabel(type);
+  }
+  function policyGroupLabel(group) {
+    return group === 'credential' ? t('accountPolicies.credentialGroup') : t('accountPolicies.subscriptionGroup');
+  }
   function getSubBadge(type) {
     const s = (type || '').toUpperCase();
     if (s.includes('POWER')) return '<span class="badge badge-power">' + escapeHtml(formatSubscriptionLabel(type)) + '</span>';
@@ -1489,7 +1501,8 @@
   }
   function policySourceLabel(source) {
     if (source === 'account') return t('accountPolicies.sourceAccount');
-    if (source === 'type') return t('accountPolicies.sourceType');
+    if (source === 'credential_type') return t('accountPolicies.sourceCredentialType');
+    if (source === 'subscription_type' || source === 'type') return t('accountPolicies.sourceSubscriptionType');
     return t('accountPolicies.sourceSystem');
   }
   function formatModelPolicySummary(account) {
@@ -1525,8 +1538,16 @@
     const policies = accountTypePoliciesData.types || [];
     const policy = policies.find(item => item.type === selectedType) || policies[0];
     if (!policy) return;
-    const options = policies.map(item => '<option value="' + escapeAttr(item.type) + '"' + (item.type === policy.type ? ' selected' : '') + '>' +
-      escapeHtml(formatSubscriptionLabel(item.type)) + ' (' + Number(item.accountCount || 0) + ')' + '</option>').join('');
+    let currentGroup = '';
+    const options = policies.map(item => {
+      let groupHeader = '';
+      if (item.group !== currentGroup) {
+        currentGroup = item.group;
+        groupHeader = '<option disabled>—— ' + escapeHtml(policyGroupLabel(item.group)) + ' ——</option>';
+      }
+      return groupHeader + '<option value="' + escapeAttr(item.type) + '"' + (item.type === policy.type ? ' selected' : '') + '>' +
+        escapeHtml(formatPolicyCategoryLabel(item.type)) + ' (' + Number(item.accountCount || 0) + ')' + '</option>';
+    }).join('');
     const knownModels = accountTypePoliciesData.availableModels || [];
     const knownHint = knownModels.length
       ? t('accountPolicies.knownModels', knownModels.join(', '))

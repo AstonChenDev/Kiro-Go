@@ -113,3 +113,50 @@ func TestTypeConcurrencyDefaultsAndPerAccountOverride(t *testing.T) {
 		t.Fatal("fourth override request should fail")
 	}
 }
+
+func TestCredentialPolicyTakesPriorityOverSubscriptionPolicy(t *testing.T) {
+	p := newPolicyTestPool(t, config.Account{
+		ID:               "github-pro",
+		Enabled:          true,
+		AccessToken:      "token",
+		SubscriptionType: config.AccountTypePro,
+		Provider:         "GitHub",
+		AuthMethod:       "social",
+	})
+	if err := config.SetAccountTypePolicy(config.AccountTypePro, config.AccountTypePolicy{
+		AllowedModels: []string{"claude-sonnet-4.6"}, MaxSSE: 1, MaxRPM: 2,
+	}); err != nil {
+		t.Fatalf("set subscription policy: %v", err)
+	}
+	if err := config.SetAccountTypePolicy(config.CredentialTypeGitHub, config.AccountTypePolicy{
+		AllowedModels: []string{"gpt-5.6-sol"}, MaxSSE: 2,
+	}); err != nil {
+		t.Fatalf("set credential policy: %v", err)
+	}
+	p.Reload()
+
+	if got := p.GetNextForModel("claude-sonnet-4.6"); got != nil {
+		t.Fatalf("subscription model bypassed credential policy: %+v", got)
+	}
+	if got := p.GetNextForModel("gpt-5.6-sol"); got == nil || got.ID != "github-pro" {
+		t.Fatalf("credential model was not routed: %+v", got)
+	}
+	p.RecordPermanentRejection("github-pro")
+
+	if !p.Acquire("github-pro", true) || !p.Acquire("github-pro", true) {
+		t.Fatal("credential maxSSE=2 should override subscription maxSSE=1")
+	}
+	p.reqTimestamps["github-pro"] = nil
+	if p.Acquire("github-pro", true) {
+		t.Fatal("third stream should hit credential maxSSE=2")
+	}
+	p.Release("github-pro", true)
+	p.Release("github-pro", true)
+	p.reqTimestamps["github-pro"] = nil
+	if !p.Acquire("github-pro", false) || !p.Acquire("github-pro", false) {
+		t.Fatal("RPM should inherit subscription maxRPM=2")
+	}
+	if p.Acquire("github-pro", false) {
+		t.Fatal("third request should hit inherited subscription maxRPM=2")
+	}
+}

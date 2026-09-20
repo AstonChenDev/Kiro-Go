@@ -365,8 +365,8 @@ type Config struct {
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
-	// AccountTypePolicies stores defaults shared by subscription type
-	// (FREE/PRO/PRO_PLUS/POWER). Per-account fields remain authoritative when
+	// AccountTypePolicies stores defaults shared by subscription tier or
+	// credential/provider family. Per-account fields remain authoritative when
 	// explicitly configured.
 	AccountTypePolicies map[string]AccountTypePolicy `json:"accountTypePolicies,omitempty"`
 
