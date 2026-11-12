@@ -97,14 +97,14 @@ type clientProfile struct {
 //     darwin#24.6.0 = macOS 15.6 (Sequoia); win32#10.0.22631 = Win11 23H2,
 //     win32#10.0.19045 = Win10 22H2.
 //   - KiroVersion/NodeVersion stay on the one combination confirmed against a
-//     genuine client (0.11.107 / 22.22.0). Version uniformity is expected
+//     genuine client (1.4.154 / 22.22.0). Version uniformity is expected
 //     (real users auto-update), so only the platform dimension is diversified.
 var clientProfilePool = []clientProfile{
-	{systemVersion: "darwin#24.6.0", kiroVersion: "0.11.107", nodeVersion: "22.22.0", weight: 35},    // macOS 15.6 Sequoia
-	{systemVersion: "darwin#24.5.0", kiroVersion: "0.11.107", nodeVersion: "22.22.0", weight: 25},    // macOS 15.5 Sequoia
-	{systemVersion: "darwin#23.6.0", kiroVersion: "0.11.107", nodeVersion: "22.22.0", weight: 25},    // macOS 14.6 Sonoma
-	{systemVersion: "win32#10.0.22631", kiroVersion: "0.11.107", nodeVersion: "22.22.0", weight: 10}, // Win11 23H2
-	{systemVersion: "win32#10.0.19045", kiroVersion: "0.11.107", nodeVersion: "22.22.0", weight: 5},  // Win10 22H2
+	{systemVersion: "darwin#24.6.0", kiroVersion: "1.4.154", nodeVersion: "22.22.0", weight: 35},    // macOS 15.6 Sequoia
+	{systemVersion: "darwin#24.5.0", kiroVersion: "1.4.154", nodeVersion: "22.22.0", weight: 25},    // macOS 15.5 Sequoia
+	{systemVersion: "darwin#23.6.0", kiroVersion: "1.4.154", nodeVersion: "22.22.0", weight: 25},    // macOS 14.6 Sonoma
+	{systemVersion: "win32#10.0.22631", kiroVersion: "1.4.154", nodeVersion: "22.22.0", weight: 10}, // Win11 23H2
+	{systemVersion: "win32#10.0.19045", kiroVersion: "1.4.154", nodeVersion: "22.22.0", weight: 5},  // Win10 22H2
 }
 
 // DeriveClientProfile deterministically derives a stable desktop fingerprint
@@ -126,7 +126,7 @@ func DeriveClientProfile(accountID string) clientProfile {
 	if totalWeight <= 0 || len(clientProfilePool) == 0 {
 		// Defensive: a misconfigured pool must still never emit Linux. Fall back
 		// to the first verified mac entry rather than runtime.GOOS.
-		return clientProfile{systemVersion: "darwin#24.6.0", kiroVersion: "0.11.107", nodeVersion: "22.22.0"}
+		return clientProfile{systemVersion: "darwin#24.6.0", kiroVersion: "1.4.154", nodeVersion: "22.22.0"}
 	}
 
 	sum := sha256.Sum256([]byte("kiro-profile-" + accountID))

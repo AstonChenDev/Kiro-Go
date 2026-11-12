@@ -56,13 +56,13 @@ func TestDeriveClientProfileDistributionMatchesWeights(t *testing.T) {
 }
 
 // TestDeriveClientProfileUsesVerifiedVersions xác nhận mỗi cấu hình pool mang theo đúng bộ Kiro
-// 0.11.107 / node 22.22.0 đã được xác minh (chỉ đa dạng hóa nền tảng; đồng nhất phiên bản là
+// 1.4.154 / node 22.22.0 đã được xác minh (chỉ đa dạng hóa nền tảng; đồng nhất phiên bản là
 // được kỳ vọng cho người dùng thực tế tự động cập nhật).
 func TestDeriveClientProfileUsesVerifiedVersions(t *testing.T) {
 	for _, id := range []string{"a", "b", "c"} {
 		p := DeriveClientProfile(id)
-		if p.kiroVersion != "0.11.107" {
-			t.Fatalf("kiroVersion must be the verified 0.11.107, got %q", p.kiroVersion)
+		if p.kiroVersion != "1.4.154" {
+			t.Fatalf("kiroVersion must be the verified 1.4.154, got %q", p.kiroVersion)
 		}
 		if p.nodeVersion != "22.22.0" {
 			t.Fatalf("nodeVersion must be the verified 22.22.0, got %q", p.nodeVersion)
@@ -89,7 +89,7 @@ func TestGetKiroClientConfigOperatorOverrideWinsPerField(t *testing.T) {
 		t.Fatalf("operator SystemVersion override must win, got %q", got.SystemVersion)
 	}
 	// Các trường chưa được đặt vẫn dùng các phiên bản đã được xác minh.
-	if got.KiroVersion != "0.11.107" || got.NodeVersion != "22.22.0" {
+	if got.KiroVersion != "1.4.154" || got.NodeVersion != "22.22.0" {
 		t.Fatalf("unset fields must fall back to verified versions, got %+v", got)
 	}
 }
